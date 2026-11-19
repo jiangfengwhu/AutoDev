@@ -1,0 +1,6 @@
+{
+  "name": "AutoDev Studio — 全自动 AI 研发中控台",
+  "description": "基于 Google AI Studio 控制面、Cloudflare Workflows 编排与 GitHub Actions 沙箱执行的全自动 AI 研发中控台，支持多智能体架构分析、测试左移与自动 Draft PR 创建。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
