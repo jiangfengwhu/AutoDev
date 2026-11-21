@@ -12,16 +12,32 @@ import {
   dispatchAgyWorkflow,
   dispatchCloudflareDeployWorkflow,
   ensureWorkflowsUpToDate,
+  extractCodingOutputFromLiveLogFallback,
+  fetchLiveAgyStreamIndex,
   fetchRepoContextSnapshot,
   getGitHubActionRunDetail,
+  getGitHubRateLimitSnapshot,
+  invalidateGitHubReadCache,
   listGitHubActionRuns,
   listOpenAutodevPrs,
   listSelfHostedRunners,
   mergeDraftPrToMain,
   postPrApprovalComment,
+  readVpsAgyCapabilities,
+  resetAutodevRepoArtifacts,
   syncAgyWorkflowFile,
+  wipeRepoCodeToScratch,
 } from './server/githubService';
-import { checkCloudflareIntegration } from './server/cloudflareService';
+import {
+  flushGitHubStateNow,
+  forcePushAllLocalStateToGitHub,
+  getGitHubStatePersistenceStatus,
+  hydrateGitHubStateStores,
+} from './server/githubStateStore';
+import {
+  checkCloudflareIntegration,
+  wipeCloudflareD1Databases,
+} from './server/cloudflareService';
 import { deployBranchPreviewToCloudflare } from './server/cloudflareDeployService';
 import {
   GEMINI_AGENT_MODEL,
@@ -32,26 +48,38 @@ import {
 import {
   attachDraftPrToRun,
   attachPreviewDeploymentToRun,
+  clearAllRuns,
+  deleteRunById,
   getRunById,
   listRuns,
+  reloadRunsFromDisk,
   saveRun,
+  updateRunPlan,
   updateRunReview,
 } from './server/runStore';
 import {
   cancelAnalysisJob,
+  clearAllAnalysisJobs,
   createAndStartAnalysisJob,
+  deleteAnalysisJobById,
   getAnalysisJobById,
   getLatestAnalysisJob,
   getRunningAnalysisJob,
   listAnalysisJobs,
+  reloadJobsFromDisk,
   resumeRunningVpsPlanJobs,
+  syncRunPlanToLinkedJobs,
 } from './server/analysisJobStore';
 import {
+  clearRsiHistory,
   createManualRsiRule,
+  deleteIncidentById,
   deleteRsiRule,
+  deleteTestReportById,
   getRsiState,
   listAllRsiRules,
   recordRulesAppliedForStage,
+  reloadRsiStateFromDisk,
   updateRsiRule,
 } from './server/rsiStore';
 import {
@@ -60,7 +88,18 @@ import {
   runAttributionForIncident,
   syncRepoTestReportsAndFailures,
 } from './server/rsiService';
-import { appendAuditLog, listAuditLogs } from './server/auditLogStore';
+import {
+  appendAuditLog,
+  clearAllAuditLogs,
+  listAuditLogs,
+  reloadAuditLogsFromDisk,
+} from './server/auditLogStore';
+import {
+  enqueueBackgroundTask,
+  getBackgroundTaskById,
+  listBackgroundTasks,
+} from './server/backgroundTaskStore';
+import { sanitizeCodingChatOutput } from './src/lib/codingChatOutput';
 import { parseRepoFullName, validatePrdInput } from './src/lib/taskGraph';
 import { buildPrArtifacts } from './src/lib/specBuilder';
 import {
@@ -68,7 +107,15 @@ import {
   evaluateSingleTaskLock,
 } from './src/lib/iterationContext';
 import { buildSevenDayOverviewMetrics } from './src/lib/overviewMetrics';
-import { buildRequirementsBoardData } from './src/lib/requirementsBoard';
+import {
+  buildRequirementsBoardData,
+  synthesizeBaselineAuditEvents,
+} from './src/lib/requirementsBoard';
+import {
+  validateArchitectOutput,
+  validateQaCriticOutput,
+  validateQaSpecOutput,
+} from './src/lib/planProtocol';
 import { decideAgySessionPolicy } from './src/lib/sessionReuse';
 import {
   aggregateQualityAndRsiMetrics,
@@ -81,11 +128,16 @@ import {
   type RsiRuleStatus,
   type RsiTargetStage,
 } from './src/lib/rsiEngine';
-import { FIXED_TARGET_REPO } from './src/lib/workflowBuilder';
+import {
+  AGY_AGENT_MODES,
+  AGY_AVAILABLE_MODELS,
+  FIXED_TARGET_REPO,
+} from './src/lib/workflowBuilder';
 import type {
   AnalysisSseEvent,
   IntegrationsStatusResponse,
   PipelineRun,
+  PreviewDeployment,
   ReworkDispatchResult,
 } from './src/types/autodev';
 
@@ -120,6 +172,20 @@ async function startServer() {
     res.json({ runs: listRuns() });
   });
 
+  // Global detached server-side background tasks (survives page switches / refresh / disconnect)
+  app.get('/api/tasks', (_req, res) => {
+    res.json({ tasks: listBackgroundTasks(30) });
+  });
+
+  app.get('/api/tasks/:id', (req, res) => {
+    const task = getBackgroundTaskById(String(req.params.id || '').trim());
+    if (!task) {
+      res.status(404).json({ error: '未找到指定后台任务' });
+      return;
+    }
+    res.json({ task });
+  });
+
   // Module 1: 7-day global R&D efficiency overview metrics (real GitHub Actions + local jobs/runs)
   app.get('/api/overview/metrics', async (req, res) => {
     const repoParam = String(req.query.repo || FIXED_TARGET_REPO.fullName);
@@ -136,6 +202,7 @@ async function startServer() {
         actionRuns: actionsRes.runs,
         analysisJobs: listAnalysisJobs(),
         pipelineRuns: listRuns(),
+        testReports: getRsiState().testReports,
         githubConnected: actionsRes.connected,
       });
       res.json(metrics);
@@ -174,6 +241,180 @@ async function startServer() {
     res.json(payload);
   });
 
+  // Module 3: Standalone Full Requirement Report (PRD + Plan + Coding Agent Final Output + Blind E2E + Audit Timeline)
+  app.get('/api/requirements/:id/report', async (req, res) => {
+    const targetId = String(req.params.id || '').trim();
+    const runs = listRuns();
+    const jobs = listAnalysisJobs();
+    const rsi = getRsiState();
+
+    const matchedRun =
+      runs.find((r) => r.id === targetId) ||
+      runs.find((r) => jobs.some((j) => j.id === targetId && j.runId === r.id));
+    const matchedJob =
+      jobs.find((j) => j.id === targetId) ||
+      (matchedRun ? jobs.find((j) => j.runId === matchedRun.id) : undefined);
+
+    if (!matchedRun && !matchedJob) {
+      res.status(404).json({ error: '未找到指定的需求报告记录' });
+      return;
+    }
+
+    const branchName = matchedRun?.draftPr?.branchName;
+    const matchedReports = rsi.testReports
+      .filter(
+        (report) =>
+          (matchedRun && report.pipelineRunId === matchedRun.id) ||
+          (branchName && report.branch === branchName) ||
+          (matchedRun?.draftPr?.prNumber && report.prNumber === matchedRun.draftPr.prNumber)
+      )
+      .sort((a, b) => Date.parse(b.executedAt) - Date.parse(a.executedAt));
+
+    const combinedLogs = synthesizeBaselineAuditEvents({
+      runs,
+      jobs,
+      existingAuditLogs: listAuditLogs(),
+    });
+    const auditEvents = combinedLogs.filter(
+      (e) =>
+        (matchedRun && e.runId === matchedRun.id) ||
+        (matchedJob && e.jobId === matchedJob.id) ||
+        (branchName && e.branch === branchName)
+    );
+
+    const latestReportWithOutput = matchedReports.find((r) =>
+      Boolean(sanitizeCodingChatOutput(r.codingFinalOutput))
+    );
+    const sanitizedRunOutput = sanitizeCodingChatOutput(matchedRun?.latestCodingOutput?.content);
+    const sanitizedReportOutput = sanitizeCodingChatOutput(latestReportWithOutput?.codingFinalOutput);
+    let codingOutput =
+      matchedRun?.latestCodingOutput && sanitizedRunOutput
+        ? { ...matchedRun.latestCodingOutput, content: sanitizedRunOutput }
+        : latestReportWithOutput && sanitizedReportOutput
+          ? {
+              content: sanitizedReportOutput,
+              actionsRunId: latestReportWithOutput.actionsRunId,
+              actionsUrl: latestReportWithOutput.actionsUrl,
+              repairRounds: latestReportWithOutput.repairRounds,
+              capturedAt: latestReportWithOutput.executedAt,
+              tokenUsage: latestReportWithOutput.tokenUsage,
+            }
+          : undefined;
+
+    // Fallback for historical runs before structured codingFinalOutput existed: extract clean chat reply only
+    if (!codingOutput && matchedRun) {
+      const parsedRepo = parseRepoFullName(matchedRun.repoFullName);
+      if (parsedRepo) {
+        const fallbackText = await extractCodingOutputFromLiveLogFallback(
+          parsedRepo.owner,
+          parsedRepo.name,
+          branchName,
+          matchedRun.lastAgySession?.actionsRunId ?? matchedReports[0]?.actionsRunId
+        );
+        const cleanFallback = sanitizeCodingChatOutput(fallbackText);
+        if (cleanFallback) {
+          codingOutput = {
+            content: cleanFallback,
+            actionsRunId: matchedRun.lastAgySession?.actionsRunId ?? matchedReports[0]?.actionsRunId,
+            actionsUrl: matchedReports[0]?.actionsUrl,
+            repairRounds: matchedReports[0]?.repairRounds,
+            capturedAt:
+              matchedRun.lastAgySession?.updatedAt ||
+              matchedReports[0]?.executedAt ||
+              matchedRun.createdAt,
+            tokenUsage: matchedReports[0]?.tokenUsage,
+          };
+        }
+      }
+    }
+
+    res.json({
+      id: matchedRun?.id || matchedJob!.id,
+      generatedAt: new Date().toISOString(),
+      run: matchedRun || null,
+      job: matchedJob || null,
+      codingOutput: codingOutput || null,
+      testReports: matchedReports,
+      auditEvents,
+    });
+  });
+
+  // Module 2: Save user edits to generated plan (Architect / QA Spec / QA Critic) before Draft PR creation
+  app.patch('/api/runs/:id/plan', async (req, res) => {
+    const runId = String(req.params.id || '').trim();
+    const existing = getRunById(runId);
+    if (!existing) {
+      res.status(404).json({ error: '未找到指定的需求规划记录' });
+      return;
+    }
+
+    const body = req.body as {
+      prdTitle?: string;
+      prdContent?: string;
+      techStackHint?: string;
+      architect?: unknown;
+      qaSpec?: unknown;
+      qaCritic?: unknown;
+    };
+
+    let nextArchitect = existing.architect;
+    if (body.architect !== undefined) {
+      const check = validateArchitectOutput(body.architect);
+      if (!check.ok) {
+        res.status(400).json({ error: `架构规划校验失败：${check.error}` });
+        return;
+      }
+      nextArchitect = check.data;
+    }
+
+    let nextQaSpec = existing.qaSpec;
+    if (body.qaSpec !== undefined) {
+      const check = validateQaSpecOutput(body.qaSpec);
+      if (!check.ok) {
+        res.status(400).json({ error: `测试规格校验失败：${check.error}` });
+        return;
+      }
+      nextQaSpec = check.data;
+    }
+
+    let nextQaCritic = existing.qaCritic;
+    if (body.qaCritic !== undefined) {
+      const check = validateQaCriticOutput(body.qaCritic);
+      if (!check.ok) {
+        res.status(400).json({ error: `盲测评审校验失败：${check.error}` });
+        return;
+      }
+      nextQaCritic = check.data;
+    }
+
+    const updated = updateRunPlan(runId, {
+      prdTitle: typeof body.prdTitle === 'string' && body.prdTitle.trim() ? body.prdTitle.trim() : undefined,
+      prdContent: typeof body.prdContent === 'string' && body.prdContent.trim() ? body.prdContent.trim() : undefined,
+      techStackHint: typeof body.techStackHint === 'string' ? body.techStackHint.trim() : undefined,
+      architect: nextArchitect,
+      qaSpec: nextQaSpec,
+      qaCritic: nextQaCritic,
+    });
+
+    if (!updated) {
+      res.status(500).json({ error: '保存需求规划修改失败' });
+      return;
+    }
+
+    syncRunPlanToLinkedJobs(updated);
+    appendAuditLog({
+      category: 'planning',
+      action: 'plan_edited',
+      repoFullName: updated.repoFullName,
+      runId: updated.id,
+      prdTitle: updated.prdTitle,
+      detail: `人工修订规划方案（${updated.architect.tasks.length} 项任务 · ${updated.architect.apiContracts.length} 条 API 契约 · ${updated.qaCritic.finalApiTestChecklist.length} 条测试清单）`,
+    });
+
+    const statePersistence = await flushGitHubStateNow(`plan-edited:${runId}`).catch(() => undefined);
+    res.json({ run: updated, statePersistence });
+  });
+
   // Module 6: Quality visualization & RSI state
   app.get('/api/rsi/state', (_req, res) => {
     res.json(buildRsiDashboardPayload());
@@ -194,7 +435,7 @@ async function startServer() {
         ? Math.max(0, Math.min(10, Math.floor(rawLimit)))
         : 4;
 
-    try {
+    const executeSync = async () => {
       const syncResult = await syncRepoTestReportsAndFailures(parsed.owner, parsed.name, {
         autoAnalyzeLimit,
       });
@@ -204,10 +445,36 @@ async function startServer() {
         repoFullName: parsed.fullName,
         detail: `同步 ${syncResult.syncedReportsCount} 份测试报告，新增 ${syncResult.newIncidentsCount} 条异常，完成 ${syncResult.analyzedCount} 次 AI 归因`,
       });
-      res.json({
+      return {
         syncResult,
         state: buildRsiDashboardPayload(),
+      };
+    };
+
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'rsi_sync',
+        title: '同步测试报告与 RSI 归因',
+        roomId: 'quality',
+        repoFullName: parsed.fullName,
+        dedupeKey: `rsi_sync:${parsed.fullName}`,
+        initialMessage: '正在拉取 GitHub Actions 测试报告并运行 AI 归因…',
+        executor: async () => {
+          const payload = await executeSync();
+          const sr = payload.syncResult;
+          return {
+            summary: `同步 ${sr.syncedReportsCount} 份测试报告，新增 ${sr.newIncidentsCount} 条异常，完成 ${sr.analyzedCount} 次 AI 归因`,
+            result: { syncResult: sr },
+          };
+        },
       });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
+
+    try {
+      const payload = await executeSync();
+      res.json(payload);
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : '同步测试报告与失败归因失败',
@@ -245,7 +512,7 @@ async function startServer() {
       ? source
       : 'manual_report';
 
-    try {
+    const executeReportIncident = async () => {
       const result = await captureAndReflectIncident({
         sourceRefKey: `manual:${Date.now()}:${crypto.randomBytes(3).toString('hex')}`,
         source: resolvedSource,
@@ -269,10 +536,38 @@ async function startServer() {
         }`,
       });
 
-      res.status(201).json({
+      return {
         ...result,
         state: buildRsiDashboardPayload(),
+      };
+    };
+
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'rsi_report_incident',
+        title: `上报异常并 AI 归因：${cleanTitle.slice(0, 28)}`,
+        roomId: 'quality',
+        repoFullName: String(repoFullName || FIXED_TARGET_REPO.fullName),
+        runId: relatedRunId ? String(relatedRunId) : undefined,
+        initialMessage: '正在写入异常记录并执行 RSI 根因归因…',
+        executor: async () => {
+          const payload = await executeReportIncident();
+          const codified = Boolean(payload.incident?.attribution?.shouldCodifyAsRule);
+          return {
+            summary: codified
+              ? `异常「${cleanTitle}」已归因并沉淀为 RSI 规则`
+              : `异常「${cleanTitle}」已完成归因评估`,
+            result: { incidentId: payload.incident?.id, codified },
+          };
+        },
       });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
+
+    try {
+      const payload = await executeReportIncident();
+      res.status(201).json(payload);
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : '记录并归因异常事件失败',
@@ -282,8 +577,34 @@ async function startServer() {
 
   // Module 5: Trigger or re-run Gemini RSI attribution + gemini-decision-1 gate for a specific incident
   app.post('/api/rsi/incidents/:id/analyze', async (req, res) => {
+    const incidentId = String(req.params.id || '').trim();
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'rsi_analyze',
+        title: 'AI 故障归因与规则门控',
+        roomId: 'quality',
+        dedupeKey: `rsi_analyze:${incidentId}`,
+        initialMessage: '正在后台运行 Gemini 归因与门控评估…',
+        executor: async () => {
+          const result = await runAttributionForIncident(incidentId);
+          const outcome = result.incident?.attribution?.appliedOutcome;
+          const summary =
+            outcome === 'merged' || result.ruleAction === 'merged'
+              ? '判定语义重复，已合并强化现有 RSI 规则'
+              : outcome === 'candidate_created'
+                ? '已写入待观察候选规则池'
+                : outcome === 'active_created' || result.ruleAction === 'created'
+                  ? '判定为高危通用规则，已立即生效注入'
+                  : '判定为一次性偶发故障，未写入长期 Prompt';
+          return { summary, result: { incidentId, outcome } };
+        },
+      });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
+
     try {
-      const result = await runAttributionForIncident(req.params.id);
+      const result = await runAttributionForIncident(incidentId);
       res.json({
         ...result,
         state: buildRsiDashboardPayload(),
@@ -296,8 +617,8 @@ async function startServer() {
   });
 
   // Module 5: AI distillation & consolidation of RSI rules to prevent System Prompt bloat
-  app.post('/api/rsi/consolidate', async (_req, res) => {
-    try {
+  app.post('/api/rsi/consolidate', async (req, res) => {
+    const executeConsolidate = async () => {
       const consolidation = await consolidateRsiRulesWithGemini();
       appendAuditLog({
         category: 'quality',
@@ -305,10 +626,35 @@ async function startServer() {
         repoFullName: FIXED_TARGET_REPO.fullName,
         detail: `AI 蒸馏压缩 RSI 规则：${consolidation.beforeCount} 条 -> ${consolidation.afterCount} 条（${consolidation.summary}）`,
       });
-      res.json({
+      return {
         consolidation,
         state: buildRsiDashboardPayload(),
+      };
+    };
+
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'rsi_consolidate',
+        title: 'AI 蒸馏压缩 RSI 规则库',
+        roomId: 'quality',
+        dedupeKey: 'rsi_consolidate',
+        initialMessage: '正在后台合并去重 RSI 规则指令…',
+        executor: async () => {
+          const payload = await executeConsolidate();
+          const c = payload.consolidation;
+          return {
+            summary: `规则蒸馏完成：${c.beforeCount} 条 -> ${c.afterCount} 条`,
+            result: { consolidation: c },
+          };
+        },
       });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
+
+    try {
+      const payload = await executeConsolidate();
+      res.json(payload);
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : 'AI 蒸馏压缩 RSI 规则失败',
@@ -497,6 +843,7 @@ async function startServer() {
       prdContent,
       techStackHint,
       agyModel,
+      agyMode,
       executionMode,
       forceOverride,
     } = req.body ?? {};
@@ -546,6 +893,7 @@ async function startServer() {
         prdContent: String(prdContent).trim(),
         techStackHint: techStackHint ? String(techStackHint).trim() : undefined,
         agyModel: agyModel ? String(agyModel).trim() : undefined,
+        agyMode: agyMode ? String(agyMode).trim() : undefined,
         executionMode: executionMode === 'gemini_api' ? 'gemini_api' : 'vps_agy',
       });
       appendAuditLog({
@@ -557,7 +905,7 @@ async function startServer() {
         branch: job.defaultBranch,
         detail: `发起需求三阶段规划（引擎：${
           job.executionMode === 'gemini_api' ? 'Gemini API' : 'Instabox VPS AGY'
-        }${job.agyModel ? ` / ${job.agyModel}` : ''}）`,
+        }${job.agyModel ? ` / ${job.agyModel}` : ''}${job.agyMode ? ` / mode:${job.agyMode}` : ''}）`,
       });
       res.status(202).json({ job });
     } catch (err) {
@@ -568,7 +916,7 @@ async function startServer() {
   });
 
   app.get('/api/agents/jobs/latest', (_req, res) => {
-    res.json({ job: getLatestAnalysisJob() ?? null });
+    res.json({ job: getLatestAnalysisJob() ?? null, jobs: listAnalysisJobs() });
   });
 
   app.get('/api/agents/jobs/:id', (req, res) => {
@@ -767,51 +1115,77 @@ async function startServer() {
         }
       }
 
-      const artifacts = buildPrArtifacts(run);
-      const draftPr = await createSpecDraftPr({
-        owner: parsedRepo.owner,
-        repo: parsedRepo.name,
-        baseBranch: baseBranch ? String(baseBranch) : run.defaultBranch,
-        artifacts,
-      });
+      const targetRun = run;
+      const executeCreateDraftPr = async (setProgress?: (msg: string) => void) => {
+        setProgress?.('正在写入规格文档、盲测隔离用例并创建特性分支…');
+        const artifacts = buildPrArtifacts(targetRun);
+        const draftPr = await createSpecDraftPr({
+          owner: parsedRepo.owner,
+          repo: parsedRepo.name,
+          baseBranch: baseBranch ? String(baseBranch) : targetRun.defaultBranch,
+          artifacts,
+        });
 
-      // Auto-inject active RSI engineering guardrails into the PR branch for VPS AGY Coding Runner
-      const rsiGuidelinesMd = buildRsiGuidelinesMarkdown(listAllRsiRules());
-      if (rsiGuidelinesMd) {
-        try {
-          await commitRsiGuidelinesToBranch({
-            owner: parsedRepo.owner,
-            repo: parsedRepo.name,
-            branchName: draftPr.branchName,
-            markdownContent: rsiGuidelinesMd,
-          });
-          recordRulesAppliedForStage('coding');
-        } catch (rsiErr) {
-          console.warn('[AutoDev RSI] Failed to write docs/rsi-guidelines.md on Draft PR:', rsiErr);
+        // Auto-inject active RSI engineering guardrails into the PR branch for VPS AGY Coding Runner
+        const rsiGuidelinesMd = buildRsiGuidelinesMarkdown(listAllRsiRules());
+        if (rsiGuidelinesMd) {
+          setProgress?.(`已创建 PR #${draftPr.prNumber}，正在注入 RSI 工程约束规则…`);
+          try {
+            await commitRsiGuidelinesToBranch({
+              owner: parsedRepo.owner,
+              repo: parsedRepo.name,
+              branchName: draftPr.branchName,
+              markdownContent: rsiGuidelinesMd,
+            });
+            recordRulesAppliedForStage('coding');
+          } catch (rsiErr) {
+            console.warn('[AutoDev RSI] Failed to write docs/rsi-guidelines.md on Draft PR:', rsiErr);
+          }
         }
-      }
 
-      const updatedRun = attachDraftPrToRun(run.id, draftPr) || {
-        ...run,
-        status: 'pr_created' as const,
-        draftPr,
+        const updatedRun = attachDraftPrToRun(targetRun.id, draftPr) || {
+          ...targetRun,
+          status: 'pr_created' as const,
+          draftPr,
+        };
+
+        appendAuditLog({
+          category: 'planning',
+          action: 'draft_pr_created',
+          repoFullName: targetRun.repoFullName,
+          runId: targetRun.id,
+          prdTitle: targetRun.prdTitle,
+          branch: draftPr.branchName,
+          prNumber: draftPr.prNumber,
+          detail: `创建规格 Draft PR #${draftPr.prNumber}（特性分支 ${draftPr.branchName}，提交 ${draftPr.commitSha.slice(0, 7)}）`,
+        });
+
+        return { draftPr, run: updatedRun };
       };
 
-      appendAuditLog({
-        category: 'planning',
-        action: 'draft_pr_created',
-        repoFullName: run.repoFullName,
-        runId: run.id,
-        prdTitle: run.prdTitle,
-        branch: draftPr.branchName,
-        prNumber: draftPr.prNumber,
-        detail: `创建规格 Draft PR #${draftPr.prNumber}（特性分支 ${draftPr.branchName}，提交 ${draftPr.commitSha.slice(0, 7)}）`,
-      });
+      if (req.body?.async === true) {
+        const { task, deduplicated } = enqueueBackgroundTask({
+          kind: 'create_draft_pr',
+          title: `创建 Draft PR：${targetRun.prdTitle.slice(0, 28)}`,
+          roomId: 'prd',
+          runId: targetRun.id,
+          repoFullName: targetRun.repoFullName,
+          dedupeKey: `create_draft_pr:${targetRun.id}`,
+          initialMessage: '正在后台提交规格文档并创建 GitHub Draft PR…',
+          executor: async ({ setProgress }) => {
+            const payload = await executeCreateDraftPr(setProgress);
+            return {
+              summary: `Draft PR #${payload.draftPr.prNumber} 已创建（分支 ${payload.draftPr.branchName}）`,
+              result: { prNumber: payload.draftPr.prNumber, prUrl: payload.draftPr.prUrl, runId: targetRun.id },
+            };
+          },
+        });
+        res.status(202).json({ async: true, deduplicated, task });
+        return;
+      }
 
-      res.json({
-        draftPr,
-        run: updatedRun,
-      });
+      const payload = await executeCreateDraftPr();
+      res.json(payload);
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : '创建 GitHub Draft PR 失败',
@@ -819,7 +1193,7 @@ async function startServer() {
     }
   });
 
-  // Module 3: Query recent GitHub Actions workflow runs for selected repo
+  // Module 3: Query recent GitHub Actions workflow runs enriched with real requirement/branch correlation
   app.get('/api/github/actions-runs', async (req, res) => {
     const repoParam = String(req.query.repo || FIXED_TARGET_REPO.fullName);
     const parsed = parseRepoFullName(repoParam);
@@ -828,8 +1202,372 @@ async function startServer() {
       return;
     }
 
-    const result = await listGitHubActionRuns(parsed.owner, parsed.name);
-    res.json(result);
+    const [result, streamIndex] = await Promise.all([
+      listGitHubActionRuns(parsed.owner, parsed.name, 25),
+      fetchLiveAgyStreamIndex(parsed.owner, parsed.name).catch(() => new Map()),
+    ]);
+
+    const localRuns = listRuns();
+    const localJobs = listAnalysisJobs();
+    const reports = getRsiState().testReports;
+
+    const reportByActionId = new Map(
+      reports.filter((r) => Boolean(r.actionsRunId)).map((r) => [r.actionsRunId!, r])
+    );
+    const jobByActionId = new Map(
+      localJobs.filter((j) => Boolean(j.planActionsRunId)).map((j) => [j.planActionsRunId!, j])
+    );
+    const runByBranch = new Map(
+      localRuns.filter((r) => Boolean(r.draftPr?.branchName)).map((r) => [r.draftPr!.branchName, r])
+    );
+
+    const enrichedRuns = result.runs.map((ar) => {
+      const streamMeta = streamIndex.get(ar.id);
+      const rep = reportByActionId.get(ar.id);
+      const planJob = jobByActionId.get(ar.id);
+
+      let targetBranch = streamMeta?.branch || rep?.branch;
+      let pipelineRunId = streamMeta?.pipelineRunId || rep?.pipelineRunId || planJob?.runId;
+      let prNumber = rep?.prNumber;
+      const jobId = planJob?.id;
+
+      if (!targetBranch && pipelineRunId) {
+        const matchedRun = localRuns.find((r) => r.id === pipelineRunId);
+        if (matchedRun?.draftPr?.branchName) {
+          targetBranch = matchedRun.draftPr.branchName;
+          prNumber = prNumber ?? matchedRun.draftPr.prNumber;
+        }
+      }
+      if (!pipelineRunId && targetBranch) {
+        const matchedRun = runByBranch.get(targetBranch);
+        if (matchedRun) {
+          pipelineRunId = matchedRun.id;
+          prNumber = prNumber ?? matchedRun.draftPr?.prNumber;
+        }
+      }
+      if (!pipelineRunId && ar.headBranch && ar.headBranch !== 'main' && ar.headBranch !== 'master') {
+        const matchedRun = runByBranch.get(ar.headBranch);
+        if (matchedRun) {
+          pipelineRunId = matchedRun.id;
+          targetBranch = targetBranch || ar.headBranch;
+          prNumber = prNumber ?? matchedRun.draftPr?.prNumber;
+        }
+      }
+
+      return {
+        ...ar,
+        ...(targetBranch ? { targetBranch } : {}),
+        ...(pipelineRunId ? { pipelineRunId } : {}),
+        ...(jobId ? { jobId } : {}),
+        ...(prNumber ? { prNumber } : {}),
+      };
+    });
+
+    res.json({
+      ...result,
+      runs: enrichedRuns,
+    });
+  });
+
+  // Query live VPS AGY capabilities (models + agent modes synced from VPS runner)
+  app.get('/api/github/vps-capabilities', async (req, res) => {
+    const repoParam = String(req.query.repo || FIXED_TARGET_REPO.fullName);
+    const parsed = parseRepoFullName(repoParam);
+    const live = parsed ? await readVpsAgyCapabilities(parsed.owner, parsed.name).catch(() => null) : null;
+
+    const mergedModels: Array<{ id: string; label: string }> = [
+      ...AGY_AVAILABLE_MODELS.map((m) => ({ id: String(m.id), label: String(m.label) })),
+    ];
+    if (live?.models?.length) {
+      for (const m of live.models) {
+        if (!mergedModels.some((x) => x.id === m.id)) {
+          mergedModels.unshift({ id: m.id, label: m.label });
+        }
+      }
+    }
+
+    res.json({
+      version: live?.version,
+      syncedAt: live?.syncedAt,
+      models: mergedModels,
+      modes: AGY_AGENT_MODES,
+      agents: live?.agents || [],
+    });
+  });
+
+  // GitHub API rate-limit telemetry + autodev-state branch persistence status
+  app.get('/api/github/rate-limit', async (req, res) => {
+    const forceRefresh = String(req.query.refresh || '') === '1';
+    const rateLimit = await getGitHubRateLimitSnapshot(forceRefresh);
+    const statePersistence = getGitHubStatePersistenceStatus();
+    res.json({
+      rateLimit,
+      statePersistence,
+    });
+  });
+
+  // Force sync local state to/from GitHub `autodev-state` orphan branch
+  app.post('/api/admin/state/sync', async (req, res) => {
+    const direction = String(req.body?.direction || 'push');
+
+    const executeStateSync = async () => {
+      if (direction === 'pull') {
+        const result = await hydrateGitHubStateStores({
+          repoFullName: FIXED_TARGET_REPO.fullName,
+          onReloadStores: () => {
+            reloadRunsFromDisk();
+            reloadJobsFromDisk();
+            reloadAuditLogsFromDisk();
+            reloadRsiStateFromDisk();
+          },
+        });
+        return {
+          ok: result.hydrated,
+          direction: 'pull',
+          result,
+          statePersistence: getGitHubStatePersistenceStatus(),
+        };
+      }
+
+      const statePersistence = await forcePushAllLocalStateToGitHub(
+        {
+          runs: listRuns(),
+          jobs: listAnalysisJobs(),
+          auditLogs: listAuditLogs(),
+          rsi: getRsiState(),
+        },
+        'manual-sync'
+      );
+      return {
+        ok: !statePersistence.lastError,
+        direction: 'push',
+        statePersistence,
+      };
+    };
+
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'state_sync',
+        title: '同步状态至 autodev-state 分支',
+        roomId: 'environment',
+        repoFullName: FIXED_TARGET_REPO.fullName,
+        dedupeKey: `state_sync:${direction}`,
+        initialMessage: '正在后台推送控制面台账至 GitHub 状态分支…',
+        executor: async () => {
+          const payload = await executeStateSync();
+          if (!payload.ok) {
+            throw new Error(payload.statePersistence?.lastError || '状态同步失败');
+          }
+          return {
+            summary: '已将控制面台账全量同步至 GitHub autodev-state 分支',
+            result: { direction },
+          };
+        },
+      });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
+
+    try {
+      const payload = await executeStateSync();
+      res.json(payload);
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : '同步 GitHub 状态分支失败',
+      });
+    }
+  });
+
+  // Delete a single pipeline run (and optionally its linked analysis job)
+  app.delete('/api/runs/:id', async (req, res) => {
+    const runId = String(req.params.id || '').trim();
+    const deleted = deleteRunById(runId);
+    // Also clean up any analysis job bound exclusively to this runId so it doesn't reappear as orphan
+    const linkedJobs = listAnalysisJobs().filter((j) => j.runId === runId);
+    for (const j of linkedJobs) {
+      deleteAnalysisJobById(j.id);
+    }
+    if (!deleted && linkedJobs.length === 0) {
+      res.status(404).json({ error: '未找到指定流水线记录' });
+      return;
+    }
+    const statePersistence = await flushGitHubStateNow(`delete-run:${runId}`);
+    res.json({
+      ok: true,
+      deletedRunId: runId,
+      deletedLinkedJobIds: linkedJobs.map((j) => j.id),
+      statePersistence,
+    });
+  });
+
+  // Delete a single analysis job
+  app.delete('/api/agents/jobs/:id', async (req, res) => {
+    const jobId = String(req.params.id || '').trim();
+    const existing = getAnalysisJobById(jobId);
+    if (!existing) {
+      res.status(404).json({ error: '未找到指定规划任务记录' });
+      return;
+    }
+    if (existing.status === 'running') {
+      await cancelAnalysisJob(jobId).catch(() => null);
+    }
+    deleteAnalysisJobById(jobId);
+    const statePersistence = await flushGitHubStateNow(`delete-job:${jobId}`);
+    res.json({
+      ok: true,
+      deletedJobId: jobId,
+      statePersistence,
+    });
+  });
+
+  // Delete a single RSI test report or incident
+  app.delete('/api/rsi/reports/:id', async (req, res) => {
+    const reportId = String(req.params.id || '').trim();
+    const deleted = deleteTestReportById(reportId);
+    if (!deleted) {
+      res.status(404).json({ error: '未找到指定测试报告' });
+      return;
+    }
+    const statePersistence = await flushGitHubStateNow(`delete-report:${reportId}`);
+    res.json({ ok: true, deletedReportId: reportId, statePersistence });
+  });
+
+  app.delete('/api/rsi/incidents/:id', async (req, res) => {
+    const incidentId = String(req.params.id || '').trim();
+    const deleted = deleteIncidentById(incidentId);
+    if (!deleted) {
+      res.status(404).json({ error: '未找到指定失败归因事件' });
+      return;
+    }
+    const statePersistence = await flushGitHubStateNow(`delete-incident:${incidentId}`);
+    res.json({ ok: true, deletedIncidentId: incidentId, statePersistence });
+  });
+
+  // Full clean-slate reset (GitHub PRs & branches + GitHub Actions history + scoped Cloudflare D1 + local & autodev-state branch)
+  app.post('/api/admin/reset-all', async (req, res) => {
+    const repoParam = String(req.body?.repoFullName || FIXED_TARGET_REPO.fullName);
+    const clearState = req.body?.clearState !== false;
+    const resetGithubPrsAndBranches = req.body?.resetGithubPrsAndBranches !== false;
+    const deleteActionRuns = req.body?.deleteActionRuns !== false;
+    const wipeCloudflareD1 = req.body?.wipeCloudflareD1 !== false;
+    const wipeRepoCode = req.body?.wipeRepoCode === true;
+    const keepRsiRules = req.body?.keepRsiRules === true;
+    const rawTargets = Array.isArray(req.body?.d1TargetNames)
+      ? req.body.d1TargetNames.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+      : ['community_db', 'community_db-preview'];
+    const parsed = parseRepoFullName(repoParam);
+    if (!parsed) {
+      res.status(400).json({ error: '无效的目标仓库标识（owner/repo）' });
+      return;
+    }
+
+    const executeResetAll = async (setProgress?: (msg: string) => void) => {
+      setProgress?.('正在清理 GitHub Actions / PR / 分支与 Cloudflare D1…');
+      const [githubReset, d1Reset] = await Promise.all([
+        resetGithubPrsAndBranches || deleteActionRuns
+          ? resetAutodevRepoArtifacts(parsed.owner, parsed.name, {
+              resetPrsAndBranches: resetGithubPrsAndBranches,
+              deleteActionRuns,
+            })
+          : Promise.resolve({
+              closedPrNumbers: [],
+              deletedBranches: [],
+              remainingBranches: [],
+              deletedActionRuns: 0,
+              skippedActiveActionRuns: 0,
+              failedActionRunDeletions: 0,
+            }),
+        wipeCloudflareD1
+          ? wipeCloudflareD1Databases(rawTargets)
+          : Promise.resolve({ connected: true, databases: [] }),
+      ]);
+
+      // Optional danger-zone clean-slate wipe of target repository main branch code
+      let repoCodeWipe = null;
+      if (wipeRepoCode) {
+        setProgress?.(`正在清空 ${parsed.fullName} 主分支业务代码并保留 Workflows…`);
+        repoCodeWipe = await wipeRepoCodeToScratch(parsed.owner, parsed.name, 'main');
+      }
+
+      let clearedRuns = 0;
+      let clearedJobs = 0;
+      let clearedAuditLogs = 0;
+      let clearedRsi = { clearedReports: 0, clearedIncidents: 0, clearedRules: 0 };
+      let statePersistence = getGitHubStatePersistenceStatus();
+
+      if (clearState) {
+        setProgress?.('正在清空本地台账并同步 autodev-state 状态分支…');
+        clearedRuns = clearAllRuns();
+        clearedJobs = clearAllAnalysisJobs();
+        clearedAuditLogs = clearAllAuditLogs();
+        clearedRsi = clearRsiHistory({ keepRules: keepRsiRules });
+        statePersistence = await forcePushAllLocalStateToGitHub(
+          {
+            runs: listRuns(),
+            jobs: listAnalysisJobs(),
+            auditLogs: listAuditLogs(),
+            rsi: getRsiState(),
+          },
+          wipeRepoCode ? 'admin-wipe-repo-and-reset' : 'admin-reset-all'
+        );
+      }
+
+      invalidateGitHubReadCache();
+
+      return {
+        ok: true,
+        repoFullName: parsed.fullName,
+        github: githubReset,
+        repoCodeWipe,
+        cloudflareD1: d1Reset,
+        localHistory: {
+          clearedRuns,
+          clearedJobs,
+          clearedAuditLogs,
+          ...clearedRsi,
+        },
+        statePersistence,
+        resetAt: new Date().toISOString(),
+      };
+    };
+
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'admin_reset',
+        title: wipeRepoCode ? '清空仓库代码并重置环境' : '测试环境一键清库重置',
+        roomId: 'environment',
+        repoFullName: parsed.fullName,
+        dedupeKey: `admin_reset:${parsed.fullName}`,
+        initialMessage: '正在后台执行清库与环境重置，可自由切换页面…',
+        executor: async ({ setProgress }) => {
+          const payload = await executeResetAll(setProgress);
+          const parts: string[] = [];
+          if (wipeRepoCode) {
+            parts.push(`移除 ${payload.repoCodeWipe?.removedFilesCount ?? 0} 个业务文件`);
+          }
+          if (clearState) parts.push('状态分支已清空');
+          if (deleteActionRuns) parts.push(`删除 ${payload.github.deletedActionRuns} 条 Actions`);
+          if (resetGithubPrsAndBranches) {
+            parts.push(`关 ${payload.github.closedPrNumbers.length} PR / 删 ${payload.github.deletedBranches.length} 分支`);
+          }
+          return {
+            summary: parts.join(' · ') || '测试环境重置完成',
+            result: { wipeRepoCode, resetAt: payload.resetAt },
+          };
+        },
+      });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
+
+    try {
+      const payload = await executeResetAll();
+      res.json(payload);
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : '执行环境全面清理失败',
+      });
+    }
   });
 
   // Module 3: Inspect jobs & log tail for a specific GitHub Actions run
@@ -929,6 +1667,7 @@ async function startServer() {
         e2eTestPath,
         revisionNote,
         agyModel,
+        agyMode,
         baseBranch,
         forceFreshSession,
       } = req.body ?? {};
@@ -977,6 +1716,7 @@ async function startServer() {
         e2eTestPath: e2eTestPath ? String(e2eTestPath) : undefined,
         revisionNote: revisionNote ? String(revisionNote) : undefined,
         agyModel: agyModel ? String(agyModel) : undefined,
+        agyMode: agyMode ? String(agyMode) : undefined,
         baseBranch: baseBranch ? String(baseBranch) : undefined,
         sessionMode: sessionPolicy.mode,
         resumeSessionId: sessionPolicy.resumeSessionId,
@@ -990,11 +1730,7 @@ async function startServer() {
         prdTitle: linkedRun?.prdTitle,
         branch: cleanBranch,
         prNumber: prNumber ? Number(prNumber) : linkedRun?.draftPr?.prNumber,
-        detail: `派发 VPS AGY 在分支 ${cleanBranch} 执行编码（模型：${result.model} · ${
-          sessionPolicy.mode === 'resume'
-            ? `复用会话 ${sessionPolicy.resumeSessionId}`
-            : '全新会话'
-        }）`,
+        detail: `派发 VPS AGY 在分支 ${cleanBranch} 执行编码（模型：${result.model} · 模式：${result.mode}）`,
       });
 
       res.json({
@@ -1046,78 +1782,106 @@ async function startServer() {
 
   // Module 4: Direct server-side Cloudflare Workers preview deployment (auto-creates D1, applies migrations, returns live workers.dev URL)
   app.post('/api/cloudflare/deploy-preview', async (req, res) => {
-    try {
-      const { runId, repoFullName, branchName, workerName, prNumber } = req.body ?? {};
-      const existingRun = runId ? getRunById(String(runId)) : undefined;
-      const resolvedRepo = String(
-        repoFullName || existingRun?.repoFullName || FIXED_TARGET_REPO.fullName
-      );
-      const parsed = parseRepoFullName(resolvedRepo);
-      if (!parsed) {
-        res.status(400).json({ error: '无效的目标仓库标识（owner/repo）' });
-        return;
+    const { runId, repoFullName, branchName, workerName, prNumber } = req.body ?? {};
+    const existingRun = runId ? getRunById(String(runId)) : undefined;
+    const resolvedRepo = String(
+      repoFullName || existingRun?.repoFullName || FIXED_TARGET_REPO.fullName
+    );
+    const parsed = parseRepoFullName(resolvedRepo);
+    if (!parsed) {
+      res.status(400).json({ error: '无效的目标仓库标识（owner/repo）' });
+      return;
+    }
+
+    const resolvedBranch = String(
+      branchName || existingRun?.draftPr?.branchName || existingRun?.defaultBranch || 'main'
+    ).trim();
+    if (!resolvedBranch) {
+      res.status(400).json({ error: '请指定要部署的目标分支' });
+      return;
+    }
+
+    const resolvedPrNumber = prNumber
+      ? Number(prNumber)
+      : existingRun?.draftPr?.prNumber;
+
+    const deployMode: 'preview' | 'production' =
+      resolvedBranch === 'main' || resolvedBranch === 'master' ? 'production' : 'preview';
+
+    const executeDeployPreview = async () => {
+      try {
+        const { deployment, deployLogTail } = await deployBranchPreviewToCloudflare({
+          owner: parsed.owner,
+          repo: parsed.name,
+          branchName: resolvedBranch,
+          workerNameOverride: workerName ? String(workerName) : undefined,
+          prNumber: resolvedPrNumber,
+          mode: deployMode,
+        });
+
+        const updatedRun = existingRun
+          ? attachPreviewDeploymentToRun(existingRun.id, deployment)
+          : undefined;
+
+        appendAuditLog({
+          category: 'execution',
+          action: 'preview_deployed',
+          repoFullName: parsed.fullName,
+          runId: existingRun?.id,
+          prdTitle: existingRun?.prdTitle,
+          branch: resolvedBranch,
+          prNumber: resolvedPrNumber,
+          detail: `部署${deployment.isIsolatedPreview ? '隔离预览' : '生产'} Worker ${deployment.workerName} (${deployment.url})`,
+        });
+
+        return {
+          deployment,
+          deployLogTail,
+          run: updatedRun,
+        };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : 'Cloudflare Workers 预览部署失败';
+        void captureAndReflectIncident({
+          sourceRefKey: `deploy-preview:${resolvedBranch}:${Date.now()}`,
+          source: 'deploy_error',
+          repoFullName: parsed.fullName,
+          title: `Cloudflare 预览部署失败（${resolvedBranch}）`,
+          errorSummary: errMsg,
+          rawEvidence: errMsg,
+          relatedRunId: existingRun?.id,
+          branch: resolvedBranch,
+        }).catch(() => {});
+        throw new Error(errMsg);
       }
+    };
 
-      const resolvedBranch = String(
-        branchName || existingRun?.draftPr?.branchName || existingRun?.defaultBranch || 'main'
-      ).trim();
-      if (!resolvedBranch) {
-        res.status(400).json({ error: '请指定要部署的目标分支' });
-        return;
-      }
-
-      const resolvedPrNumber = prNumber
-        ? Number(prNumber)
-        : existingRun?.draftPr?.prNumber;
-
-      const deployMode: 'preview' | 'production' =
-        resolvedBranch === 'main' || resolvedBranch === 'master' ? 'production' : 'preview';
-
-      const { deployment, deployLogTail } = await deployBranchPreviewToCloudflare({
-        owner: parsed.owner,
-        repo: parsed.name,
-        branchName: resolvedBranch,
-        workerNameOverride: workerName ? String(workerName) : undefined,
-        prNumber: resolvedPrNumber,
-        mode: deployMode,
-      });
-
-      const updatedRun = existingRun
-        ? attachPreviewDeploymentToRun(existingRun.id, deployment)
-        : undefined;
-
-      appendAuditLog({
-        category: 'execution',
-        action: 'preview_deployed',
-        repoFullName: parsed.fullName,
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'deploy_preview',
+        title: `部署 Cloudflare ${deployMode === 'production' ? '生产' : '隔离预览'}（${resolvedBranch}）`,
+        roomId: 'approval',
         runId: existingRun?.id,
-        prdTitle: existingRun?.prdTitle,
-        branch: resolvedBranch,
-        prNumber: resolvedPrNumber,
-        detail: `部署${deployment.isIsolatedPreview ? '隔离预览' : '生产'} Worker ${deployment.workerName} (${deployment.url})`,
+        repoFullName: parsed.fullName,
+        dedupeKey: `deploy_preview:${parsed.fullName}:${resolvedBranch}`,
+        initialMessage: `正在后台构建并部署分支 ${resolvedBranch} 到 Cloudflare Workers…`,
+        executor: async () => {
+          const payload = await executeDeployPreview();
+          return {
+            summary: `预览环境已就绪：${payload.deployment.url}`,
+            result: { url: payload.deployment.url, workerName: payload.deployment.workerName, runId: existingRun?.id },
+          };
+        },
       });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
 
-      res.json({
-        deployment,
-        deployLogTail,
-        run: updatedRun,
-      });
+    try {
+      const payload = await executeDeployPreview();
+      res.json(payload);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : 'Cloudflare Workers 预览部署失败';
-      const { runId, repoFullName, branchName } = req.body ?? {};
-      void captureAndReflectIncident({
-        sourceRefKey: `deploy-preview:${String(branchName || 'main')}:${Date.now()}`,
-        source: 'deploy_error',
-        repoFullName: String(repoFullName || FIXED_TARGET_REPO.fullName),
-        title: `Cloudflare 预览部署失败（${String(branchName || 'main')}）`,
-        errorSummary: errMsg,
-        rawEvidence: errMsg,
-        relatedRunId: runId ? String(runId) : undefined,
-        branch: branchName ? String(branchName) : undefined,
-      }).catch(() => {});
-
       res.status(502).json({
-        error: errMsg,
+        error: err instanceof Error ? err.message : 'Cloudflare Workers 预览部署失败',
       });
     }
   });
@@ -1142,75 +1906,227 @@ async function startServer() {
       return;
     }
 
-    const patch: Parameters<typeof updateRunReview>[1] = {};
-    if (Array.isArray(checkedCriteriaIds)) {
-      patch.checkedCriteriaIds = checkedCriteriaIds.map(String);
-    }
-    if (decision === 'approved' || decision === 'changes_requested') {
-      patch.status = decision;
-      patch.approvalNote = String(approvalNote ?? '');
-      patch.approvedAt = new Date().toISOString();
-    }
+    const executeReview = async (setProgress?: (msg: string) => void) => {
+      const patch: Parameters<typeof updateRunReview>[1] = {};
+      if (Array.isArray(checkedCriteriaIds)) {
+        patch.checkedCriteriaIds = checkedCriteriaIds.map(String);
+      }
+      if (decision === 'approved' || decision === 'changes_requested') {
+        patch.status = decision;
+        patch.approvalNote = String(approvalNote ?? '');
+        patch.approvedAt = new Date().toISOString();
+      }
 
-    let updated = updateRunReview(runId, patch);
-    let githubSync: { synced: boolean; error?: string } | undefined;
-    let mergeResult:
-      | {
-          merged: boolean;
-          alreadyMerged?: boolean;
-          mergeCommitSha?: string;
-          baseBranch?: string;
-          commitUrl?: string;
-          branchDeleted?: boolean;
-          error?: string;
-        }
-      | undefined;
-    let reworkResult: ReworkDispatchResult | undefined;
+      let updated = updateRunReview(runId, patch);
+      let githubSync: { synced: boolean; error?: string } | undefined;
+      let mergeResult:
+        | {
+            merged: boolean;
+            alreadyMerged?: boolean;
+            mergeCommitSha?: string;
+            baseBranch?: string;
+            commitUrl?: string;
+            branchDeleted?: boolean;
+            error?: string;
+          }
+        | undefined;
+      let productionDeployResult:
+        | {
+            deployed: boolean;
+            deployment?: PreviewDeployment;
+            error?: string;
+          }
+        | undefined;
+      let reworkResult: ReworkDispatchResult | undefined;
 
-    const shouldMerge =
-      decision === 'approved' &&
-      mergePrToMain !== false &&
-      Boolean(updated?.draftPr);
+      const shouldMerge =
+        decision === 'approved' &&
+        mergePrToMain !== false &&
+        Boolean(updated?.draftPr);
 
-    if (shouldMerge && updated?.draftPr) {
-      const parsed = parseRepoFullName(updated.repoFullName);
-      if (parsed) {
-        const resMerge = await mergeDraftPrToMain({
-          owner: parsed.owner,
-          repo: parsed.name,
-          prNumber: updated.draftPr.prNumber,
-          commitTitle: `feat(autodev): ${updated.prdTitle} (#${updated.draftPr.prNumber})`,
-          commitMessage: String(approvalNote || 'Approved and merged via AutoDev Studio'),
-          mergeMethod: 'squash',
-        });
-        if (resMerge.merged && resMerge.release) {
-          updated = updateRunReview(runId, { mergedRelease: resMerge.release });
-          mergeResult = {
-            merged: true,
-            alreadyMerged: resMerge.release.alreadyMerged,
-            mergeCommitSha: resMerge.release.mergeCommitSha,
-            baseBranch: resMerge.release.baseBranch,
-            commitUrl: resMerge.release.commitUrl,
-            branchDeleted: resMerge.release.branchDeleted,
-          };
-        } else {
-          mergeResult = {
-            merged: false,
-            error: resMerge.error || 'PR 合并失败',
-          };
+      if (shouldMerge && updated?.draftPr) {
+        const parsed = parseRepoFullName(updated.repoFullName);
+        if (parsed) {
+          setProgress?.(`正在解除 PR #${updated.draftPr.prNumber} Draft 状态并合并至主分支…`);
+          const resMerge = await mergeDraftPrToMain({
+            owner: parsed.owner,
+            repo: parsed.name,
+            prNumber: updated.draftPr.prNumber,
+            commitTitle: `feat(autodev): ${updated.prdTitle} (#${updated.draftPr.prNumber})`,
+            commitMessage: String(approvalNote || 'Approved and merged via AutoDev Studio'),
+            mergeMethod: 'squash',
+          });
+          if (resMerge.merged && resMerge.release) {
+            updated = updateRunReview(runId, { mergedRelease: resMerge.release });
+            mergeResult = {
+              merged: true,
+              alreadyMerged: resMerge.release.alreadyMerged,
+              mergeCommitSha: resMerge.release.mergeCommitSha,
+              baseBranch: resMerge.release.baseBranch,
+              commitUrl: resMerge.release.commitUrl,
+              branchDeleted: resMerge.release.branchDeleted,
+            };
+
+            // Automatically deploy merged main branch to production Cloudflare Workers!
+            try {
+              const targetProdBranch = resMerge.release.baseBranch || updated?.defaultBranch || 'main';
+              setProgress?.(`已合入 ${targetProdBranch}，正在自动部署生产 Cloudflare Workers…`);
+              const { deployment } = await deployBranchPreviewToCloudflare({
+                owner: parsed.owner,
+                repo: parsed.name,
+                branchName: targetProdBranch,
+                prNumber: updated?.draftPr?.prNumber,
+                mode: 'production',
+              });
+              updated = updateRunReview(runId, { productionDeployment: deployment });
+              productionDeployResult = { deployed: true, deployment };
+            } catch (prodErr) {
+              productionDeployResult = {
+                deployed: false,
+                error: prodErr instanceof Error ? prodErr.message : '自动部署生产环境失败',
+              };
+            }
+          } else {
+            mergeResult = {
+              merged: false,
+              error: resMerge.error || 'PR 合并失败',
+            };
+          }
         }
       }
-    }
 
-    // Closed-loop rework: commit docs/revision-feedback.md to PR branch and dispatch AGY Runner
-    const shouldRework =
-      decision === 'changes_requested' &&
-      autoReworkViaAgy === true &&
-      Boolean(updated?.draftPr);
+      // Closed-loop rework: commit docs/revision-feedback.md to PR branch and dispatch AGY Runner
+      const shouldRework =
+        decision === 'changes_requested' &&
+        autoReworkViaAgy === true &&
+        Boolean(updated?.draftPr);
 
-    if (shouldRework && updated?.draftPr) {
-      const parsed = parseRepoFullName(updated.repoFullName);
-      if (parsed) {
+      if (shouldRework && updated?.draftPr) {
+        const parsed = parseRepoFullName(updated.repoFullName);
+        if (parsed) {
+          setProgress?.(`正在向原分支 ${updated.draftPr.branchName} 写入返工意见并派发 AGY…`);
+          const checkedSet = new Set(updated.checkedCriteriaIds ?? []);
+          const uncheckedCriteria = updated.architect.tasks.flatMap((task) =>
+            task.acceptanceCriteria
+              .map((text, idx) => ({ id: `${task.id}::${idx}`, label: `[${task.id}] ${text}` }))
+              .filter((item) => !checkedSet.has(item.id))
+              .map((item) => item.label)
+          );
+          const cleanNote = String(approvalNote ?? '').trim();
+          const feedbackMd = buildRevisionFeedbackMarkdown({
+            runId: updated.id,
+            prdTitle: updated.prdTitle,
+            prNumber: updated.draftPr.prNumber,
+            approvalNote: cleanNote,
+            uncheckedCriteria,
+          });
+
+          const draftPrBranch = updated.draftPr.branchName;
+          const draftPrNumber = updated.draftPr.prNumber;
+          const draftPrE2ePath = updated.draftPr.e2eTestPath;
+
+          try {
+            const commitRes = await commitRevisionFeedbackToBranch({
+              owner: parsed.owner,
+              repo: parsed.name,
+              branchName: draftPrBranch,
+              markdownContent: feedbackMd,
+              prNumber: draftPrNumber,
+            });
+            const activeCodingRules = listAllRsiRules();
+            const rsiMarkdown = buildRsiGuidelinesMarkdown(activeCodingRules);
+            if (rsiMarkdown) {
+              await commitRsiGuidelinesToBranch({
+                owner: parsed.owner,
+                repo: parsed.name,
+                branchName: draftPrBranch,
+                markdownContent: rsiMarkdown,
+              }).catch((err) => {
+                console.warn('Non-blocking RSI guidelines sync on rework failed:', err);
+              });
+              recordRulesAppliedForStage('coding');
+            }
+            const sessionPolicy = decideAgySessionPolicy({
+              targetBranch: draftPrBranch,
+              lastAgySession: updated.lastAgySession,
+              forceFresh: forceFreshSession === true,
+            });
+            const dispatchRes = await dispatchAgyWorkflow({
+              owner: parsed.owner,
+              repo: parsed.name,
+              prBranch: draftPrBranch,
+              prNumber: draftPrNumber,
+              runId: updated.id,
+              e2eTestPath: draftPrE2ePath,
+              revisionNote:
+                cleanNote ||
+                `共有 ${uncheckedCriteria.length} 项验收标准未勾选，请按 docs/revision-feedback.md 修复。`,
+              agyModel: agyModel ? String(agyModel) : undefined,
+              baseBranch: updated.defaultBranch || 'main',
+              sessionMode: sessionPolicy.mode,
+              resumeSessionId: sessionPolicy.resumeSessionId,
+            });
+            reworkResult = {
+              dispatched: true,
+              branchName: draftPrBranch,
+              feedbackFilePath: commitRes.path,
+              feedbackCommitSha: commitRes.commitSha,
+              actionsUrl: dispatchRes.actionsUrl,
+              dispatchedAt: new Date().toISOString(),
+              note: cleanNote,
+              sessionMode: sessionPolicy.mode,
+              resumeSessionId: sessionPolicy.resumeSessionId,
+              sessionReason: sessionPolicy.reason,
+            };
+            updated = updateRunReview(runId, { lastRework: reworkResult });
+          } catch (err) {
+            reworkResult = {
+              dispatched: false,
+              branchName: draftPrBranch,
+              feedbackFilePath: 'docs/revision-feedback.md',
+              dispatchedAt: new Date().toISOString(),
+              note: cleanNote,
+              error: err instanceof Error ? err.message : '自动派发 VPS AGY 返工失败',
+            };
+          }
+        }
+      }
+
+      if (
+        syncToGitHub &&
+        (decision === 'approved' || decision === 'changes_requested') &&
+        updated?.draftPr
+      ) {
+        const parsed = parseRepoFullName(updated.repoFullName);
+        if (parsed) {
+          let noteWithExtras = String(approvalNote ?? '').trim();
+          if (mergeResult?.merged) {
+            noteWithExtras = `${noteWithExtras || '验收通过'}\n\n已自动解除 Draft 状态并 Squash Merge 合入 \`${
+              mergeResult.baseBranch || 'main'
+            }\`（Commit: \`${(mergeResult.mergeCommitSha || '').slice(0, 7)}\`${
+              mergeResult.branchDeleted ? '，已自动清理临时特性分支' : ''
+            }）。${
+              productionDeployResult?.deployed && productionDeployResult.deployment
+                ? `\n\n已自动部署至 Cloudflare Workers 生产环境：${productionDeployResult.deployment.url}`
+                : ''
+            }`;
+          } else if (reworkResult?.dispatched) {
+            noteWithExtras = `${noteWithExtras || '退回修订'}\n\n已将修改指令写入 \`${
+              reworkResult.feedbackFilePath
+            }\` 并自动派发 VPS AGY 在分支 \`${reworkResult.branchName}\` 执行增量修复。`;
+          }
+          githubSync = await postPrApprovalComment({
+            owner: parsed.owner,
+            repo: parsed.name,
+            prNumber: updated.draftPr.prNumber,
+            decision,
+            note: noteWithExtras,
+          });
+        }
+      }
+
+      let rsiIncidentId: string | undefined;
+      if (decision === 'changes_requested' && updated) {
         const checkedSet = new Set(updated.checkedCriteriaIds ?? []);
         const uncheckedCriteria = updated.architect.tasks.flatMap((task) =>
           task.acceptanceCriteria
@@ -1219,214 +2135,153 @@ async function startServer() {
             .map((item) => item.label)
         );
         const cleanNote = String(approvalNote ?? '').trim();
-        const feedbackMd = buildRevisionFeedbackMarkdown({
-          runId: updated.id,
-          prdTitle: updated.prdTitle,
-          prNumber: updated.draftPr.prNumber,
-          approvalNote: cleanNote,
-          uncheckedCriteria,
-        });
-
-        const draftPrBranch = updated.draftPr.branchName;
-        const draftPrNumber = updated.draftPr.prNumber;
-        const draftPrE2ePath = updated.draftPr.e2eTestPath;
+        const summaryParts = [
+          cleanNote || '人工验收未通过，退回修订',
+          uncheckedCriteria.length > 0 ? `未勾选验收项 ${uncheckedCriteria.length} 条` : '',
+        ].filter(Boolean);
 
         try {
-          const commitRes = await commitRevisionFeedbackToBranch({
-            owner: parsed.owner,
-            repo: parsed.name,
-            branchName: draftPrBranch,
-            markdownContent: feedbackMd,
-            prNumber: draftPrNumber,
+          const captured = await captureAndReflectIncident({
+            sourceRefKey: `manual-acceptance:${updated.id}:${Date.now()}`,
+            source: 'manual_acceptance',
+            repoFullName: updated.repoFullName,
+            title: `人工验收退回：${updated.prdTitle}`,
+            errorSummary: summaryParts.join(' · '),
+            rawEvidence: [
+              `需求标题: ${updated.prdTitle}`,
+              `PR 编号: ${updated.draftPr ? `#${updated.draftPr.prNumber}` : '无'}`,
+              `退回修改意见:\n${cleanNote || '(未填写文字意见)'}`,
+              uncheckedCriteria.length > 0
+                ? `\n未通过的验收标准:\n${uncheckedCriteria.map((c) => `- ${c}`).join('\n')}`
+                : '',
+            ].join('\n'),
+            relatedRunId: updated.id,
+            branch: updated.draftPr?.branchName || updated.defaultBranch,
+            waitForAnalysis: false,
           });
-          const activeCodingRules = listAllRsiRules();
-          const rsiMarkdown = buildRsiGuidelinesMarkdown(activeCodingRules);
-          if (rsiMarkdown) {
-            await commitRsiGuidelinesToBranch({
-              owner: parsed.owner,
-              repo: parsed.name,
-              branchName: draftPrBranch,
-              markdownContent: rsiMarkdown,
-            }).catch((err) => {
-              console.warn('Non-blocking RSI guidelines sync on rework failed:', err);
-            });
-            recordRulesAppliedForStage('coding');
-          }
-          const sessionPolicy = decideAgySessionPolicy({
-            targetBranch: draftPrBranch,
-            lastAgySession: updated.lastAgySession,
-            forceFresh: forceFreshSession === true,
-          });
-          const dispatchRes = await dispatchAgyWorkflow({
-            owner: parsed.owner,
-            repo: parsed.name,
-            prBranch: draftPrBranch,
-            prNumber: draftPrNumber,
+          rsiIncidentId = captured.incident.id;
+        } catch {
+          // non-fatal
+        }
+      }
+
+      if (updated) {
+        if (decision === 'approved') {
+          appendAuditLog({
+            category: 'approval',
+            action: 'release_approved',
+            actor: '验收审批人',
+            repoFullName: updated.repoFullName,
             runId: updated.id,
-            e2eTestPath: draftPrE2ePath,
-            revisionNote:
-              cleanNote ||
-              `共有 ${uncheckedCriteria.length} 项验收标准未勾选，请按 docs/revision-feedback.md 修复。`,
-            agyModel: agyModel ? String(agyModel) : undefined,
-            baseBranch: updated.defaultBranch || 'main',
-            sessionMode: sessionPolicy.mode,
-            resumeSessionId: sessionPolicy.resumeSessionId,
+            prdTitle: updated.prdTitle,
+            branch: updated.draftPr?.branchName || updated.defaultBranch,
+            prNumber: updated.draftPr?.prNumber,
+            status: mergeResult && !mergeResult.merged ? 'failed' : 'success',
+            detail: mergeResult?.merged
+              ? `验收通过并合入 ${mergeResult.baseBranch || 'main'}（Commit ${(mergeResult.mergeCommitSha || '').slice(0, 7)}）${
+                  productionDeployResult?.deployed && productionDeployResult.deployment
+                    ? `，已自动部署生产：${productionDeployResult.deployment.url}`
+                    : productionDeployResult?.error
+                      ? `（生产自动部署异常：${productionDeployResult.error}）`
+                      : ''
+                }`
+              : mergeResult?.error
+                ? `验收通过但合并 PR 失败：${mergeResult.error}`
+                : `验收通过并批准上线${approvalNote ? `：${String(approvalNote).trim()}` : ''}`,
           });
-          reworkResult = {
-            dispatched: true,
-            branchName: draftPrBranch,
-            feedbackFilePath: commitRes.path,
-            feedbackCommitSha: commitRes.commitSha,
-            actionsUrl: dispatchRes.actionsUrl,
-            dispatchedAt: new Date().toISOString(),
-            note: cleanNote,
-            sessionMode: sessionPolicy.mode,
-            resumeSessionId: sessionPolicy.resumeSessionId,
-            sessionReason: sessionPolicy.reason,
-          };
-          updated = updateRunReview(runId, { lastRework: reworkResult });
-        } catch (err) {
-          reworkResult = {
-            dispatched: false,
-            branchName: draftPrBranch,
-            feedbackFilePath: 'docs/revision-feedback.md',
-            dispatchedAt: new Date().toISOString(),
-            note: cleanNote,
-            error: err instanceof Error ? err.message : '自动派发 VPS AGY 返工失败',
-          };
+        } else if (decision === 'changes_requested') {
+          const origBranch = updated.draftPr?.branchName || updated.defaultBranch;
+          appendAuditLog({
+            category: 'approval',
+            action: 'revision_requested',
+            actor: '验收审批人',
+            repoFullName: updated.repoFullName,
+            runId: updated.id,
+            prdTitle: updated.prdTitle,
+            branch: origBranch,
+            prNumber: updated.draftPr?.prNumber,
+            status: reworkResult && !reworkResult.dispatched ? 'failed' : 'success',
+            detail: reworkResult?.dispatched
+              ? `退回修订：已在原需求分支 ${origBranch} 写入 docs/revision-feedback.md 并派发 VPS AGY 修复${
+                  approvalNote ? `（意见：${String(approvalNote).trim()}）` : ''
+                }`
+              : `人工验收退回修订（原分支 ${origBranch}）${
+                  approvalNote ? `：${String(approvalNote).trim()}` : ''
+                }`,
+          });
+        } else if (Array.isArray(checkedCriteriaIds)) {
+          const total = updated.architect.tasks.reduce(
+            (acc, t) => acc + t.acceptanceCriteria.length,
+            0
+          );
+          appendAuditLog({
+            category: 'approval',
+            action: 'acceptance_checklist_updated',
+            actor: '验收审批人',
+            repoFullName: updated.repoFullName,
+            runId: updated.id,
+            prdTitle: updated.prdTitle,
+            branch: updated.draftPr?.branchName || updated.defaultBranch,
+            prNumber: updated.draftPr?.prNumber,
+            detail: `更新验收标准勾选进度：${checkedCriteriaIds.length}/${total}`,
+          });
         }
       }
+
+      return {
+        run: updated,
+        githubSync,
+        mergeResult,
+        productionDeployResult,
+        reworkResult,
+        rsiIncidentId,
+      };
+    };
+
+    if (req.body?.async === true && (decision === 'approved' || decision === 'changes_requested')) {
+      const isApprove = decision === 'approved';
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: isApprove ? 'approve_release' : 'request_rework',
+        title: isApprove
+          ? `批准上线并自动发布：${existing.prdTitle.slice(0, 24)}`
+          : `退回修订并派发返工：${existing.prdTitle.slice(0, 24)}`,
+        roomId: 'approval',
+        runId: existing.id,
+        repoFullName: existing.repoFullName,
+        dedupeKey: `review:${existing.id}:${decision}`,
+        initialMessage: isApprove
+          ? '正在后台合并 PR 并部署生产环境，可自由切换页面…'
+          : '正在后台提交修订意见并派发 AGY 原分支返工…',
+        executor: async ({ setProgress }) => {
+          const outcome = await executeReview(setProgress);
+          if (isApprove && outcome.mergeResult && !outcome.mergeResult.merged) {
+            throw new Error(`PR 合并失败：${outcome.mergeResult.error || '请检查冲突'}`);
+          }
+          if (isApprove && outcome.productionDeployResult && !outcome.productionDeployResult.deployed) {
+            throw new Error(`已合并主分支，但生产部署异常：${outcome.productionDeployResult.error || '未知错误'}`);
+          }
+          if (!isApprove && outcome.reworkResult && !outcome.reworkResult.dispatched) {
+            throw new Error(`已记录退回意见，但派发 AGY 返工失败：${outcome.reworkResult.error || '未知错误'}`);
+          }
+          const summary = isApprove
+            ? outcome.productionDeployResult?.deployment?.url
+              ? `已合入主分支并上线生产：${outcome.productionDeployResult.deployment.url}`
+              : '已验收通过并合入主分支'
+            : outcome.reworkResult?.dispatched
+              ? `已写入返工指令并派发 AGY 在 ${outcome.reworkResult.branchName} 修复`
+              : '已退回修订';
+          return {
+            summary,
+            result: { runId: existing.id, decision },
+          };
+        },
+      });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
     }
 
-    if (
-      syncToGitHub &&
-      (decision === 'approved' || decision === 'changes_requested') &&
-      updated?.draftPr
-    ) {
-      const parsed = parseRepoFullName(updated.repoFullName);
-      if (parsed) {
-        let noteWithExtras = String(approvalNote ?? '').trim();
-        if (mergeResult?.merged) {
-          noteWithExtras = `${noteWithExtras || '验收通过'}\n\n已自动解除 Draft 状态并 Squash Merge 合入 \`${
-            mergeResult.baseBranch || 'main'
-          }\`（Commit: \`${(mergeResult.mergeCommitSha || '').slice(0, 7)}\`${
-            mergeResult.branchDeleted ? '，已自动清理临时特性分支' : ''
-          }）。`;
-        } else if (reworkResult?.dispatched) {
-          noteWithExtras = `${noteWithExtras || '退回修订'}\n\n已将修改指令写入 \`${
-            reworkResult.feedbackFilePath
-          }\` 并自动派发 VPS AGY 在分支 \`${reworkResult.branchName}\` 执行增量修复。`;
-        }
-        githubSync = await postPrApprovalComment({
-          owner: parsed.owner,
-          repo: parsed.name,
-          prNumber: updated.draftPr.prNumber,
-          decision,
-          note: noteWithExtras,
-        });
-      }
-    }
-
-    let rsiIncidentId: string | undefined;
-    if (decision === 'changes_requested' && updated) {
-      const checkedSet = new Set(updated.checkedCriteriaIds ?? []);
-      const uncheckedCriteria = updated.architect.tasks.flatMap((task) =>
-        task.acceptanceCriteria
-          .map((text, idx) => ({ id: `${task.id}::${idx}`, label: `[${task.id}] ${text}` }))
-          .filter((item) => !checkedSet.has(item.id))
-          .map((item) => item.label)
-      );
-      const cleanNote = String(approvalNote ?? '').trim();
-      const summaryParts = [
-        cleanNote || '人工验收未通过，退回修订',
-        uncheckedCriteria.length > 0 ? `未勾选验收项 ${uncheckedCriteria.length} 条` : '',
-      ].filter(Boolean);
-
-      try {
-        const captured = await captureAndReflectIncident({
-          sourceRefKey: `manual-acceptance:${updated.id}:${Date.now()}`,
-          source: 'manual_acceptance',
-          repoFullName: updated.repoFullName,
-          title: `人工验收退回：${updated.prdTitle}`,
-          errorSummary: summaryParts.join(' · '),
-          rawEvidence: [
-            `需求标题: ${updated.prdTitle}`,
-            `PR 编号: ${updated.draftPr ? `#${updated.draftPr.prNumber}` : '无'}`,
-            `退回修改意见:\n${cleanNote || '(未填写文字意见)'}`,
-            uncheckedCriteria.length > 0
-              ? `\n未通过的验收标准:\n${uncheckedCriteria.map((c) => `- ${c}`).join('\n')}`
-              : '',
-          ].join('\n'),
-          relatedRunId: updated.id,
-          branch: updated.draftPr?.branchName || updated.defaultBranch,
-          waitForAnalysis: false,
-        });
-        rsiIncidentId = captured.incident.id;
-      } catch {
-        // non-fatal
-      }
-    }
-
-    if (updated) {
-      if (decision === 'approved') {
-        appendAuditLog({
-          category: 'approval',
-          action: 'release_approved',
-          actor: '验收审批人',
-          repoFullName: updated.repoFullName,
-          runId: updated.id,
-          prdTitle: updated.prdTitle,
-          branch: updated.draftPr?.branchName || updated.defaultBranch,
-          prNumber: updated.draftPr?.prNumber,
-          status: mergeResult && !mergeResult.merged ? 'failed' : 'success',
-          detail: mergeResult?.merged
-            ? `验收通过并合入 ${mergeResult.baseBranch || 'main'}（Commit ${(mergeResult.mergeCommitSha || '').slice(0, 7)}）`
-            : mergeResult?.error
-              ? `验收通过但合并 PR 失败：${mergeResult.error}`
-              : `验收通过并批准上线${approvalNote ? `：${String(approvalNote).trim()}` : ''}`,
-        });
-      } else if (decision === 'changes_requested') {
-        const origBranch = updated.draftPr?.branchName || updated.defaultBranch;
-        appendAuditLog({
-          category: 'approval',
-          action: 'revision_requested',
-          actor: '验收审批人',
-          repoFullName: updated.repoFullName,
-          runId: updated.id,
-          prdTitle: updated.prdTitle,
-          branch: origBranch,
-          prNumber: updated.draftPr?.prNumber,
-          status: reworkResult && !reworkResult.dispatched ? 'failed' : 'success',
-          detail: reworkResult?.dispatched
-            ? `退回修订：已在原需求分支 ${origBranch} 写入 docs/revision-feedback.md 并派发 VPS AGY 返工（${
-                reworkResult.sessionMode === 'resume' && reworkResult.resumeSessionId
-                  ? `复用会话 ${reworkResult.resumeSessionId}`
-                  : '全新会话'
-              }）${approvalNote ? `（意见：${String(approvalNote).trim()}）` : ''}`
-            : `人工验收退回修订（原分支 ${origBranch}）${
-                approvalNote ? `：${String(approvalNote).trim()}` : ''
-              }`,
-        });
-      } else if (Array.isArray(checkedCriteriaIds)) {
-        const total = updated.architect.tasks.reduce(
-          (acc, t) => acc + t.acceptanceCriteria.length,
-          0
-        );
-        appendAuditLog({
-          category: 'approval',
-          action: 'acceptance_checklist_updated',
-          actor: '验收审批人',
-          repoFullName: updated.repoFullName,
-          runId: updated.id,
-          prdTitle: updated.prdTitle,
-          branch: updated.draftPr?.branchName || updated.defaultBranch,
-          prNumber: updated.draftPr?.prNumber,
-          detail: `更新验收标准勾选进度：${checkedCriteriaIds.length}/${total}`,
-        });
-      }
-    }
-
-    res.json({ run: updated, githubSync, mergeResult, reworkResult, rsiIncidentId });
+    const payload = await executeReview();
+    res.json(payload);
   });
 
   // Vite middleware in dev, static build in production
@@ -1441,6 +2296,32 @@ async function startServer() {
     app.use(express.static(distDir));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
+    });
+  }
+
+  // Hydrate control-plane state from GitHub orphan branch `autodev-state` on startup (with 6s guard)
+  if (process.env.GITHUB_TOKEN?.trim()) {
+    await Promise.race([
+      hydrateGitHubStateStores({
+        repoFullName: FIXED_TARGET_REPO.fullName,
+        onReloadStores: () => {
+          reloadRunsFromDisk();
+          reloadJobsFromDisk();
+          reloadAuditLogsFromDisk();
+          reloadRsiStateFromDisk();
+        },
+      }).then((res) => {
+        if (res.hydrated) {
+          console.log(
+            `[AutoDev State] Hydrated from ${FIXED_TARGET_REPO.fullName}@autodev-state (restored: ${res.restoredKeys.join(', ') || 'empty'}${res.createdBranch ? ', initialized branch' : ''})`
+          );
+        } else if (res.error) {
+          console.warn('[AutoDev State] Startup hydration skipped:', res.error);
+        }
+      }),
+      new Promise<void>((resolve) => setTimeout(resolve, 6000)),
+    ]).catch((err) => {
+      console.warn('[AutoDev State] Startup hydration error:', err?.message || err);
     });
   }
 
@@ -1465,6 +2346,13 @@ async function startServer() {
         });
     }
   });
+
+  // Flush any pending dirty state to GitHub `autodev-state` on graceful shutdown
+  const handleGracefulShutdown = () => {
+    void flushGitHubStateNow('shutdown').finally(() => process.exit(0));
+  };
+  process.once('SIGTERM', handleGracefulShutdown);
+  process.once('SIGINT', handleGracefulShutdown);
 }
 
 startServer().catch((err) => {

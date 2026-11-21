@@ -27,7 +27,11 @@ import {
   upsertPlanChannelJson,
 } from './githubService';
 import { parseRepoFullName } from '../src/lib/taskGraph';
-import { resolveEffectiveTechStack } from '../src/lib/workflowBuilder';
+import {
+  DEFAULT_AGY_MODE,
+  DEFAULT_AGY_MODEL,
+  resolveEffectiveTechStack,
+} from '../src/lib/workflowBuilder';
 import {
   AUTODEV_PLAN_CHANNEL_BRANCH,
   getPlanArtifactPath,
@@ -41,14 +45,16 @@ import { saveRun } from './runStore';
 import { formatRsiPromptBlock } from '../src/lib/rsiEngine';
 import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore';
 import { captureAndReflectIncident } from './rsiService';
+import { scheduleGitHubStateSync } from './githubStateStore';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const JOBS_FILE = path.join(DATA_DIR, 'jobs-v1.json');
 const LEGACY_TMP_JOBS_FILE = path.join(os.tmpdir(), 'autodev-studio-jobs-v1.json');
 
-const DEFAULT_AGY_PLAN_MODEL = 'gemini-3.8-flash-high';
-const PLAN_POLL_INTERVAL_MS = 3500;
-const PLAN_HARD_TIMEOUT_MS = 32 * 60 * 1000;
+const DEFAULT_AGY_PLAN_MODEL = DEFAULT_AGY_MODEL;
+const DEFAULT_AGY_PLAN_MODE = DEFAULT_AGY_MODE;
+const PLAN_POLL_INTERVAL_MS = 8000;
+const PLAN_HARD_TIMEOUT_MS = 95 * 60 * 1000;
 
 let jobsCache: AnalysisJob[] | null = null;
 const activeVpsPollers = new Set<string>();
@@ -139,7 +145,7 @@ function loadJobs(): AnalysisJob[] {
   return jobsCache;
 }
 
-function persistJobs(jobs: AnalysisJob[]): void {
+function persistJobs(jobs: AnalysisJob[], skipRemoteSync = false): void {
   jobsCache = jobs;
   try {
     ensureDataDir();
@@ -147,6 +153,14 @@ function persistJobs(jobs: AnalysisJob[]): void {
   } catch {
     // ignore disk errors
   }
+  if (!skipRemoteSync) {
+    scheduleGitHubStateSync('jobs', jobs);
+  }
+}
+
+export function reloadJobsFromDisk(): void {
+  jobsCache = null;
+  loadJobs();
 }
 
 function updateJob(jobId: string, updater: (job: AnalysisJob) => AnalysisJob): AnalysisJob | null {
@@ -218,6 +232,43 @@ export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob | nu
   }));
 }
 
+export function deleteAnalysisJobById(jobId: string): boolean {
+  const existing = loadJobs();
+  const next = existing.filter((j) => j.id !== jobId);
+  if (next.length === existing.length) return false;
+  persistJobs(next);
+  return true;
+}
+
+export function syncRunPlanToLinkedJobs(run: PipelineRun): void {
+  const all = loadJobs();
+  let changed = false;
+  const next = all.map((job) => {
+    if (job.runId !== run.id) return job;
+    changed = true;
+    return {
+      ...job,
+      prdTitle: run.prdTitle,
+      prdContent: run.prdContent,
+      techStackHint: run.techStackHint,
+      architect: run.architect,
+      qaSpec: run.qaSpec,
+      qaCritic: run.qaCritic,
+      run,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+  if (changed) {
+    persistJobs(next);
+  }
+}
+
+export function clearAllAnalysisJobs(): number {
+  const prevCount = loadJobs().length;
+  persistJobs([]);
+  return prevCount;
+}
+
 export function createAndStartAnalysisJob(input: {
   repoFullName: string;
   defaultBranch: string;
@@ -225,6 +276,7 @@ export function createAndStartAnalysisJob(input: {
   prdContent: string;
   techStackHint?: string;
   agyModel?: string;
+  agyMode?: string;
   executionMode?: AnalysisExecutionMode;
 }): AnalysisJob {
   const existingRunning = getRunningAnalysisJob();
@@ -243,6 +295,7 @@ export function createAndStartAnalysisJob(input: {
         : 'gemini_api';
 
   const agyModel = (input.agyModel || DEFAULT_AGY_PLAN_MODEL).trim() || DEFAULT_AGY_PLAN_MODEL;
+  const agyMode = (input.agyMode || DEFAULT_AGY_PLAN_MODE).trim() || DEFAULT_AGY_PLAN_MODE;
   const now = new Date().toISOString();
   const jobId = `job-${crypto.randomBytes(4).toString('hex')}`;
   const job: AnalysisJob = {
@@ -255,7 +308,9 @@ export function createAndStartAnalysisJob(input: {
     prdContent: input.prdContent,
     techStackHint: input.techStackHint,
     executionMode: resolvedMode,
+    planMode: resolvedMode === 'vps_agy' ? 'unified_single_turn' : 'three_stage',
     agyModel: resolvedMode === 'vps_agy' ? agyModel : undefined,
+    agyMode: resolvedMode === 'vps_agy' ? agyMode : undefined,
     status: 'running',
     steps: createInitialSteps(),
   };
@@ -287,6 +342,7 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
   const { owner, name: repo } = parsedRepo;
   const baseBranch = initialJob.defaultBranch || 'main';
   const agyModel = initialJob.agyModel || DEFAULT_AGY_PLAN_MODEL;
+  const agyMode = initialJob.agyMode || DEFAULT_AGY_PLAN_MODE;
 
   const setStep = (stepId: AgentStepId, patch: Partial<AgentStepState>) => {
     updateJob(jobId, (j) => ({
@@ -299,7 +355,7 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
     setStep('architect', {
       status: 'running',
       startedAt: new Date().toISOString(),
-      message: `正在向 Instabox AGY Runner 派发三阶段规划任务（${agyModel}）…`,
+      message: `正在向 Instabox AGY Runner 派发单对话联合规划任务（${agyModel}）…`,
     });
 
     // Grab lightweight repo context metadata in parallel with ensuring the orphan artifact channel branch
@@ -342,10 +398,11 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
     const initialState: PlanRemoteState = {
       jobId,
       status: 'queued',
+      mode: 'unified_single_turn',
       updatedAt: new Date().toISOString(),
       model: agyModel,
       steps: {
-        architect: { status: 'running', message: '已入队，等待 Instabox AGY Runner 接单并检出最新代码…' },
+        architect: { status: 'running', message: '已入队，等待 Instabox AGY Runner 检出最新代码并启动单对话联合规划…' },
         qa_spec: { status: 'idle' },
         qa_critic: { status: 'idle' },
       },
@@ -378,6 +435,7 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
       baseBranch,
       channelBranch: channelInfo.branch,
       agyModel,
+      agyMode,
     });
 
     updateJob(jobId, (j) => ({
@@ -389,7 +447,7 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
           ? {
               ...s,
               status: 'running',
-              message: `已派发至 Instabox AGY Runner（${agyModel}），等待检出 ${baseBranch} 并开始架构分析…`,
+              message: `已派发至 Instabox AGY Runner（${agyModel}），将在单次会话中一次性产出架构、测试与盲测加固方案…`,
             }
           : s
       ),
@@ -564,6 +622,7 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
               architect: nextArchitect,
               qaSpec: nextQaSpec,
               qaCritic: nextQaCritic,
+              planTokenUsage: remote.tokenUsage,
               status: 'analyzed',
               checkedCriteriaIds: [],
             };
@@ -572,6 +631,8 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
             updateJob(jobId, (j) => ({
               ...j,
               status: 'completed',
+              planMode: remote.mode ?? j.planMode ?? 'unified_single_turn',
+              tokenUsage: remote.tokenUsage ?? j.tokenUsage,
               planActionsRunId: remote.actionsRunId ?? j.planActionsRunId,
               planActionsUrl: remote.actionsUrl ?? j.planActionsUrl,
               architect: nextArchitect,
@@ -587,6 +648,8 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
           // Progressive update while running
           updateJob(jobId, (j) => ({
             ...j,
+            planMode: remote.mode ?? j.planMode,
+            tokenUsage: remote.tokenUsage ?? j.tokenUsage,
             planActionsRunId: remote.actionsRunId ?? j.planActionsRunId,
             planActionsUrl: remote.actionsUrl ?? j.planActionsUrl,
             architect: nextArchitect ?? j.architect,

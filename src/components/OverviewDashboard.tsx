@@ -11,11 +11,12 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { AlertCircle, RefreshCw } from 'lucide-react';
-import type {
-  OverviewDailyBucket,
-  OverviewFilterScope,
-  SevenDayOverviewMetrics,
+import { AlertCircle, Monitor, RefreshCw } from 'lucide-react';
+import {
+  formatTokenCount,
+  type OverviewDailyBucket,
+  type OverviewFilterScope,
+  type SevenDayOverviewMetrics,
 } from '../lib/overviewMetrics';
 
 interface OverviewDashboardProps {
@@ -24,7 +25,7 @@ interface OverviewDashboardProps {
   onErrorToast?: (message: string, title?: string) => void;
 }
 
-type ResourceChartMode = 'minutes' | 'runs';
+type ResourceChartMode = 'tokens' | 'minutes' | 'runs';
 
 interface TooltipPayloadEntry {
   name?: string;
@@ -100,7 +101,30 @@ function ResourceUsageTooltip({
       <div className="font-mono font-semibold text-[#F0F6FC] mb-1.5">
         {row.dateKey || label}
       </div>
-      {mode === 'minutes' ? (
+      {mode === 'tokens' ? (
+        <div className="space-y-1 font-mono tabular-nums text-[11px]">
+          <div className="flex items-center justify-between gap-5">
+            <span className="text-[#8B949E]">总 Token 消耗</span>
+            <span className="text-[#F0F6FC] font-semibold">
+              {formatTokenCount(row.totalTokens)}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-5">
+            <span className="text-[#8B949E]">需求规划</span>
+            <span className="text-[#58A6FF]">{formatTokenCount(row.planTokens)}</span>
+          </div>
+          <div className="flex items-center justify-between gap-5">
+            <span className="text-[#8B949E]">编码与验证</span>
+            <span className="text-[#A371F7]">{formatTokenCount(row.codingTokens)}</span>
+          </div>
+          <div className="flex items-center justify-between gap-5 pt-1 border-t border-[#21262D] text-[#8B949E]">
+            <span>输入 / 输出</span>
+            <span>
+              {formatTokenCount(row.inputTokens)} / {formatTokenCount(row.outputTokens)}
+            </span>
+          </div>
+        </div>
+      ) : mode === 'minutes' ? (
         <div className="space-y-1 font-mono tabular-nums text-[11px]">
           <div className="flex items-center justify-between gap-5">
             <span className="text-[#8B949E]">总计算耗时</span>
@@ -146,7 +170,7 @@ export function OverviewDashboard({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [scope, setScope] = useState<OverviewFilterScope>('all');
-  const [resourceMode, setResourceMode] = useState<ResourceChartMode>('minutes');
+  const [resourceMode, setResourceMode] = useState<ResourceChartMode>('tokens');
 
   const fetchMetrics = useCallback(async () => {
     setLoading(true);
@@ -208,26 +232,39 @@ export function OverviewDashboard({
   const summary = metrics?.summary;
 
   return (
-    <section aria-label="全局研发效能概览" className="space-y-4">
-      {/* Sub-header */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2 text-[13px]">
-          <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
-            近 7 日全局研发效能概览
+    <section
+      aria-label="指挥大厅墙面数据大屏"
+      className="studio-bigscreen-bezel rounded-2xl overflow-hidden"
+    >
+      {/* Top Studio Wall Light Bar */}
+      <div
+        aria-hidden="true"
+        className="h-1 w-full bg-gradient-to-r from-[#F59E0B]/80 via-[#38BDF8]/50 to-[#A78BFA]/70"
+      />
+
+      {/* Big-Screen Bezel Header Strip */}
+      <div className="px-5 py-3.5 border-b border-[#232D40] bg-[#0B101A]/90 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2.5 text-[13px]">
+          <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#F59E0B]/40 bg-[#F59E0B]/12 text-[#FBBF24] shrink-0">
+            <Monitor className="h-4 w-4" />
+          </span>
+          <h2 className="font-display text-[15px] font-semibold text-[#F8FAFC] tracking-tight">
+            指挥大厅 · 办公室全景数据大屏
           </h2>
-          <span aria-hidden="true" className="text-[#6E7681]">·</span>
-          <span className="text-[12px] text-[#8B949E]">
-            基于真实 GitHub Actions 与规划任务流水线统计
+          <span aria-hidden="true" className="text-[#4B5870]">·</span>
+          <span className="text-[12px] text-[#8E9DB5]">
+            近 7 日全局研发效能与 Token 算力实时遥测
           </span>
         </div>
         {metrics?.generatedAt && (
-          <span className="font-mono text-[11px] tabular-nums text-[#8B949E]">
-            统计截至{' '}
+          <span className="font-mono text-[11px] tabular-nums text-[#8E9DB5]">
+            大屏同步于{' '}
             {new Date(metrics.generatedAt).toLocaleTimeString('zh-CN', { hour12: false })}
           </span>
         )}
       </div>
 
+      <div className="p-5 space-y-5">
       {error && (
         <div
           role="alert"
@@ -251,21 +288,21 @@ export function OverviewDashboard({
       {/* 4-Column KPI Strip */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {/* KPI 1: 7-day Success Rate */}
-        <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4">
-          <div className="text-[12px] text-[#8B949E]">近 7 日任务成功率</div>
+        <div className="rounded-xl border border-[#242F44] bg-[#0F1522] p-4">
+          <div className="text-[12px] text-[#94A3B8]">近 7 日任务成功率</div>
           {loading && !summary ? (
-            <div className="mt-2 h-7 w-20 rounded bg-[#21262D] animate-pulse" />
+            <div className="mt-2 h-7 w-20 rounded bg-[#1B2435] animate-pulse" />
           ) : (
             <div className="mt-1.5 flex items-baseline gap-2">
               <span
-                className={`font-mono text-[24px] font-semibold tracking-tight tabular-nums ${
+                className={`font-mono text-[26px] font-semibold tracking-tight tabular-nums ${
                   summary?.overallSuccessRate === null || summary?.overallSuccessRate === undefined
-                    ? 'text-[#8B949E]'
+                    ? 'text-[#8E9DB5]'
                     : summary.overallSuccessRate >= 70
-                      ? 'text-[#3FB950]'
+                      ? 'text-[#34D399]'
                       : summary.overallSuccessRate >= 40
-                        ? 'text-[#D29922]'
-                        : 'text-[#F85149]'
+                        ? 'text-[#FBBF24]'
+                        : 'text-[#FB7185]'
                 }`}
               >
                 {summary?.overallSuccessRate !== null && summary?.overallSuccessRate !== undefined
@@ -274,51 +311,51 @@ export function OverviewDashboard({
               </span>
             </div>
           )}
-          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8B949E]">
+          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8E9DB5]">
             {summary
               ? `成功 ${summary.succeededRuns} · 失败 ${summary.failedRuns} · 总计 ${summary.totalRuns}`
               : '正在统计…'}
           </div>
         </div>
 
-        {/* KPI 2: Compute Resource Consumption */}
-        <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4">
-          <div className="text-[12px] text-[#8B949E]">近 7 日算力消耗</div>
+        {/* KPI 2: Compute Resource Consumption (Tokens) */}
+        <div className="rounded-xl border border-[#242F44] bg-[#0F1522] p-4">
+          <div className="text-[12px] text-[#94A3B8]">近 7 日算力消耗 (Token)</div>
           {loading && !summary ? (
-            <div className="mt-2 h-7 w-24 rounded bg-[#21262D] animate-pulse" />
+            <div className="mt-2 h-7 w-24 rounded bg-[#1B2435] animate-pulse" />
           ) : (
             <div className="mt-1.5 flex items-baseline gap-1.5">
-              <span className="font-mono text-[24px] font-semibold tracking-tight text-[#F0F6FC] tabular-nums">
-                {summary ? summary.totalComputeMinutes.toFixed(1) : '0.0'}
+              <span className="font-mono text-[26px] font-semibold tracking-tight text-[#F8FAFC] tabular-nums">
+                {summary ? formatTokenCount(summary.totalTokens) : '0'}
               </span>
-              <span className="text-[12px] font-mono text-[#8B949E]">分钟</span>
+              <span className="text-[12px] font-mono text-[#A78BFA]">Tokens</span>
             </div>
           )}
-          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8B949E]">
+          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8E9DB5]">
             {summary
-              ? `规划 ${summary.planComputeMinutes.toFixed(1)}m · 编码/部署 ${summary.codingAndDeployMinutes.toFixed(1)}m`
+              ? `规划 ${formatTokenCount(summary.planTokens)} · 编码 ${formatTokenCount(summary.codingTokens)}`
               : '正在统计…'}
           </div>
         </div>
 
         {/* KPI 3: Average Duration per Task */}
-        <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4">
-          <div className="text-[12px] text-[#8B949E]">平均单次执行耗时</div>
+        <div className="rounded-xl border border-[#242F44] bg-[#0F1522] p-4">
+          <div className="text-[12px] text-[#94A3B8]">平均单次执行耗时</div>
           {loading && !summary ? (
-            <div className="mt-2 h-7 w-20 rounded bg-[#21262D] animate-pulse" />
+            <div className="mt-2 h-7 w-20 rounded bg-[#1B2435] animate-pulse" />
           ) : (
             <div className="mt-1.5 flex items-baseline gap-1.5">
-              <span className="font-mono text-[24px] font-semibold tracking-tight text-[#F0F6FC] tabular-nums">
+              <span className="font-mono text-[26px] font-semibold tracking-tight text-[#38BDF8] tabular-nums">
                 {summary?.avgDurationMinutes !== null && summary?.avgDurationMinutes !== undefined
                   ? summary.avgDurationMinutes.toFixed(1)
                   : '—'}
               </span>
               {summary?.avgDurationMinutes !== null && summary?.avgDurationMinutes !== undefined && (
-                <span className="text-[12px] font-mono text-[#8B949E]">分钟/次</span>
+                <span className="text-[12px] font-mono text-[#8E9DB5]">分钟/次</span>
               )}
             </div>
           )}
-          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8B949E]">
+          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8E9DB5]">
             {summary
               ? summary.runningRuns > 0
                 ? `当前 ${summary.runningRuns} 项执行中`
@@ -328,19 +365,19 @@ export function OverviewDashboard({
         </div>
 
         {/* KPI 4: Weekly PRD Delivery */}
-        <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4">
-          <div className="text-[12px] text-[#8B949E]">本周需求交付</div>
+        <div className="rounded-xl border border-[#242F44] bg-[#0F1522] p-4">
+          <div className="text-[12px] text-[#94A3B8]">本周需求交付</div>
           {loading && !summary ? (
-            <div className="mt-2 h-7 w-20 rounded bg-[#21262D] animate-pulse" />
+            <div className="mt-2 h-7 w-20 rounded bg-[#1B2435] animate-pulse" />
           ) : (
             <div className="mt-1.5 flex items-baseline gap-1.5">
-              <span className="font-mono text-[24px] font-semibold tracking-tight text-[#F0F6FC] tabular-nums">
+              <span className="font-mono text-[26px] font-semibold tracking-tight text-[#FBBF24] tabular-nums">
                 {summary?.deliveredPrdCount ?? 0}
               </span>
-              <span className="text-[12px] font-mono text-[#8B949E]">个需求</span>
+              <span className="text-[12px] font-mono text-[#8E9DB5]">个需求</span>
             </div>
           )}
-          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8B949E]">
+          <div className="mt-1.5 text-[11px] font-mono tabular-nums text-[#8E9DB5]">
             {summary
               ? `已批准上线 ${summary.approvedPrdCount} · 近 7 日执行 ${summary.totalRuns} 次`
               : '正在统计…'}
@@ -351,23 +388,23 @@ export function OverviewDashboard({
       {/* 2-Column Recharts Visualizations */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-stretch">
         {/* Left Chart: 7-Day Task Success Rate Trend */}
-        <div className="xl:col-span-6 rounded-md border border-[#30363D] bg-[#161B22] p-5 flex flex-col">
+        <div className="xl:col-span-6 rounded-xl border border-[#242F44] bg-[#0F1522] p-5 flex flex-col">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
             <div>
-              <h3 className="text-[14px] font-semibold text-[#F0F6FC]">
+              <h3 className="font-display text-[14px] font-semibold text-[#F8FAFC]">
                 近 7 日任务成功率趋势
               </h3>
-              <div className="mt-1 flex flex-wrap items-center gap-3 text-[11px] text-[#8B949E]">
+              <div className="mt-1 flex flex-wrap items-center gap-3 text-[11px] text-[#8E9DB5]">
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-xs bg-[#3FB950]" aria-hidden="true" />
+                  <span className="h-2 w-2 rounded-xs bg-[#34D399]" aria-hidden="true" />
                   成功
                 </span>
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-xs bg-[#F85149]" aria-hidden="true" />
+                  <span className="h-2 w-2 rounded-xs bg-[#FB7185]" aria-hidden="true" />
                   失败/取消
                 </span>
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-0.5 w-3 bg-[#58A6FF]" aria-hidden="true" />
+                  <span className="h-0.5 w-3 bg-[#38BDF8]" aria-hidden="true" />
                   成功率 %
                 </span>
               </div>
@@ -448,7 +485,7 @@ export function OverviewDashboard({
                     dataKey="displaySucceeded"
                     name="成功"
                     stackId="runs"
-                    fill="#3FB950"
+                    fill="#34D399"
                     radius={[0, 0, 0, 0]}
                     barSize={24}
                     isAnimationActive={false}
@@ -458,7 +495,7 @@ export function OverviewDashboard({
                     dataKey="displayFailed"
                     name="失败/取消"
                     stackId="runs"
-                    fill="#F85149"
+                    fill="#FB7185"
                     radius={[3, 3, 0, 0]}
                     barSize={24}
                     isAnimationActive={false}
@@ -468,12 +505,12 @@ export function OverviewDashboard({
                     type="monotone"
                     dataKey="displayRate"
                     name="成功率"
-                    stroke="#58A6FF"
+                    stroke="#38BDF8"
                     strokeWidth={2}
                     connectNulls
                     isAnimationActive={false}
-                    dot={{ r: 4, fill: '#0D1117', stroke: '#58A6FF', strokeWidth: 2 }}
-                    activeDot={{ r: 5.5, fill: '#58A6FF', stroke: '#F0F6FC', strokeWidth: 1.5 }}
+                    dot={{ r: 4, fill: '#0F1522', stroke: '#38BDF8', strokeWidth: 2 }}
+                    activeDot={{ r: 5.5, fill: '#38BDF8', stroke: '#F8FAFC', strokeWidth: 1.5 }}
                   />
                 </ComposedChart>
               </ResponsiveContainer>
@@ -482,19 +519,19 @@ export function OverviewDashboard({
         </div>
 
         {/* Right Chart: 7-Day Resource Consumption Trend */}
-        <div className="xl:col-span-6 rounded-md border border-[#30363D] bg-[#161B22] p-5 flex flex-col">
+        <div className="xl:col-span-6 rounded-xl border border-[#242F44] bg-[#0F1522] p-5 flex flex-col">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
             <div>
-              <h3 className="text-[14px] font-semibold text-[#F0F6FC]">
+              <h3 className="font-display text-[14px] font-semibold text-[#F8FAFC]">
                 近 7 日资源消耗趋势
               </h3>
-              <div className="mt-1 flex flex-wrap items-center gap-3 text-[11px] text-[#8B949E]">
+              <div className="mt-1 flex flex-wrap items-center gap-3 text-[11px] text-[#8E9DB5]">
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-xs bg-[#58A6FF]" aria-hidden="true" />
+                  <span className="h-2 w-2 rounded-xs bg-[#38BDF8]" aria-hidden="true" />
                   需求规划
                 </span>
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-xs bg-[#A371F7]" aria-hidden="true" />
+                  <span className="h-2 w-2 rounded-xs bg-[#A78BFA]" aria-hidden="true" />
                   编码与部署 Runner
                 </span>
               </div>
@@ -507,8 +544,9 @@ export function OverviewDashboard({
             >
               {(
                 [
-                  { id: 'minutes', label: '计算耗时 (分)' },
+                  { id: 'tokens', label: 'Token 消耗' },
                   { id: 'runs', label: '执行频次' },
+                  { id: 'minutes', label: '耗时 (分)' },
                 ] as const
               ).map((tab) => {
                 const active = resourceMode === tab.id;
@@ -538,66 +576,85 @@ export function OverviewDashboard({
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
                   data={chartRows}
-                  margin={{ top: 10, right: 20, left: -8, bottom: 0 }}
+                  margin={{ top: 10, right: 20, left: -4, bottom: 0 }}
                 >
                   <defs>
                     <linearGradient id="autodevPlanFill" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#58A6FF" stopOpacity={0.35} />
-                      <stop offset="95%" stopColor="#58A6FF" stopOpacity={0.04} />
+                      <stop offset="5%" stopColor="#38BDF8" stopOpacity={0.35} />
+                      <stop offset="95%" stopColor="#38BDF8" stopOpacity={0.04} />
                     </linearGradient>
                     <linearGradient id="autodevCodingFill" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#A371F7" stopOpacity={0.35} />
-                      <stop offset="95%" stopColor="#A371F7" stopOpacity={0.04} />
+                      <stop offset="5%" stopColor="#A78BFA" stopOpacity={0.35} />
+                      <stop offset="95%" stopColor="#A78BFA" stopOpacity={0.04} />
                     </linearGradient>
                   </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#21262D" vertical={false} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1E283B" vertical={false} />
                   <XAxis
                     dataKey="label"
                     padding={{ left: 12, right: 12 }}
-                    tick={{ fill: '#8B949E', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
-                    axisLine={{ stroke: '#30363D' }}
+                    tick={{ fill: '#8E9DB5', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
+                    axisLine={{ stroke: '#2A3548' }}
                     tickLine={false}
                   />
                   <YAxis
                     allowDecimals={resourceMode === 'minutes'}
-                    tickFormatter={(v) => (resourceMode === 'minutes' ? `${v}m` : `${v}`)}
-                    tick={{ fill: '#8B949E', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
+                    tickFormatter={(v) =>
+                      resourceMode === 'tokens'
+                        ? formatTokenCount(Number(v))
+                        : resourceMode === 'minutes'
+                          ? `${v}m`
+                          : `${v}`
+                    }
+                    tick={{ fill: '#8E9DB5', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
                     axisLine={false}
                     tickLine={false}
                   />
                   <Tooltip
                     content={<ResourceUsageTooltip mode={resourceMode} />}
-                    cursor={{ stroke: '#30363D', strokeDasharray: '3 3' }}
+                    cursor={{ stroke: '#2A3548', strokeDasharray: '3 3' }}
                   />
                   <Area
                     type="monotone"
-                    dataKey={resourceMode === 'minutes' ? 'planMinutes' : 'planCount'}
+                    dataKey={
+                      resourceMode === 'tokens'
+                        ? 'planTokens'
+                        : resourceMode === 'minutes'
+                          ? 'planMinutes'
+                          : 'planCount'
+                    }
                     name="需求规划"
                     stackId="resource"
-                    stroke="#58A6FF"
+                    stroke="#38BDF8"
                     strokeWidth={2}
                     fill="url(#autodevPlanFill)"
                     isAnimationActive={false}
-                    dot={{ r: 3, fill: '#0D1117', stroke: '#58A6FF', strokeWidth: 1.5 }}
-                    activeDot={{ r: 4.5, fill: '#58A6FF', stroke: '#F0F6FC', strokeWidth: 1.5 }}
+                    dot={{ r: 3, fill: '#0F1522', stroke: '#38BDF8', strokeWidth: 1.5 }}
+                    activeDot={{ r: 4.5, fill: '#38BDF8', stroke: '#F8FAFC', strokeWidth: 1.5 }}
                   />
                   <Area
                     type="monotone"
-                    dataKey={resourceMode === 'minutes' ? 'codingAndDeployMinutes' : 'codingCount'}
+                    dataKey={
+                      resourceMode === 'tokens'
+                        ? 'codingTokens'
+                        : resourceMode === 'minutes'
+                          ? 'codingAndDeployMinutes'
+                          : 'codingCount'
+                    }
                     name="编码与部署"
                     stackId="resource"
-                    stroke="#A371F7"
+                    stroke="#A78BFA"
                     strokeWidth={2}
                     fill="url(#autodevCodingFill)"
                     isAnimationActive={false}
-                    dot={{ r: 3, fill: '#0D1117', stroke: '#A371F7', strokeWidth: 1.5 }}
-                    activeDot={{ r: 4.5, fill: '#A371F7', stroke: '#F0F6FC', strokeWidth: 1.5 }}
+                    dot={{ r: 3, fill: '#0F1522', stroke: '#A78BFA', strokeWidth: 1.5 }}
+                    activeDot={{ r: 4.5, fill: '#A78BFA', stroke: '#F8FAFC', strokeWidth: 1.5 }}
                   />
                 </AreaChart>
               </ResponsiveContainer>
             )}
           </div>
         </div>
+      </div>
       </div>
     </section>
   );

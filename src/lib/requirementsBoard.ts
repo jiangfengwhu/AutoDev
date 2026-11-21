@@ -1,11 +1,13 @@
 import type { AnalysisJob, PipelineRun } from '../types/autodev';
 import type { TestExecutionReport } from './rsiEngine';
+import { sanitizeCodingChatOutput } from './codingChatOutput';
 
 export type AuditLogCategory = 'planning' | 'execution' | 'approval' | 'quality';
 
 export type AuditActionType =
   | 'prd_analysis_started'
   | 'prd_analysis_cancelled'
+  | 'plan_edited'
   | 'draft_pr_created'
   | 'agy_coding_dispatched'
   | 'actions_run_cancelled'
@@ -77,6 +79,11 @@ export interface RequirementBoardItem {
   latestTestPassed: number;
   latestTestFailed: number;
   latestTestSummary?: string;
+  hasCodingOutput?: boolean;
+  latestCodingOutputPreview?: string;
+  latestCodingCommitSha?: string;
+  repairRounds?: number;
+  totalTokens?: number;
   createdAt: string;
   updatedAt: string;
   auditEvents: AuditLogEntry[];
@@ -134,6 +141,7 @@ export const AUDIT_CATEGORY_LABELS: Record<AuditLogCategory, string> = {
 export const AUDIT_ACTION_LABELS: Record<AuditActionType, string> = {
   prd_analysis_started: '发起需求规划',
   prd_analysis_cancelled: '取消需求规划',
+  plan_edited: '编辑需求规划方案',
   draft_pr_created: '创建规格 Draft PR',
   agy_coding_dispatched: '派发 AGY 编码执行',
   actions_run_cancelled: '取消 Actions 任务',
@@ -210,9 +218,9 @@ export function synthesizeBaselineAuditEvents(params: {
         prdTitle: job.prdTitle,
         branch: job.defaultBranch,
         status: job.status === 'error' ? 'failed' : 'success',
-        detail: `${job.executionMode === 'gemini_api' ? 'Gemini API' : 'Instabox VPS AGY'} 三阶段规划${
-          job.agyModel ? ` (${job.agyModel})` : ''
-        }`,
+        detail: `${job.executionMode === 'gemini_api' ? 'Gemini API' : 'Instabox VPS AGY'} ${
+          job.planMode === 'unified_single_turn' ? '单对话联合规划' : '三阶段规划'
+        }${job.agyModel ? ` (${job.agyModel})` : ''}`,
         synthetic: true,
       });
     }
@@ -406,6 +414,20 @@ export function buildRequirementsBoardData(params: {
     const updatedAt =
       candidateTimestamps.sort((a, b) => Date.parse(b) - Date.parse(a))[0] || run.createdAt;
 
+    const rawCodingText = (
+      run.latestCodingOutput?.content ||
+      matchedReports.find((r) => Boolean(r.codingFinalOutput?.trim()))?.codingFinalOutput ||
+      ''
+    ).trim();
+    const latestCodingText = sanitizeCodingChatOutput(rawCodingText) || '';
+    const codingTokensSum = matchedReports.reduce(
+      (sum, r) => sum + (r.tokenUsage?.totalTokens || 0),
+      0
+    );
+    const planTokensVal = run.planTokenUsage?.totalTokens || linkedJob?.tokenUsage?.totalTokens || 0;
+    const totalTokens =
+      planTokensVal + Math.max(codingTokensSum, run.latestCodingOutput?.tokenUsage?.totalTokens || 0);
+
     items.push({
       id: run.id,
       runId: run.id,
@@ -437,6 +459,13 @@ export function buildRequirementsBoardData(params: {
       latestTestPassed: latestReport ? latestReport.passed : 0,
       latestTestFailed: latestReport ? latestReport.failed : 0,
       latestTestSummary: latestReport?.summary,
+      hasCodingOutput: Boolean(latestCodingText),
+      latestCodingOutputPreview: latestCodingText
+        ? latestCodingText.replace(/\s+/g, ' ').slice(0, 220)
+        : undefined,
+      latestCodingCommitSha: run.latestCodingOutput?.commitSha,
+      repairRounds: run.latestCodingOutput?.repairRounds ?? latestReport?.repairRounds,
+      totalTokens: totalTokens > 0 ? totalTokens : undefined,
       createdAt: run.createdAt,
       updatedAt,
       auditEvents: matchedEvents,

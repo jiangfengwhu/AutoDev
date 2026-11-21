@@ -3,6 +3,7 @@ import type { AgySessionSnapshot } from '../lib/sessionReuse';
 export type { AgySessionSnapshot };
 
 export type NavSectionId =
+  | 'studio'
   | 'environment'
   | 'prd'
   | 'requirements'
@@ -257,6 +258,7 @@ export interface DraftPrResult {
   commitSha: string;
   filesCommitted: string[];
   e2eTestPath?: string;
+  e2eVaultPath?: string;
   archivedSpecPath?: string;
   createdAt: string;
   initializedEmptyRepo?: boolean;
@@ -301,6 +303,25 @@ export interface MergedReleaseResult {
   branchDeleted?: boolean;
 }
 
+export interface TokenUsageSummary {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  source: 'reported' | 'estimated';
+  model?: string;
+}
+
+export interface CodingAgentOutputSnapshot {
+  content: string;
+  commitSha?: string;
+  model?: string;
+  actionsRunId?: number;
+  actionsUrl?: string;
+  repairRounds?: number;
+  capturedAt: string;
+  tokenUsage?: TokenUsageSummary;
+}
+
 export interface PipelineRun {
   id: string;
   createdAt: string;
@@ -316,9 +337,13 @@ export interface PipelineRun {
   status: PipelineRunStatus;
   draftPr?: DraftPrResult;
   previewDeployment?: PreviewDeployment;
+  productionDeployment?: PreviewDeployment;
   mergedRelease?: MergedReleaseResult;
   lastRework?: ReworkDispatchResult;
   lastAgySession?: AgySessionSnapshot;
+  latestCodingOutput?: CodingAgentOutputSnapshot;
+  planTokenUsage?: TokenUsageSummary;
+  planUpdatedAt?: string;
   checkedCriteriaIds?: string[];
   approvalNote?: string;
   approvedAt?: string;
@@ -334,6 +359,10 @@ export interface GitHubActionRun {
   htmlUrl: string;
   createdAt: string;
   updatedAt: string;
+  targetBranch?: string;
+  pipelineRunId?: string;
+  jobId?: string;
+  prNumber?: number;
 }
 
 export interface GitHubSelfHostedRunner {
@@ -360,12 +389,15 @@ export interface AnalysisJob {
   techStackHint?: string;
   executionMode?: AnalysisExecutionMode;
   agyModel?: string;
+  agyMode?: string;
   planActionsUrl?: string;
   planActionsRunId?: number;
   planChannelBranch?: string;
   planIssueNumber?: number;
   planStateCommentId?: number;
   planInputCommentId?: number;
+  planMode?: 'unified_single_turn' | 'three_stage';
+  tokenUsage?: TokenUsageSummary;
   repoContext?: RepoContextSnapshot;
   status: AnalysisJobStatus;
   steps: AgentStepState[];
@@ -395,4 +427,37 @@ export type AnalysisSseEvent =
     }
   | { type: 'pipeline_complete'; run: PipelineRun; timestamp: string }
   | { type: 'error'; step?: AgentStepId; message: string; timestamp: string };
+
+export type BackgroundTaskKind =
+  | 'create_draft_pr'
+  | 'deploy_preview'
+  | 'approve_release'
+  | 'request_rework'
+  | 'rsi_sync'
+  | 'rsi_analyze'
+  | 'rsi_consolidate'
+  | 'rsi_report_incident'
+  | 'state_sync'
+  | 'admin_reset';
+
+export type BackgroundTaskStatus = 'running' | 'completed' | 'failed';
+
+export interface BackgroundTask {
+  id: string;
+  kind: BackgroundTaskKind;
+  title: string;
+  roomId: NavSectionId;
+  status: BackgroundTaskStatus;
+  progressMessage: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  runId?: string;
+  repoFullName?: string;
+  dedupeKey?: string;
+  summary?: string;
+  result?: Record<string, unknown>;
+  error?: string;
+}
+
 

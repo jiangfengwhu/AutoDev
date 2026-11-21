@@ -7,6 +7,7 @@ import {
   type AuditLogCategory,
   type AuditLogEntry,
 } from '../src/lib/requirementsBoard';
+import { scheduleGitHubStateSync } from './githubStateStore';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const AUDIT_LOG_FILE = path.join(DATA_DIR, 'audit-logs-v1.json');
@@ -37,7 +38,7 @@ function loadLogs(): AuditLogEntry[] {
   return logsCache;
 }
 
-function persistLogs(next: AuditLogEntry[]): void {
+function persistLogs(next: AuditLogEntry[], skipRemoteSync = false): void {
   logsCache = next;
   try {
     ensureDataDir();
@@ -45,6 +46,14 @@ function persistLogs(next: AuditLogEntry[]): void {
   } catch {
     // ignore disk errors
   }
+  if (!skipRemoteSync) {
+    scheduleGitHubStateSync('auditLogs', next);
+  }
+}
+
+export function reloadAuditLogsFromDisk(): void {
+  logsCache = null;
+  loadLogs();
 }
 
 export function listAuditLogs(): AuditLogEntry[] {
@@ -85,4 +94,10 @@ export function appendAuditLog(input: {
   const next = [entry, ...current].slice(0, 300);
   persistLogs(next);
   return entry;
+}
+
+export function clearAllAuditLogs(): number {
+  const prevCount = loadLogs().length;
+  persistLogs([]);
+  return prevCount;
 }

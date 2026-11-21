@@ -20,6 +20,7 @@ import {
   normalizeRuleDedupeKey,
   selectActiveRsiRulesForStage,
 } from '../src/lib/rsiEngine';
+import { scheduleGitHubStateSync } from './githubStateStore';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const RSI_STORE_FILE = path.join(DATA_DIR, 'rsi-state-v1.json');
@@ -57,7 +58,7 @@ function loadState(): RsiPersistedState {
   return stateCache;
 }
 
-function persistState(next: RsiPersistedState): void {
+function persistState(next: RsiPersistedState, skipRemoteSync = false): void {
   stateCache = next;
   try {
     ensureDataDir();
@@ -65,6 +66,14 @@ function persistState(next: RsiPersistedState): void {
   } catch {
     // ignore disk errors
   }
+  if (!skipRemoteSync) {
+    scheduleGitHubStateSync('rsi', next);
+  }
+}
+
+export function reloadRsiStateFromDisk(): void {
+  stateCache = null;
+  loadState();
 }
 
 export function getRsiState(): RsiPersistedState {
@@ -401,4 +410,38 @@ export function recordRulesAppliedForStage(stage: Exclude<RsiTargetStage, 'all'>
 
 export function listAllRsiRules(): RsiSystemRule[] {
   return [...loadState().rules];
+}
+
+export function deleteTestReportById(reportId: string): boolean {
+  const s = loadState();
+  const nextReports = s.testReports.filter((r) => r.id !== reportId);
+  if (nextReports.length === s.testReports.length) return false;
+  persistState({ ...s, testReports: nextReports });
+  return true;
+}
+
+export function deleteIncidentById(incidentId: string): boolean {
+  const s = loadState();
+  const nextIncidents = s.incidents.filter((i) => i.id !== incidentId);
+  if (nextIncidents.length === s.incidents.length) return false;
+  persistState({ ...s, incidents: nextIncidents });
+  return true;
+}
+
+export function clearRsiHistory(options: { keepRules?: boolean } = {}): {
+  clearedReports: number;
+  clearedIncidents: number;
+  clearedRules: number;
+} {
+  const s = loadState();
+  const clearedReports = s.testReports.length;
+  const clearedIncidents = s.incidents.length;
+  const clearedRules = options.keepRules ? 0 : s.rules.length;
+  persistState({
+    testReports: [],
+    incidents: [],
+    rules: options.keepRules ? s.rules : [],
+    lastSyncedAt: undefined,
+  });
+  return { clearedReports, clearedIncidents, clearedRules };
 }

@@ -30,7 +30,8 @@ import {
   setRsiLastSyncedAt,
   upsertTestReport,
 } from './rsiStore';
-import { attachAgySessionToRun } from './runStore';
+import type { TokenUsageSummary } from '../src/types/autodev';
+import { attachAgySessionToRun, attachCodingOutputToRun } from './runStore';
 import {
   getGitHubActionRunDetail,
   listGitHubActionRuns,
@@ -725,6 +726,11 @@ interface RemoteChannelTestReport {
   agySessionId?: string;
   agySessionReused?: boolean;
   agyExitCode?: number;
+  repairRounds?: number;
+  commitSha?: string;
+  model?: string;
+  codingFinalOutput?: string;
+  tokenUsage?: TokenUsageSummary;
 }
 
 /**
@@ -810,6 +816,9 @@ export async function syncRepoTestReportsAndFailures(
           agySessionId: remoteJson.agySessionId,
           agySessionReused: remoteJson.agySessionReused,
           agyExitCode: remoteJson.agyExitCode,
+          codingFinalOutput: remoteJson.codingFinalOutput,
+          repairRounds: remoteJson.repairRounds,
+          tokenUsage: remoteJson.tokenUsage,
         };
 
         if (remoteJson.agyExitCode !== undefined || remoteJson.agySessionId) {
@@ -831,6 +840,25 @@ export async function syncRepoTestReportsAndFailures(
               reused: Boolean(remoteJson.agySessionReused),
               consecutiveReuseCount: 0,
               updatedAt: remoteJson.executedAt || run.updatedAt || run.createdAt,
+            }
+          );
+        }
+
+        if (remoteJson.codingFinalOutput && remoteJson.codingFinalOutput.trim()) {
+          attachCodingOutputToRun(
+            {
+              runId: remoteJson.runId || undefined,
+              branchName: remoteJson.branch || run.headBranch,
+            },
+            {
+              content: remoteJson.codingFinalOutput.trim(),
+              commitSha: remoteJson.commitSha,
+              model: remoteJson.model,
+              actionsRunId: run.id,
+              actionsUrl: remoteJson.actionsUrl || run.htmlUrl,
+              repairRounds: remoteJson.repairRounds,
+              capturedAt: remoteJson.executedAt || run.updatedAt || run.createdAt,
+              tokenUsage: remoteJson.tokenUsage,
             }
           );
         }

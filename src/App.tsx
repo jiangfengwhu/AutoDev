@@ -1,36 +1,30 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { GitBranch, Menu } from 'lucide-react';
 import type {
   AnalysisJob,
+  BackgroundTask,
   IntegrationsStatusResponse,
   NavSectionId,
   PipelineRun,
   SelectedTargetRepo,
   ToastItem,
 } from './types/autodev';
-import { Sidebar } from './components/Sidebar';
+import { StudioNavigationShell } from './components/StudioNavigationShell';
+import { StudioOfficeMap, buildRoomLiveState } from './components/StudioOfficeMap';
+import { StudioRoomBanner } from './components/StudioRoomBanner';
+import { BackgroundTasksPanel } from './components/BackgroundTasksPanel';
 import { EnvironmentView } from './components/EnvironmentView';
 import { PrdWorkspaceView } from './components/PrdWorkspaceView';
 import { RequirementsBoardView } from './components/RequirementsBoardView';
 import { PipelineBoardView } from './components/PipelineBoardView';
 import { ApprovalView } from './components/ApprovalView';
-import { QualityRsiView } from './components/QualityRsiView';
+import { QualityRsiView, type QualityFocusTarget } from './components/QualityRsiView';
 import { ToastContainer } from './components/ToastContainer';
 import { FIXED_TARGET_REPO } from './lib/workflowBuilder';
+import type { StudioRoomId } from './lib/studioTheme';
 import {
   clearPrdDraft,
   loadPrdDraft,
-  savePrdDraft,
 } from './lib/prdDraftStorage';
-
-const SECTION_META: Record<NavSectionId, { breadcrumb: string }> = {
-  environment: { breadcrumb: '1. 环境与引擎装配' },
-  prd: { breadcrumb: '2. 新建需求 (PRD)' },
-  requirements: { breadcrumb: '3. 需求看板' },
-  pipeline: { breadcrumb: '4. 全自动流水线看板' },
-  approval: { breadcrumb: '5. 验收与上线审批' },
-  quality: { breadcrumb: '6. 质量与自进化 (RSI)' },
-};
 
 const DEFAULT_PINNED_REPO: SelectedTargetRepo = {
   fullName: FIXED_TARGET_REPO.fullName,
@@ -48,8 +42,7 @@ export interface PrdDraftState {
 }
 
 export default function App() {
-  const [activeSection, setActiveSection] = useState<NavSectionId>('environment');
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [activeSection, setActiveSection] = useState<NavSectionId>('studio');
 
   const [status, setStatus] = useState<IntegrationsStatusResponse | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
@@ -61,6 +54,15 @@ export default function App() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
   const [analysisJob, setAnalysisJob] = useState<AnalysisJob | null>(null);
+  const [analysisJobs, setAnalysisJobs] = useState<AnalysisJob[]>([]);
+  const [focusedQualityTarget, setFocusedQualityTarget] = useState<QualityFocusTarget | null>(null);
+
+  // Global detached server-side background tasks
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
+  const [tasksDrawerOpen, setTasksDrawerOpen] = useState(false);
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const prevTaskStatusRef = useRef<Map<string, BackgroundTask['status']>>(new Map());
+
   const [prdDraft, setPrdDraft] = useState<PrdDraftState>(() => {
     const saved = loadPrdDraft();
     return saved
@@ -92,7 +94,7 @@ export default function App() {
     (toast: Omit<ToastItem, 'id'>) => {
       const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       setToasts((prev) => [...prev.slice(-4), { ...toast, id }]);
-      const ttl = toast.type === 'error' ? 7500 : 4500;
+      const ttl = toast.type === 'error' ? 7500 : 4800;
       setTimeout(() => {
         setToasts((prev) => prev.filter((t) => t.id !== id));
       }, ttl);
@@ -149,6 +151,101 @@ export default function App() {
     }
   }, [pushErrorToast]);
 
+  const fetchRunsAndLatestJob = useCallback(async () => {
+    try {
+      const [runsRes, jobRes] = await Promise.all([
+        fetch('/api/runs'),
+        fetch('/api/agents/jobs/latest'),
+      ]);
+
+      let loadedRuns: PipelineRun[] = [];
+      if (runsRes.ok) {
+        const runsData = (await runsRes.json()) as { runs?: PipelineRun[] };
+        if (Array.isArray(runsData.runs)) {
+          loadedRuns = runsData.runs;
+          setRuns(loadedRuns);
+          if (loadedRuns.length > 0) {
+            setActiveRunId((prev) => prev ?? loadedRuns[0].id);
+          }
+        }
+      }
+
+      if (jobRes.ok) {
+        const jobData = (await jobRes.json()) as {
+          job?: AnalysisJob | null;
+          jobs?: AnalysisJob[];
+        };
+        const loadedJobs = Array.isArray(jobData.jobs) ? jobData.jobs : [];
+        setAnalysisJobs(loadedJobs);
+
+        // Clean up any stale localStorage draft that already belongs to a submitted/completed requirement
+        const savedLocal = loadPrdDraft();
+        if (savedLocal) {
+          const normTitle = savedLocal.prdTitle.trim();
+          const normContent = savedLocal.prdContent.trim();
+          const alreadySubmitted =
+            loadedRuns.some(
+              (r) =>
+                r.prdTitle.trim() === normTitle &&
+                r.prdContent.trim() === normContent
+            ) ||
+            loadedJobs.some(
+              (j) =>
+                j.status !== 'error' &&
+                j.prdTitle.trim() === normTitle &&
+                j.prdContent.trim() === normContent
+            );
+          if (alreadySubmitted) {
+            clearPrdDraft();
+            hasRestoredLocalDraftRef.current = false;
+            setDraftSavedAt(null);
+            if (!draftDirtyRef.current) {
+              setPrdDraft({ prdTitle: '', techStackHint: '', prdContent: '' });
+            }
+          }
+        }
+
+        const job = jobData.job ?? null;
+        if (job) {
+          const linkedRun = job.runId
+            ? loadedRuns.find((r) => r.id === job.runId) ?? job.run ?? null
+            : null;
+          const isAwaitingDraftPr =
+            job.status === 'completed' &&
+            Boolean(linkedRun) &&
+            !linkedRun?.draftPr &&
+            !linkedRun?.mergedRelease &&
+            linkedRun?.status === 'analyzed';
+
+          // Only bind analysisJob into PRD workspace if actively running or awaiting Draft PR creation.
+          // Completed requirements (Draft PR created / approved / merged) must NOT occupy the New Requirement screen.
+          if (job.status === 'running' || isAwaitingDraftPr) {
+            setAnalysisJob(job);
+            lastJobStatusRef.current = job.status;
+            if (!draftDirtyRef.current && job.status === 'running') {
+              setPrdDraft({
+                prdTitle: job.prdTitle,
+                techStackHint: job.techStackHint ?? '',
+                prdContent: job.prdContent,
+              });
+            }
+            if (job.runId) {
+              setActiveRunId((prev) => prev ?? job.runId!);
+            }
+          } else {
+            setAnalysisJob(null);
+            lastJobStatusRef.current = null;
+          }
+        } else {
+          setAnalysisJob(null);
+          lastJobStatusRef.current = null;
+        }
+      }
+    } catch {
+      // non-fatal
+    }
+  }, []);
+
   const fetchRuns = useCallback(async () => {
     try {
       const res = await fetch('/api/runs');
@@ -165,47 +262,126 @@ export default function App() {
     }
   }, []);
 
-  const fetchLatestAnalysisJob = useCallback(async () => {
-    try {
-      const res = await fetch('/api/agents/jobs/latest');
-      if (!res.ok) return;
-      const data = (await res.json()) as { job?: AnalysisJob | null };
-      const job = data.job ?? null;
-      if (job) {
-        setAnalysisJob(job);
-        lastJobStatusRef.current = job.status;
-        if (!draftDirtyRef.current && (!hasRestoredLocalDraftRef.current || job.status === 'running')) {
-          setPrdDraft({
-            prdTitle: job.prdTitle,
-            techStackHint: job.techStackHint ?? '',
-            prdContent: job.prdContent,
-          });
+  const handleEnvironmentReset = useCallback(() => {
+    setRuns([]);
+    setActiveRunId(null);
+    setAnalysisJob(null);
+    setAnalysisJobs([]);
+    lastJobStatusRef.current = null;
+    clearPrdDraft();
+    hasRestoredLocalDraftRef.current = false;
+    draftDirtyRef.current = false;
+    setPrdDraft({ prdTitle: '', techStackHint: '', prdContent: '' });
+    setDraftSavedAt(null);
+    fetchRunsAndLatestJob();
+  }, [fetchRunsAndLatestJob]);
+
+  const fetchBackgroundTasks = useCallback(
+    async (detectTransitions: boolean) => {
+      try {
+        const res = await fetch('/api/tasks');
+        if (!res.ok) return;
+        const data = (await res.json()) as { tasks?: BackgroundTask[] };
+        const nextTasks = Array.isArray(data.tasks) ? data.tasks : [];
+
+        if (detectTransitions) {
+          let needsRefresh = false;
+          let needsReset = false;
+
+          for (const task of nextTasks) {
+            const prevStatus = prevTaskStatusRef.current.get(task.id);
+            if (prevStatus === 'running' && task.status === 'completed') {
+              needsRefresh = true;
+              if (task.kind === 'admin_reset') {
+                needsReset = true;
+              }
+              pushSuccessToast(
+                task.progressMessage || `${task.title} 已在后台完成`,
+                `后台完成：${task.title}`
+              );
+            } else if (prevStatus === 'running' && task.status === 'failed') {
+              needsRefresh = true;
+              pushErrorToast(
+                task.error || task.progressMessage || '后台任务执行失败',
+                `后台失败：${task.title}`
+              );
+            }
+          }
+
+          if (needsReset) {
+            handleEnvironmentReset();
+          }
+          if (needsRefresh) {
+            fetchRunsAndLatestJob();
+            fetchIntegrationsStatus();
+            setRefreshNonce((n) => n + 1);
+          }
         }
-        if (job.runId) {
-          setActiveRunId((prev) => prev ?? job.runId!);
+
+        const nextMap = new Map<string, BackgroundTask['status']>();
+        for (const t of nextTasks) {
+          nextMap.set(t.id, t.status);
         }
+        prevTaskStatusRef.current = nextMap;
+        setBackgroundTasks(nextTasks);
+      } catch {
+        // retry on next poll
       }
-    } catch {
-      // non-fatal
-    }
+    },
+    [
+      fetchIntegrationsStatus,
+      fetchRunsAndLatestJob,
+      handleEnvironmentReset,
+      pushErrorToast,
+      pushSuccessToast,
+    ]
+  );
+
+  const handleBackgroundTaskStarted = useCallback((task: BackgroundTask) => {
+    prevTaskStatusRef.current.set(task.id, task.status);
+    setBackgroundTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
   }, []);
 
   useEffect(() => {
     fetchIntegrationsStatus();
-    fetchRuns();
-    fetchLatestAnalysisJob();
-  }, [fetchIntegrationsStatus, fetchRuns, fetchLatestAnalysisJob]);
+    fetchRunsAndLatestJob();
+    fetchBackgroundTasks(false);
+  }, [fetchIntegrationsStatus, fetchRunsAndLatestJob, fetchBackgroundTasks]);
+
+  const hasRunningBackgroundTask = backgroundTasks.some((t) => t.status === 'running');
+
+  useEffect(() => {
+    if (!hasRunningBackgroundTask) return;
+    const timer = setInterval(() => {
+      fetchBackgroundTasks(true);
+    }, 1800);
+    return () => clearInterval(timer);
+  }, [hasRunningBackgroundTask, fetchBackgroundTasks]);
 
   const handleRunCompleted = useCallback((run: PipelineRun) => {
     setRuns((prev) => [run, ...prev.filter((r) => r.id !== run.id)]);
     setActiveRunId(run.id);
+    clearPrdDraft();
+    hasRestoredLocalDraftRef.current = false;
+    setDraftSavedAt(null);
   }, []);
 
   const handleRunUpdated = useCallback((updated: PipelineRun) => {
     setRuns((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    // Once a Draft PR is created or the requirement is approved/merged, never keep it in PRD draft storage
+    if (updated.draftPr || updated.mergedRelease || updated.status === 'approved') {
+      clearPrdDraft();
+      hasRestoredLocalDraftRef.current = false;
+      draftDirtyRef.current = false;
+      setDraftSavedAt(null);
+      setPrdDraft({ prdTitle: '', techStackHint: '', prdContent: '' });
+      if (updated.mergedRelease || updated.status === 'approved') {
+        setAnalysisJob((prev) => (prev?.runId === updated.id ? null : prev));
+      }
+    }
   }, []);
 
-  // Poll running server-side analysis job regardless of which tab the user is viewing
+  // Poll running server-side analysis job regardless of which room the user is viewing
   useEffect(() => {
     if (!analysisJob || analysisJob.status !== 'running') return;
 
@@ -221,12 +397,19 @@ export default function App() {
 
         if (lastJobStatusRef.current === 'running' && nextJob.status === 'completed') {
           lastJobStatusRef.current = 'completed';
+          clearPrdDraft();
+          hasRestoredLocalDraftRef.current = false;
+          setDraftSavedAt(null);
           if (nextJob.run) {
             handleRunCompleted(nextJob.run);
           } else {
             fetchRuns();
           }
-          pushSuccessToast(`「${nextJob.prdTitle}」已完成架构设计与只读测试集评审`, '分析完成');
+          setRefreshNonce((n) => n + 1);
+          pushSuccessToast(
+            `「${nextJob.prdTitle}」已完成联合架构设计与盲测集评审，支持直接修改规划方案`,
+            '分析完成'
+          );
         } else if (lastJobStatusRef.current === 'running' && nextJob.status === 'error') {
           lastJobStatusRef.current = 'error';
           pushErrorToast(nextJob.error || '多智能体执行失败', 'PRD 分析中断');
@@ -243,6 +426,11 @@ export default function App() {
     setSelectedRepo(repo);
   };
 
+  const handleRecordDeleted = useCallback(() => {
+    fetchRunsAndLatestJob();
+    setRefreshNonce((n) => n + 1);
+  }, [fetchRunsAndLatestJob]);
+
   const handlePrdDraftChange = (patch: Partial<PrdDraftState>) => {
     draftDirtyRef.current = true;
     setPrdDraft((prev) => ({ ...prev, ...patch }));
@@ -251,32 +439,33 @@ export default function App() {
   const handleJobStarted = (job: AnalysisJob) => {
     lastJobStatusRef.current = job.status;
     setAnalysisJob(job);
+    setAnalysisJobs((prev) => [job, ...prev.filter((j) => j.id !== job.id)]);
     draftDirtyRef.current = false;
-    const nextDraft = {
+    // Submitted requirements should no longer sit in localStorage draft cache
+    clearPrdDraft();
+    hasRestoredLocalDraftRef.current = false;
+    setDraftSavedAt(null);
+    setPrdDraft({
       prdTitle: job.prdTitle,
       techStackHint: job.techStackHint ?? '',
       prdContent: job.prdContent,
-    };
-    setPrdDraft(nextDraft);
-    const saved = savePrdDraft({
-      repoFullName: job.repoFullName,
-      ...nextDraft,
     });
-    if (saved) {
-      setDraftSavedAt(saved.savedAt);
-    }
   };
 
-  const handleResetPrdWorkspace = () => {
+  const handleResetPrdWorkspace = useCallback(() => {
     if (analysisJob?.status === 'running') return;
-    draftDirtyRef.current = true;
+    draftDirtyRef.current = false;
     hasRestoredLocalDraftRef.current = false;
     lastJobStatusRef.current = null;
     clearPrdDraft();
     setDraftSavedAt(null);
     setAnalysisJob(null);
     setPrdDraft({ prdTitle: '', techStackHint: '', prdContent: '' });
-  };
+  }, [analysisJob?.status]);
+
+  const handleClearFocusedQualityTarget = useCallback(() => {
+    setFocusedQualityTarget(null);
+  }, []);
 
   // Match activeRun either from analysisJob.runId or selected activeRunId
   const activeRun =
@@ -285,152 +474,217 @@ export default function App() {
     runs[0] ??
     null;
 
+  const hasInProgressRun = runs.some(
+    (r) => !r.mergedRelease && r.status !== 'approved'
+  );
+  const isRequirementInProgress =
+    analysisJob?.status === 'running' || hasInProgressRun;
+
+  // Navigate to New Requirement (PRD): if previous job already created a Draft PR / completed / merged,
+  // clear it immediately so the user always lands on a clean blank requirement form.
+  const handleSelectSection = useCallback(
+    (section: NavSectionId) => {
+      if (section === 'prd') {
+        const linkedRun = analysisJob?.runId
+          ? runs.find((r) => r.id === analysisJob.runId) ?? analysisJob.run ?? null
+          : null;
+        const isPendingDraftPr =
+          analysisJob?.status === 'completed' &&
+          Boolean(linkedRun) &&
+          !linkedRun?.draftPr &&
+          !linkedRun?.mergedRelease &&
+          linkedRun?.status === 'analyzed';
+
+        if (analysisJob && analysisJob.status !== 'running' && !isPendingDraftPr) {
+          clearPrdDraft();
+          hasRestoredLocalDraftRef.current = false;
+          draftDirtyRef.current = false;
+          lastJobStatusRef.current = null;
+          setDraftSavedAt(null);
+          setAnalysisJob(null);
+          setPrdDraft({ prdTitle: '', techStackHint: '', prdContent: '' });
+        }
+      }
+      setActiveSection(section);
+    },
+    [analysisJob, runs]
+  );
+
+  const handleOpenNewPrd = useCallback(() => {
+    handleSelectSection('prd');
+  }, [handleSelectSection]);
+
+  const activeRoomLiveState =
+    activeSection !== 'studio'
+      ? buildRoomLiveState({
+          roomId: activeSection as StudioRoomId,
+          runs,
+          analysisJob,
+          backgroundTasks,
+          status,
+        })
+      : null;
+
   return (
-    <div className="min-h-screen bg-[#0D1117] text-[#C9D1D9] flex">
-      <Sidebar
+    <div className="min-h-screen bg-[#0C0F16] studio-blueprint-floor text-[#E2E8F0] flex flex-col">
+      <StudioNavigationShell
         activeSection={activeSection}
-        onSelectSection={setActiveSection}
+        onSelectSection={handleSelectSection}
         selectedRepo={selectedRepo}
-        runCount={runs.length}
-        isAnalyzingJob={analysisJob?.status === 'running'}
-        mobileOpen={mobileNavOpen}
-        onCloseMobile={() => setMobileNavOpen(false)}
+        backgroundTasks={backgroundTasks}
+        analysisJob={analysisJob}
+        isRequirementInProgress={isRequirementInProgress}
+        onOpenNewPrd={handleOpenNewPrd}
+        onOpenTasksDrawer={() => setTasksDrawerOpen(true)}
       />
 
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Top Bar Contract: Breadcrumb on left, Target Repo + 1 contextual CTA on right */}
-        <header className="sticky top-0 z-30 h-14 bg-[#161B22]/95 backdrop-blur-sm border-b border-[#30363D] px-4 lg:px-8 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
-            <button
-              type="button"
-              onClick={() => setMobileNavOpen(true)}
-              aria-label="打开导航菜单"
-              className="lg:hidden inline-flex h-9 w-9 items-center justify-center rounded-md border border-[#30363D] bg-[#21262D] text-[#F0F6FC] hover:bg-[#30363D]"
-            >
-              <Menu className="h-4 w-4" />
-            </button>
-
-            <div className="flex items-center gap-2 text-[13px] min-w-0">
-              <span className="text-[#8B949E] whitespace-nowrap hidden sm:inline">
-                AutoDev Studio
-              </span>
-              <span aria-hidden="true" className="text-[#6E7681] hidden sm:inline">
-                /
-              </span>
-              <span className="font-semibold text-[#F0F6FC] truncate">
-                {SECTION_META[activeSection].breadcrumb}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-4 shrink-0">
-            {selectedRepo && (
-              <div className="hidden md:flex items-center gap-1.5 text-[12px] font-mono text-[#8B949E] max-w-[260px]">
-                <GitBranch className="h-3.5 w-3.5 shrink-0 text-[#58A6FF]" />
-                <span className="truncate">{selectedRepo.fullName}</span>
-              </div>
+      <main className="flex-1 w-full max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-7">
+        {activeSection === 'studio' ? (
+          <StudioOfficeMap
+            selectedRepo={selectedRepo}
+            status={status}
+            runs={runs}
+            analysisJob={analysisJob}
+            backgroundTasks={backgroundTasks}
+            isRequirementInProgress={isRequirementInProgress}
+            onEnterRoom={(roomId) => handleSelectSection(roomId)}
+            onOpenNewPrd={handleOpenNewPrd}
+            onOpenTasksDrawer={() => setTasksDrawerOpen(true)}
+          />
+        ) : (
+          <>
+            {activeRoomLiveState && (
+              <StudioRoomBanner
+                roomId={activeSection as StudioRoomId}
+                statusSpeech={activeRoomLiveState.speech}
+                isBusy={activeRoomLiveState.isBusy}
+                onBackToFloorplan={() => handleSelectSection('studio')}
+              />
             )}
-            {activeSection !== 'prd' && (
-              <button
-                type="button"
-                onClick={() => setActiveSection('prd')}
-                className="rounded-md bg-[#238636] border border-[#3FB950]/30 px-3.5 py-1.5 text-[12px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] transition-colors whitespace-nowrap shrink-0"
-              >
-                新建需求
-              </button>
+
+            {activeSection === 'environment' && (
+              <EnvironmentView
+                status={status}
+                loading={statusLoading}
+                error={statusError}
+                onRefresh={fetchIntegrationsStatus}
+                selectedRepo={selectedRepo}
+                onSelectRepo={handleSelectRepo}
+                onEnvironmentReset={handleEnvironmentReset}
+                onBackgroundTaskStarted={handleBackgroundTaskStarted}
+                refreshNonce={refreshNonce}
+                onErrorToast={pushErrorToast}
+                onSuccessToast={pushSuccessToast}
+              />
             )}
-          </div>
-        </header>
 
-        {/* Main Content Viewport */}
-        <main className="flex-1 w-full max-w-[1240px] mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-8">
-          {activeSection === 'environment' && (
-            <EnvironmentView
-              status={status}
-              loading={statusLoading}
-              error={statusError}
-              onRefresh={fetchIntegrationsStatus}
-              selectedRepo={selectedRepo}
-              onSelectRepo={handleSelectRepo}
-              onErrorToast={pushErrorToast}
-              onSuccessToast={pushSuccessToast}
-            />
-          )}
+            {activeSection === 'prd' && (
+              <PrdWorkspaceView
+                selectedRepo={selectedRepo}
+                activeRun={analysisJob === null ? null : activeRun}
+                analysisJob={analysisJob}
+                prdDraft={prdDraft}
+                draftSavedAt={draftSavedAt}
+                onDraftSavedAtChange={setDraftSavedAt}
+                onChangePrdDraft={handlePrdDraftChange}
+                onResetWorkspace={handleResetPrdWorkspace}
+                onJobStarted={handleJobStarted}
+                onRunUpdated={handleRunUpdated}
+                onBackgroundTaskStarted={handleBackgroundTaskStarted}
+                onGoToEnvironment={() => handleSelectSection('environment')}
+                onGoToPipeline={() => handleSelectSection('pipeline')}
+                onGoToApproval={(runId) => {
+                  setActiveRunId(runId);
+                  handleSelectSection('approval');
+                }}
+                onErrorToast={pushErrorToast}
+                onSuccessToast={pushSuccessToast}
+              />
+            )}
 
-          {activeSection === 'prd' && (
-            <PrdWorkspaceView
-              selectedRepo={selectedRepo}
-              activeRun={analysisJob === null ? null : activeRun}
-              analysisJob={analysisJob}
-              prdDraft={prdDraft}
-              draftSavedAt={draftSavedAt}
-              onDraftSavedAtChange={setDraftSavedAt}
-              onChangePrdDraft={handlePrdDraftChange}
-              onResetWorkspace={handleResetPrdWorkspace}
-              onJobStarted={handleJobStarted}
-              onRunUpdated={handleRunUpdated}
-              onGoToEnvironment={() => setActiveSection('environment')}
-              onGoToPipeline={() => setActiveSection('pipeline')}
-              onErrorToast={pushErrorToast}
-              onSuccessToast={pushSuccessToast}
-            />
-          )}
+            {activeSection === 'requirements' && (
+              <RequirementsBoardView
+                repoFullName={selectedRepo.fullName}
+                isRequirementInProgress={isRequirementInProgress}
+                refreshNonce={refreshNonce}
+                onGoToNewPrd={handleOpenNewPrd}
+                onGoToPipeline={(runId) => {
+                  setActiveRunId(runId);
+                  handleSelectSection('pipeline');
+                }}
+                onGoToApproval={(runId) => {
+                  setActiveRunId(runId);
+                  handleSelectSection('approval');
+                }}
+                onRecordDeleted={handleRecordDeleted}
+                onSuccessToast={pushSuccessToast}
+                onErrorToast={pushErrorToast}
+              />
+            )}
 
-          {activeSection === 'requirements' && (
-            <RequirementsBoardView
-              repoFullName={selectedRepo.fullName}
-              onGoToNewPrd={() => setActiveSection('prd')}
-              onGoToPipeline={(runId) => {
-                setActiveRunId(runId);
-                setActiveSection('pipeline');
-              }}
-              onGoToApproval={(runId) => {
-                setActiveRunId(runId);
-                setActiveSection('approval');
-              }}
-              onErrorToast={pushErrorToast}
-            />
-          )}
+            {activeSection === 'pipeline' && (
+              <PipelineBoardView
+                runs={runs}
+                relatedJobs={analysisJobs}
+                selectedRunId={activeRunId}
+                onSelectRun={setActiveRunId}
+                cloudflareStatus={status?.cloudflare}
+                githubConnected={Boolean(status?.github.connected)}
+                isRequirementInProgress={isRequirementInProgress}
+                onGoToNewPrd={handleOpenNewPrd}
+                onGoToApproval={(runId) => {
+                  setActiveRunId(runId);
+                  handleSelectSection('approval');
+                }}
+                onErrorToast={pushErrorToast}
+                onSuccessToast={pushSuccessToast}
+              />
+            )}
 
-          {activeSection === 'pipeline' && (
-            <PipelineBoardView
-              runs={runs}
-              selectedRunId={activeRunId}
-              onSelectRun={setActiveRunId}
-              cloudflareStatus={status?.cloudflare}
-              githubConnected={Boolean(status?.github.connected)}
-              onGoToNewPrd={() => setActiveSection('prd')}
-              onGoToApproval={(runId) => {
-                setActiveRunId(runId);
-                setActiveSection('approval');
-              }}
-              onErrorToast={pushErrorToast}
-              onSuccessToast={pushSuccessToast}
-            />
-          )}
+            {activeSection === 'approval' && (
+              <ApprovalView
+                runs={runs}
+                selectedRunId={activeRunId}
+                onSelectRun={setActiveRunId}
+                onRunUpdated={handleRunUpdated}
+                onBackgroundTaskStarted={handleBackgroundTaskStarted}
+                isRequirementInProgress={isRequirementInProgress}
+                onGoToNewPrd={handleOpenNewPrd}
+                onGoToQuality={(target) => {
+                  setFocusedQualityTarget({
+                    reportId: target?.reportId,
+                    actionsRunId: target?.actionsRunId,
+                    nonce: Date.now(),
+                  });
+                  handleSelectSection('quality');
+                }}
+                onErrorToast={pushErrorToast}
+                onSuccessToast={pushSuccessToast}
+              />
+            )}
 
-          {activeSection === 'approval' && (
-            <ApprovalView
-              runs={runs}
-              selectedRunId={activeRunId}
-              onSelectRun={setActiveRunId}
-              onRunUpdated={handleRunUpdated}
-              onGoToNewPrd={() => setActiveSection('prd')}
-              onGoToQuality={() => setActiveSection('quality')}
-              onErrorToast={pushErrorToast}
-              onSuccessToast={pushSuccessToast}
-            />
-          )}
+            {activeSection === 'quality' && (
+              <QualityRsiView
+                repoFullName={selectedRepo.fullName}
+                focusedTarget={focusedQualityTarget}
+                onClearFocusedTarget={handleClearFocusedQualityTarget}
+                onBackgroundTaskStarted={handleBackgroundTaskStarted}
+                refreshNonce={refreshNonce}
+                onErrorToast={pushErrorToast}
+                onSuccessToast={pushSuccessToast}
+              />
+            )}
+          </>
+        )}
+      </main>
 
-          {activeSection === 'quality' && (
-            <QualityRsiView
-              repoFullName={selectedRepo.fullName}
-              onErrorToast={pushErrorToast}
-              onSuccessToast={pushSuccessToast}
-            />
-          )}
-        </main>
-      </div>
+      <BackgroundTasksPanel
+        open={tasksDrawerOpen}
+        onClose={() => setTasksDrawerOpen(false)}
+        tasks={backgroundTasks}
+        runningAnalysisJob={analysisJob}
+        onNavigateToRoom={(room) => handleSelectSection(room)}
+      />
 
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>

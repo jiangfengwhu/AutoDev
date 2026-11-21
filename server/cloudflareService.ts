@@ -21,11 +21,17 @@ function maskAccountId(accountId: string): string {
   return `${accountId.slice(0, 4)}…${accountId.slice(-4)}`;
 }
 
-async function cfRequest<T>(token: string, path: string): Promise<CloudflareEnvelope<T>> {
+async function cfRequest<T>(
+  token: string,
+  path: string,
+  init?: RequestInit
+): Promise<CloudflareEnvelope<T>> {
   const response = await fetch(`${CLOUDFLARE_API_BASE}${path}`, {
+    ...init,
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
+      ...(init?.headers ?? {}),
     },
   });
 
@@ -388,4 +394,135 @@ export async function getCloudflareDeploymentStatus(params: {
 
   return { pages, worker };
 }
+
+const DEFAULT_ATD_D1_NAMES = ['community_db', 'community_db-preview'];
+
+export async function wipeCloudflareD1Databases(
+  targetNames: string[] = DEFAULT_ATD_D1_NAMES
+): Promise<{
+  connected: boolean;
+  databases: Array<{
+    name: string;
+    uuid: string;
+    droppedTables: string[];
+    error?: string;
+  }>;
+  error?: string;
+}> {
+  const token = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  if (!token || !accountId) {
+    return {
+      connected: false,
+      databases: [],
+      error: '未配置 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID',
+    };
+  }
+
+  const normalizedTargets = Array.from(
+    new Set(targetNames.map((n) => n.trim()).filter(Boolean))
+  );
+  if (normalizedTargets.length === 0) {
+    return {
+      connected: true,
+      databases: [],
+      error: '安全保护：必须显式指定要清理的目标 D1 数据库名称，禁止全账号通配清空。',
+    };
+  }
+
+  const encodedAccount = encodeURIComponent(accountId);
+  try {
+    const listRes = await cfRequest<Array<{ uuid: string; name: string }>>(
+      token,
+      `/accounts/${encodedAccount}/d1/database`
+    );
+    const allDbs = Array.isArray(listRes.result) ? listRes.result : [];
+    const targetDbs = allDbs.filter((db) => normalizedTargets.includes(db.name));
+
+    const results: Array<{
+      name: string;
+      uuid: string;
+      droppedTables: string[];
+      error?: string;
+    }> = [];
+
+    for (const db of targetDbs) {
+      const droppedTables: string[] = [];
+      try {
+        const queryUrl = `/accounts/${encodedAccount}/d1/database/${encodeURIComponent(db.uuid)}/query`;
+        const tablesRes = await cfRequest<
+          Array<{ results?: Array<{ name?: string }> }>
+        >(token, queryUrl, {
+          method: 'POST',
+          body: JSON.stringify({
+            sql: "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%';",
+          }),
+        });
+
+        const tableNames = (tablesRes.result?.[0]?.results || [])
+          .map((row) => String(row.name || '').trim())
+          .filter(Boolean);
+
+        if (tableNames.length > 0) {
+          const dropStatements = tableNames.map(
+            (t) => `DROP TABLE IF EXISTS "${t.replace(/"/g, '""')}";`
+          );
+          try {
+            await cfRequest<unknown>(token, queryUrl, {
+              method: 'POST',
+              body: JSON.stringify({
+                sql: ['PRAGMA foreign_keys = OFF;', 'PRAGMA defer_foreign_keys = ON;', ...dropStatements].join(' '),
+              }),
+            });
+            droppedTables.push(...tableNames);
+          } catch {
+            // Fallback: iteratively drop tables in dependency-tolerant passes
+            let remaining = [...tableNames];
+            for (let pass = 0; pass < tableNames.length + 1 && remaining.length > 0; pass++) {
+              const nextRemaining: string[] = [];
+              let droppedThisPass = 0;
+              for (const table of remaining) {
+                try {
+                  await cfRequest<unknown>(token, queryUrl, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      sql: `PRAGMA defer_foreign_keys = ON; DROP TABLE IF EXISTS "${table.replace(/"/g, '""')}";`,
+                    }),
+                  });
+                  droppedTables.push(table);
+                  droppedThisPass++;
+                } catch {
+                  nextRemaining.push(table);
+                }
+              }
+              if (droppedThisPass === 0) break;
+              remaining = nextRemaining;
+            }
+            if (remaining.length > 0) {
+              throw new Error(`以下表未能删除（可能存在外键约束）：${remaining.join(', ')}`);
+            }
+          }
+        }
+
+        results.push({ name: db.name, uuid: db.uuid, droppedTables });
+      } catch (dbErr) {
+        results.push({
+          name: db.name,
+          uuid: db.uuid,
+          droppedTables,
+          error: dbErr instanceof Error ? dbErr.message : String(dbErr),
+        });
+      }
+    }
+
+    return { connected: true, databases: results };
+  } catch (err) {
+    return {
+      connected: false,
+      databases: [],
+      error: err instanceof Error ? err.message : '清理 Cloudflare D1 数据库失败',
+    };
+  }
+}
+
 

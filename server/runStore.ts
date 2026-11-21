@@ -3,13 +3,18 @@ import os from 'os';
 import path from 'path';
 import type {
   AgySessionSnapshot,
+  ArchitectOutput,
+  CodingAgentOutputSnapshot,
   DraftPrResult,
   MergedReleaseResult,
   PipelineRun,
   PipelineRunStatus,
   PreviewDeployment,
+  QaCriticOutput,
+  QaSpecOutput,
   ReworkDispatchResult,
 } from '../src/types/autodev';
+import { scheduleGitHubStateSync } from './githubStateStore';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const STORE_FILE = path.join(DATA_DIR, 'runs-v1.json');
@@ -51,7 +56,7 @@ function loadRunsFromDisk(): PipelineRun[] {
   return runsCache;
 }
 
-function persistRuns(runs: PipelineRun[]): void {
+function persistRuns(runs: PipelineRun[], skipRemoteSync = false): void {
   runsCache = runs;
   try {
     ensureDataDir();
@@ -59,6 +64,14 @@ function persistRuns(runs: PipelineRun[]): void {
   } catch {
     // Non-fatal if storage is read-only
   }
+  if (!skipRemoteSync) {
+    scheduleGitHubStateSync('runs', runs);
+  }
+}
+
+export function reloadRunsFromDisk(): void {
+  runsCache = null;
+  loadRunsFromDisk();
 }
 
 export function listRuns(): PipelineRun[] {
@@ -121,6 +134,7 @@ export function updateRunReview(
     approvalNote?: string;
     approvedAt?: string;
     mergedRelease?: MergedReleaseResult;
+    productionDeployment?: PreviewDeployment;
     lastRework?: ReworkDispatchResult;
   }
 ): PipelineRun | undefined {
@@ -137,6 +151,9 @@ export function updateRunReview(
     ...(patch.approvalNote !== undefined ? { approvalNote: patch.approvalNote } : {}),
     ...(patch.approvedAt !== undefined ? { approvedAt: patch.approvedAt } : {}),
     ...(patch.mergedRelease !== undefined ? { mergedRelease: patch.mergedRelease } : {}),
+    ...(patch.productionDeployment !== undefined
+      ? { productionDeployment: patch.productionDeployment }
+      : {}),
     ...(patch.lastRework !== undefined ? { lastRework: patch.lastRework } : {}),
   };
   const next = [...existing];
@@ -185,5 +202,82 @@ export function attachAgySessionToRun(
   persistRuns(next);
   return updatedRun;
 }
+
+export function updateRunPlan(
+  runId: string,
+  patch: {
+    prdTitle?: string;
+    prdContent?: string;
+    techStackHint?: string;
+    architect?: ArchitectOutput;
+    qaSpec?: QaSpecOutput;
+    qaCritic?: QaCriticOutput;
+  }
+): PipelineRun | undefined {
+  const existing = loadRunsFromDisk();
+  const idx = existing.findIndex((r) => r.id === runId);
+  if (idx === -1) return undefined;
+
+  const updatedRun: PipelineRun = {
+    ...existing[idx],
+    ...(patch.prdTitle !== undefined ? { prdTitle: patch.prdTitle } : {}),
+    ...(patch.prdContent !== undefined ? { prdContent: patch.prdContent } : {}),
+    ...(patch.techStackHint !== undefined ? { techStackHint: patch.techStackHint } : {}),
+    ...(patch.architect !== undefined ? { architect: patch.architect } : {}),
+    ...(patch.qaSpec !== undefined ? { qaSpec: patch.qaSpec } : {}),
+    ...(patch.qaCritic !== undefined ? { qaCritic: patch.qaCritic } : {}),
+    planUpdatedAt: new Date().toISOString(),
+  };
+  const next = [...existing];
+  next[idx] = updatedRun;
+  persistRuns(next);
+  return updatedRun;
+}
+
+export function attachCodingOutputToRun(
+  params: { runId?: string; branchName?: string },
+  output: CodingAgentOutputSnapshot
+): PipelineRun | undefined {
+  const existing = loadRunsFromDisk();
+  const idx = existing.findIndex(
+    (r) =>
+      (params.runId && r.id === params.runId) ||
+      (params.branchName && r.draftPr?.branchName === params.branchName)
+  );
+  if (idx === -1) return undefined;
+
+  const prev = existing[idx].latestCodingOutput;
+  if (
+    prev?.actionsRunId &&
+    output.actionsRunId &&
+    prev.actionsRunId > output.actionsRunId
+  ) {
+    return existing[idx];
+  }
+
+  const updatedRun: PipelineRun = {
+    ...existing[idx],
+    latestCodingOutput: output,
+  };
+  const next = [...existing];
+  next[idx] = updatedRun;
+  persistRuns(next);
+  return updatedRun;
+}
+
+export function deleteRunById(runId: string): boolean {
+  const existing = loadRunsFromDisk();
+  const next = existing.filter((r) => r.id !== runId);
+  if (next.length === existing.length) return false;
+  persistRuns(next);
+  return true;
+}
+
+export function clearAllRuns(): number {
+  const prevCount = loadRunsFromDisk().length;
+  persistRuns([]);
+  return prevCount;
+}
+
 
 

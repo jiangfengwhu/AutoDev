@@ -14,20 +14,29 @@ import {
   Square,
 } from 'lucide-react';
 import type {
+  AnalysisJob,
   CloudflareIntegrationStatus,
   GitHubActionRun,
   GitHubSelfHostedRunner,
   PipelineRun,
 } from '../types/autodev';
-import { AGY_AVAILABLE_MODELS, FIXED_TARGET_REPO } from '../lib/workflowBuilder';
-import { buildIterationArtifactPaths } from '../lib/iterationContext';
+import {
+  AGY_AGENT_MODES,
+  AGY_AVAILABLE_MODELS,
+  DEFAULT_AGY_MODE,
+  DEFAULT_AGY_MODEL,
+  FIXED_TARGET_REPO,
+} from '../lib/workflowBuilder';
+import { filterActionRunsForPipelineRun } from '../lib/iterationContext';
 
 interface PipelineBoardViewProps {
   runs: PipelineRun[];
+  relatedJobs?: AnalysisJob[];
   selectedRunId: string | null;
   onSelectRun: (runId: string) => void;
   cloudflareStatus?: CloudflareIntegrationStatus;
   githubConnected: boolean;
+  isRequirementInProgress?: boolean;
   onGoToNewPrd: () => void;
   onGoToApproval: (runId: string) => void;
   onErrorToast: (message: string, title?: string) => void;
@@ -74,10 +83,12 @@ const RUN_STATUS_TEXT: Record<PipelineRun['status'], { label: string; color: str
 
 export function PipelineBoardView({
   runs,
+  relatedJobs = [],
   selectedRunId,
   onSelectRun,
   cloudflareStatus,
   githubConnected,
+  isRequirementInProgress = false,
   onGoToNewPrd,
   onGoToApproval,
   onErrorToast,
@@ -92,9 +103,13 @@ export function PipelineBoardView({
 
   const [runners, setRunners] = useState<GitHubSelfHostedRunner[]>([]);
   const [repoBranches, setRepoBranches] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<Array<{ id: string; label: string }>>(
+    () => AGY_AVAILABLE_MODELS.map((m) => ({ id: m.id, label: m.label }))
+  );
 
   const [selectedBranch, setSelectedBranch] = useState<string>('');
-  const [selectedModel, setSelectedModel] = useState<string>(AGY_AVAILABLE_MODELS[0].id);
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_AGY_MODEL);
+  const [selectedMode, setSelectedMode] = useState<string>(DEFAULT_AGY_MODE);
   const [dispatching, setDispatching] = useState(false);
   const [dispatchFeedback, setDispatchFeedback] = useState<{
     type: 'success' | 'error';
@@ -163,14 +178,6 @@ export function PipelineBoardView({
           setActionsError(actionsData.error);
         }
 
-        setExpandedRunId((prev) => {
-          if (prev !== null) return prev;
-          const active = nextRuns.find(
-            (r) => r.status === 'in_progress' || r.status === 'queued'
-          );
-          return active ? active.id : nextRuns[0]?.id ?? null;
-        });
-
         if (runnersRes.ok) {
           const runnersData = await runnersRes.json();
           setRunners(runnersData.runners || []);
@@ -190,6 +197,24 @@ export function PipelineBoardView({
     [onErrorToast]
   );
 
+  // Sync live VPS AGY models (Gemini 4 + detected CLI models)
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/github/vps-capabilities?repo=${encodeURIComponent(targetRepo)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { models?: Array<{ id: string; label: string }> } | null) => {
+        if (!cancelled && data?.models && data.models.length > 0) {
+          setAvailableModels(data.models);
+        }
+      })
+      .catch(() => {
+        // Fallback to built-in AGY_AVAILABLE_MODELS
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [targetRepo]);
+
   useEffect(() => {
     if (githubConnected) {
       fetchPipelineTelemetry(targetRepo);
@@ -201,11 +226,34 @@ export function PipelineBoardView({
     }
   }, [targetRepo, githubConnected, fetchPipelineTelemetry]);
 
+  // Filter GitHub Actions strictly to the currently selected requirement pipeline
+  const visibleActionRuns = useMemo(
+    () => filterActionRunsForPipelineRun(actionRuns, activeRun, relatedJobs),
+    [actionRuns, activeRun, relatedJobs]
+  );
+
+  useEffect(() => {
+    setExpandedRunId((prev) => {
+      if (prev !== null && visibleActionRuns.some((r) => r.id === prev)) {
+        return prev;
+      }
+      const active = visibleActionRuns.find(
+        (r) => r.status === 'in_progress' || r.status === 'queued'
+      );
+      return active ? active.id : visibleActionRuns[0]?.id ?? null;
+    });
+  }, [activeRun?.id, visibleActionRuns]);
+
   useEffect(() => {
     if (expandedRunId && githubConnected) {
       fetchRunDetail(expandedRunId);
     }
   }, [expandedRunId, githubConnected, fetchRunDetail]);
+
+  const hasCurrentRunExecuting = useMemo(
+    () => visibleActionRuns.some((r) => r.status === 'in_progress' || r.status === 'queued'),
+    [visibleActionRuns]
+  );
 
   const hasActiveActionRun = useMemo(
     () => actionRuns.some((r) => r.status === 'in_progress' || r.status === 'queued'),
@@ -214,13 +262,28 @@ export function PipelineBoardView({
 
   useEffect(() => {
     if (!githubConnected || !hasActiveActionRun) return;
-    const timer = setInterval(() => {
+    const pollTick = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       fetchPipelineTelemetry(targetRepo, true);
       if (expandedRunId) {
         fetchRunDetail(expandedRunId, true);
       }
-    }, 5000);
-    return () => clearInterval(timer);
+    };
+    const timer = setInterval(pollTick, 12000);
+    const onVisibility = () => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        pollTick();
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibility);
+    }
+    return () => {
+      clearInterval(timer);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibility);
+      }
+    };
   }, [
     githubConnected,
     hasActiveActionRun,
@@ -283,6 +346,7 @@ export function PipelineBoardView({
           prNumber: activeRun?.draftPr?.prNumber,
           runId: activeRun?.id,
           agyModel: selectedModel,
+          agyMode: selectedMode,
           baseBranch: activeRun?.defaultBranch || FIXED_TARGET_REPO.defaultBranch,
           e2eTestPath: activeRun?.draftPr?.e2eTestPath,
         }),
@@ -292,7 +356,7 @@ export function PipelineBoardView({
         throw new Error(data.error || `触发失败 (${res.status})`);
       }
 
-      const msg = `已派发至 VPS AGY Runner（分支 ${data.branch} · 模型 ${data.model}）`;
+      const msg = `已派发至 VPS AGY Runner（分支 ${data.branch} · 模型 ${data.model} · 模式 ${data.mode || selectedMode}）`;
       setDispatchFeedback({
         type: 'success',
         message: msg,
@@ -350,14 +414,16 @@ export function PipelineBoardView({
           <div className="text-[15px] font-semibold text-[#F0F6FC]">
             尚无运行中的研发流水线
           </div>
-          <button
-            type="button"
-            onClick={onGoToNewPrd}
-            className="inline-flex items-center gap-2 rounded-md bg-[#238636] border border-[#3FB950]/30 px-4 py-2 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] transition-colors"
-          >
-            <Plus className="h-4 w-4" />
-            <span>新建需求 (PRD)</span>
-          </button>
+          {!isRequirementInProgress && (
+            <button
+              type="button"
+              onClick={onGoToNewPrd}
+              className="inline-flex items-center gap-2 rounded-md bg-[#238636] border border-[#3FB950]/30 px-4 py-2 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] transition-colors"
+            >
+              <Plus className="h-4 w-4" />
+              <span>新建需求 (PRD)</span>
+            </button>
+          )}
         </div>
       </div>
     );
@@ -462,7 +528,7 @@ export function PipelineBoardView({
                   )}
                 </div>
                 <div className="text-[14px] font-semibold text-[#F0F6FC] font-mono truncate">
-                  docs/spec.json · {activeRun.draftPr?.e2eTestPath || buildIterationArtifactPaths(activeRun.id).e2eTestPath}
+                  docs/spec.json · 盲测用例已隔离至 Vault
                 </div>
                 {activeRun.draftPr ? (
                   <a
@@ -547,137 +613,182 @@ export function PipelineBoardView({
               </div>
             </div>
 
-            {/* VPS AGY Coding Agent Dispatch Console */}
-            <div className="rounded-md border border-[#30363D] bg-[#161B22] p-5 space-y-4">
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
-                  派发 VPS AGY 自动开发
-                </h2>
+            {/* VPS AGY Coding Agent Dispatch Console (Hidden while current requirement is executing) */}
+            {hasCurrentRunExecuting ? (
+              <div
+                role="status"
+                className="rounded-md border border-[#58A6FF]/40 bg-[#1F6FEB]/10 px-5 py-4 flex flex-wrap items-center justify-between gap-3"
+              >
+                <div className="flex items-center gap-2.5 text-[13px] text-[#F0F6FC]">
+                  <Loader2 className="h-4 w-4 animate-spin text-[#58A6FF] shrink-0" />
+                  <span>
+                    当前需求正在 VPS AGY 上执行（无超时限制，完成后自动 push 并运行隔离 E2E 盲测）
+                  </span>
+                </div>
+                <span className="font-mono text-[11px] text-[#79C0FF]">
+                  专注模式 · 已锁定重复派发
+                </span>
               </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                <div>
-                  <label
-                    htmlFor="agy-branch-select"
-                    className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
-                  >
-                    目标分支
-                  </label>
-                  <select
-                    id="agy-branch-select"
-                    value={selectedBranch}
-                    onChange={(e) => setSelectedBranch(e.target.value)}
-                    disabled={dispatching || candidateBranches.length === 0}
-                    className="w-full rounded-md border border-[#30363D] bg-[#0D1117] px-3 py-2 font-mono text-[12px] text-[#F0F6FC] focus:border-[#58A6FF] focus:outline-none disabled:opacity-50"
-                  >
-                    {candidateBranches.length === 0 ? (
-                      <option value="">暂无可用分支</option>
-                    ) : (
-                      candidateBranches.map((branch) => (
-                        <option key={branch} value={branch}>
-                          {branch}
-                        </option>
-                      ))
-                    )}
-                  </select>
+            ) : (
+              <div className="rounded-md border border-[#30363D] bg-[#161B22] p-5 space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
+                    派发 VPS AGY 自动开发
+                  </h2>
+                  <span className="font-mono text-[11px] text-[#8B949E]">
+                    无超时直等 · 盲测防作弊
+                  </span>
                 </div>
 
-                <div>
-                  <label
-                    htmlFor="agy-model-select"
-                    className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
-                  >
-                    AGY 模型
-                  </label>
-                  <select
-                    id="agy-model-select"
-                    value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    disabled={dispatching}
-                    className="w-full rounded-md border border-[#30363D] bg-[#0D1117] px-3 py-2 font-mono text-[12px] text-[#F0F6FC] focus:border-[#58A6FF] focus:outline-none disabled:opacity-50"
-                  >
-                    {AGY_AVAILABLE_MODELS.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.label} ({m.id})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                <div className="text-[12px] text-[#8B949E]">
-                  {onlineRunners.length > 0 ? (
-                    <span className="text-[#3FB950] font-mono">
-                      {onlineRunners[0].name} 就绪
-                    </span>
-                  ) : (
-                    <span className="text-[#D29922]">
-                      当前无在线 Runner（派发后将进入队列）
-                    </span>
-                  )}
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleDispatchAgy}
-                  disabled={dispatching || !githubConnected || !selectedBranch}
-                  className="inline-flex items-center gap-2 rounded-md bg-[#238636] border border-[#3FB950]/30 px-4 py-2 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
-                >
-                  {dispatching ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>派发中…</span>
-                    </>
-                  ) : (
-                    <>
-                      <Play className="h-3.5 w-3.5" />
-                      <span>派发 VPS AGY 自动开发</span>
-                    </>
-                  )}
-                </button>
-              </div>
-
-              {dispatchFeedback && (
-                <div
-                  role={dispatchFeedback.type === 'error' ? 'alert' : 'status'}
-                  className={`rounded-md border px-4 py-3 text-[12px] flex items-start justify-between gap-3 ${
-                    dispatchFeedback.type === 'success'
-                      ? 'border-[#3FB950]/40 bg-[#2EA043]/10 text-[#AFF5B4]'
-                      : 'border-[#F85149]/40 bg-[#F85149]/10 text-[#FFDCD7]'
-                  }`}
-                >
-                  <div className="flex items-start gap-2">
-                    {dispatchFeedback.type === 'error' ? (
-                      <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-[#F85149]" />
-                    ) : (
-                      <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-[#3FB950]" />
-                    )}
-                    <span>{dispatchFeedback.message}</span>
-                  </div>
-                  {dispatchFeedback.actionsUrl && (
-                    <a
-                      href={dispatchFeedback.actionsUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 underline whitespace-nowrap shrink-0"
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+                  <div>
+                    <label
+                      htmlFor="agy-branch-select"
+                      className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
                     >
-                      <span>Actions</span>
-                      <ExternalLink className="h-3 w-3" />
-                    </a>
-                  )}
-                </div>
-              )}
-            </div>
+                      目标分支
+                    </label>
+                    <select
+                      id="agy-branch-select"
+                      value={selectedBranch}
+                      onChange={(e) => setSelectedBranch(e.target.value)}
+                      disabled={dispatching || candidateBranches.length === 0}
+                      className="w-full rounded-md border border-[#30363D] bg-[#0D1117] px-3 py-2 font-mono text-[12px] text-[#F0F6FC] focus:border-[#58A6FF] focus:outline-none disabled:opacity-50"
+                    >
+                      {candidateBranches.length === 0 ? (
+                        <option value="">暂无可用分支</option>
+                      ) : (
+                        candidateBranches.map((branch) => (
+                          <option key={branch} value={branch}>
+                            {branch}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </div>
 
-            {/* Live GitHub Actions & VPS AGY Execution Stream */}
+                  <div>
+                    <label
+                      htmlFor="agy-model-select"
+                      className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
+                    >
+                      AGY 模型
+                    </label>
+                    <select
+                      id="agy-model-select"
+                      value={selectedModel}
+                      onChange={(e) => setSelectedModel(e.target.value)}
+                      disabled={dispatching}
+                      className="w-full rounded-md border border-[#30363D] bg-[#0D1117] px-3 py-2 font-mono text-[12px] text-[#F0F6FC] focus:border-[#58A6FF] focus:outline-none disabled:opacity-50"
+                    >
+                      {availableModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label} ({m.id})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="agy-mode-select"
+                      className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
+                    >
+                      Agent 模式
+                    </label>
+                    <select
+                      id="agy-mode-select"
+                      value={selectedMode}
+                      onChange={(e) => setSelectedMode(e.target.value)}
+                      disabled={dispatching}
+                      className="w-full rounded-md border border-[#30363D] bg-[#0D1117] px-3 py-2 font-mono text-[12px] text-[#F0F6FC] focus:border-[#58A6FF] focus:outline-none disabled:opacity-50"
+                    >
+                      {AGY_AGENT_MODES.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label} ({m.id})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  <div className="text-[12px] text-[#8B949E]">
+                    {onlineRunners.length > 0 ? (
+                      <span className="text-[#3FB950] font-mono">
+                        {onlineRunners[0].name} 就绪
+                      </span>
+                    ) : (
+                      <span className="text-[#D29922]">
+                        当前无在线 Runner（派发后将进入队列）
+                      </span>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleDispatchAgy}
+                    disabled={dispatching || !githubConnected || !selectedBranch}
+                    className="inline-flex items-center gap-2 rounded-md bg-[#238636] border border-[#3FB950]/30 px-4 py-2 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+                  >
+                    {dispatching ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <span>派发中…</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="h-3.5 w-3.5" />
+                        <span>派发 VPS AGY 自动开发</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {dispatchFeedback && (
+                  <div
+                    role={dispatchFeedback.type === 'error' ? 'alert' : 'status'}
+                    className={`rounded-md border px-4 py-3 text-[12px] flex items-start justify-between gap-3 ${
+                      dispatchFeedback.type === 'success'
+                        ? 'border-[#3FB950]/40 bg-[#2EA043]/10 text-[#AFF5B4]'
+                        : 'border-[#F85149]/40 bg-[#F85149]/10 text-[#FFDCD7]'
+                    }`}
+                  >
+                    <div className="flex items-start gap-2">
+                      {dispatchFeedback.type === 'error' ? (
+                        <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-[#F85149]" />
+                      ) : (
+                        <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5 text-[#3FB950]" />
+                      )}
+                      <span>{dispatchFeedback.message}</span>
+                    </div>
+                    {dispatchFeedback.actionsUrl && (
+                      <a
+                        href={dispatchFeedback.actionsUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 underline whitespace-nowrap shrink-0"
+                      >
+                        <span>Actions</span>
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Live GitHub Actions & VPS AGY Execution Stream (Filtered strictly to activeRun) */}
             <div className="rounded-md border border-[#30363D] bg-[#161B22] overflow-hidden">
               <div className="px-5 py-3.5 border-b border-[#30363D] flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-2.5">
+                <div className="flex flex-wrap items-center gap-2.5">
                   <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
                     GitHub Actions 与 VPS AGY 执行日志
                   </h2>
-                  {hasActiveActionRun && (
+                  <span className="font-mono text-[11px] text-[#8B949E] tabular-nums">
+                    仅展示当前需求关联流水线（{visibleActionRuns.length} 条）
+                  </span>
+                  {hasCurrentRunExecuting && (
                     <span className="inline-flex items-center gap-1.5 text-[11px] font-mono text-[#58A6FF]">
                       <Loader2 className="h-3 w-3 animate-spin" />
                       5s 轮询中
@@ -704,13 +815,17 @@ export function PipelineBoardView({
                 </div>
               ) : actionsError ? (
                 <div className="p-5 text-[13px] text-[#F85149]">{actionsError}</div>
-              ) : actionRuns.length === 0 ? (
+              ) : visibleActionRuns.length === 0 ? (
                 <div className="p-5 text-[13px] text-[#8B949E]">
-                  暂无 GitHub Actions 运行记录。
+                  当前需求暂无关联的 GitHub Actions 执行记录
+                  {activeRun.draftPr?.branchName
+                    ? `（分支 ${activeRun.draftPr.branchName}）`
+                    : ''}
+                  。
                 </div>
               ) : (
                 <div className="divide-y divide-[#21262D] bg-[#0D1117]">
-                  {actionRuns.map((ar) => {
+                  {visibleActionRuns.map((ar) => {
                     const isExpanded = expandedRunId === ar.id;
                     const isRunning = ar.status === 'in_progress' || ar.status === 'queued';
                     const conclusionColor =

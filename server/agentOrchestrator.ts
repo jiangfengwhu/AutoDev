@@ -398,8 +398,9 @@ export async function runQaSpecAgent(
     '本轮产出的测试脚本将保存在独立文件 `tests/e2e/<runId>.spec.ts` 中，与历次回归测试共存。',
     '请输出：',
     '1) 清晰的接口测试清单 (apiTestChecklist，覆盖正常流与基础异常码)；',
-    '2) 可直接放入 `tests/e2e/<runId>.spec.ts` 运行的 Playwright TypeScript E2E 测试代码 (e2eTestCode)，使用 `import { test, expect } from "@playwright/test";`，优先使用语义化 locator（getByRole / getByLabel / getByTestId）与 Playwright request fixture；',
-    '3) 测试覆盖说明 (coverageNotes)。',
+    '2) 可直接放入 `tests/e2e/<runId>.spec.ts` 运行的 Playwright TypeScript E2E 测试代码 (e2eTestCode)，使用 `import { test, expect } from "@playwright/test";`，优先使用语义化 locator（getByRole / getByLabel / getByPlaceholder / getByText）与 Playwright request fixture；',
+    '3) Playwright 严格模式铁律：绝不允许编写裸露的 `locatorA.or(locatorB)` 而不追加 `.first()`（必须写作 `locatorA.or(locatorB).first()`），避免双分支同时可见时触发 strict mode violation；且本测试将存入盲测金库（编码阶段不可见），禁止臆测未约定的内部 CSS 类名；',
+    '4) 测试覆盖说明 (coverageNotes)。',
     'Playwright 测试代码必须语法合法、结构完整、无省略号占位符。',
     ...(rsiBlock ? ['', rsiBlock] : []),
   ].join('\n');
@@ -446,7 +447,7 @@ export async function runQaCriticAgent(
     '1) reviewSummary：客观指出初版测试集的核心盲区及本次加固后的提升；',
     '2) findings：列出 4-6 条高价值评审意见；',
     '3) finalApiTestChecklist：在初版基础上补全异常码与边界断言后的完整接口测试清单；',
-    '4) finalE2eTestCode：在保留初版核心路径的基础上，将所有 findings 转化为真实可执行的 Playwright TypeScript 断言与边界测试用例，产出最终版只读 Playwright 完整代码（严禁使用 `// ... 省略`）。',
+    '4) finalE2eTestCode：在保留初版核心路径的基础上，将所有 findings 转化为真实可执行的 Playwright TypeScript 断言与边界测试用例，产出最终版独立盲测 Playwright 完整代码（严禁使用 `// ... 省略`）。必须审查并修复所有裸露 `locA.or(locB)` 为 `locA.or(locB).first()`，且避免依赖未约定的私有 CSS class，保证盲测通过客观用户行为与公开 API 契约断言。',
     ...(rsiBlock ? ['', rsiBlock] : []),
   ].join('\n');
 

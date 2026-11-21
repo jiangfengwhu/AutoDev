@@ -7,15 +7,18 @@ import {
   ChevronRight,
   ClipboardList,
   ExternalLink,
+  FileText,
   GitBranch,
   GitMerge,
   GitPullRequest,
   Globe,
   History,
+  MessageSquare,
   Plus,
   RefreshCw,
   RotateCcw,
   Search,
+  Trash2,
   XCircle,
 } from 'lucide-react';
 import {
@@ -38,12 +41,19 @@ import {
   type RequirementsBoardPayload,
   type RequirementStatusBucket,
 } from '../lib/requirementsBoard';
+import { formatTokenCount } from '../lib/overviewMetrics';
+import { STUDIO_IMAGES } from '../lib/studioTheme';
+import { RequirementReportModal } from './RequirementReportModal';
 
 interface RequirementsBoardViewProps {
   repoFullName: string;
+  isRequirementInProgress?: boolean;
+  refreshNonce?: number;
   onGoToNewPrd: () => void;
   onGoToPipeline: (runId: string) => void;
   onGoToApproval: (runId: string) => void;
+  onRecordDeleted?: () => void;
+  onSuccessToast?: (message: string, title?: string) => void;
   onErrorToast: (message: string, title?: string) => void;
 }
 
@@ -138,9 +148,13 @@ function matchesStatusFilter(status: RequirementBoardStatus, filter: StatusFilte
 
 export function RequirementsBoardView({
   repoFullName,
+  isRequirementInProgress = false,
+  refreshNonce = 0,
   onGoToNewPrd,
   onGoToPipeline,
   onGoToApproval,
+  onRecordDeleted,
+  onSuccessToast,
   onErrorToast,
 }: RequirementsBoardViewProps) {
   const [board, setBoard] = useState<RequirementsBoardPayload | null>(null);
@@ -151,6 +165,9 @@ export function RequirementsBoardView({
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [reqQuery, setReqQuery] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [reportTargetId, setReportTargetId] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const [auditCategory, setAuditCategory] = useState<AuditCategoryFilter>('all');
   const [auditQuery, setAuditQuery] = useState('');
@@ -176,7 +193,40 @@ export function RequirementsBoardView({
 
   useEffect(() => {
     fetchBoard();
-  }, [fetchBoard]);
+  }, [fetchBoard, refreshNonce]);
+
+  const handleDeleteRequirement = useCallback(
+    async (item: RequirementBoardItem) => {
+      setDeletingId(item.id);
+      try {
+        const endpoint = item.runId
+          ? `/api/runs/${encodeURIComponent(item.runId)}`
+          : item.jobId
+            ? `/api/agents/jobs/${encodeURIComponent(item.jobId)}`
+            : null;
+        if (!endpoint) {
+          throw new Error('该记录缺少可删除的标识 ID');
+        }
+        const res = await fetch(endpoint, { method: 'DELETE' });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(json.error || `HTTP ${res.status}`);
+        }
+        setConfirmDeleteId(null);
+        onSuccessToast?.(`已删除「${item.title}」并同步状态分支`, '记录已删除');
+        await fetchBoard();
+        onRecordDeleted?.();
+      } catch (err) {
+        onErrorToast(
+          err instanceof Error ? err.message : '删除需求记录失败',
+          '删除失败'
+        );
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [fetchBoard, onRecordDeleted, onSuccessToast, onErrorToast]
+  );
 
   const filteredRequirements = useMemo(() => {
     const list = board?.requirements ?? [];
@@ -234,14 +284,16 @@ export function RequirementsBoardView({
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
             <span>刷新看板</span>
           </button>
-          <button
-            type="button"
-            onClick={onGoToNewPrd}
-            className="inline-flex items-center gap-1.5 rounded-md bg-[#238636] border border-[#3FB950]/30 px-3.5 py-1.5 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] transition-colors whitespace-nowrap"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            <span>新建需求</span>
-          </button>
+          {!isRequirementInProgress && (
+            <button
+              type="button"
+              onClick={onGoToNewPrd}
+              className="inline-flex items-center gap-1.5 rounded-md bg-[#238636] border border-[#3FB950]/30 px-3.5 py-1.5 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] transition-colors whitespace-nowrap"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span>新建需求</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -648,13 +700,15 @@ export function RequirementsBoardView({
                   当前筛选条件下暂无需求记录
                 </div>
                 <p className="text-[12px] text-[#8B949E]">
-                  您可以切换筛选状态，或点击右上角「新建需求」发起新一轮自动化研发迭代。
+                  {isRequirementInProgress
+                    ? '当前有新需求正在进行中，可切换筛选条件查看进度。'
+                    : '您可以切换筛选状态，或点击右上角「新建需求」发起新一轮自动化研发迭代。'}
                 </p>
               </div>
             ) : (
               <div className="overflow-x-auto">
-                <div className="min-w-[880px]">
-                  <div className="grid grid-cols-[2rem_minmax(240px,2.2fr)_110px_168px_132px_116px_136px] items-center border-b border-[#30363D] bg-[#161B22] text-[11px] font-semibold text-[#8B949E]">
+                <div className="min-w-[940px]">
+                  <div className="grid grid-cols-[2rem_minmax(220px,2.1fr)_104px_162px_126px_112px_182px] items-center border-b border-[#30363D] bg-[#161B22] text-[11px] font-semibold text-[#8B949E]">
                     <div className="py-2.5 pl-5 pr-2" aria-label="展开" />
                     <div className="py-2.5 px-3">需求标题 / 原特性分支</div>
                     <div className="py-2.5 px-3">当前状态</div>
@@ -680,7 +734,7 @@ export function RequirementsBoardView({
                                 setExpandedId(expanded ? null : item.id);
                               }
                             }}
-                            className="grid grid-cols-[2rem_minmax(240px,2.2fr)_110px_168px_132px_116px_136px] items-center hover:bg-[#161B22]/80 cursor-pointer transition-colors"
+                            className="grid grid-cols-[2rem_minmax(220px,2.1fr)_104px_162px_126px_112px_182px] items-center hover:bg-[#161B22]/80 cursor-pointer transition-colors"
                           >
                             <div className="py-3 pl-5 pr-2 text-[#8B949E]">
                               {expanded ? (
@@ -770,27 +824,71 @@ export function RequirementsBoardView({
                                 className="py-3 pl-3 pr-5 flex items-center justify-end gap-2 whitespace-nowrap"
                                 onClick={(e) => e.stopPropagation()}
                               >
-                                {item.runId ? (
+                                {confirmDeleteId === item.id ? (
                                   <>
                                     <button
                                       type="button"
-                                      onClick={() => onGoToPipeline(item.runId!)}
-                                      className="text-[11px] font-medium text-[#C9D1D9] hover:text-[#58A6FF]"
+                                      onClick={() => handleDeleteRequirement(item)}
+                                      disabled={deletingId === item.id}
+                                      className="text-[11px] font-medium text-[#FF7B72] hover:text-[#F85149] disabled:opacity-50"
                                     >
-                                      流水线
+                                      {deletingId === item.id ? '删除中…' : '确认删除'}
                                     </button>
                                     <span aria-hidden="true" className="text-[#30363D]">|</span>
                                     <button
                                       type="button"
-                                      onClick={() => onGoToApproval(item.runId!)}
-                                      className="inline-flex items-center gap-0.5 text-[11px] font-medium text-[#58A6FF] hover:underline"
+                                      onClick={() => setConfirmDeleteId(null)}
+                                      disabled={deletingId === item.id}
+                                      className="text-[11px] text-[#8B949E] hover:text-[#C9D1D9]"
                                     >
-                                      <span>验收</span>
-                                      <ArrowUpRight className="h-3 w-3" />
+                                      取消
                                     </button>
                                   </>
                                 ) : (
-                                  <span className="text-[11px] text-[#6E7681]">仅规划记录</span>
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => setReportTargetId(item.runId || item.jobId || item.id)}
+                                      className="inline-flex items-center gap-1 text-[11px] font-medium text-[#3FB950] hover:underline"
+                                    >
+                                      <FileText className="h-3 w-3" />
+                                      <span>报告</span>
+                                    </button>
+                                    {item.runId ? (
+                                      <>
+                                        <span aria-hidden="true" className="text-[#30363D]">|</span>
+                                        <button
+                                          type="button"
+                                          onClick={() => onGoToPipeline(item.runId!)}
+                                          className="text-[11px] font-medium text-[#C9D1D9] hover:text-[#58A6FF]"
+                                        >
+                                          流水线
+                                        </button>
+                                        <span aria-hidden="true" className="text-[#30363D]">|</span>
+                                        <button
+                                          type="button"
+                                          onClick={() => onGoToApproval(item.runId!)}
+                                          className="inline-flex items-center gap-0.5 text-[11px] font-medium text-[#58A6FF] hover:underline"
+                                        >
+                                          <span>验收</span>
+                                          <ArrowUpRight className="h-3 w-3" />
+                                        </button>
+                                      </>
+                                    ) : null}
+                                    {(item.runId || item.jobId) && (
+                                      <>
+                                        <span aria-hidden="true" className="text-[#30363D]">|</span>
+                                        <button
+                                          type="button"
+                                          onClick={() => setConfirmDeleteId(item.id)}
+                                          title="删除该需求记录"
+                                          className="inline-flex items-center text-[#8B949E] hover:text-[#FF7B72] transition-colors"
+                                        >
+                                          <Trash2 className="h-3.5 w-3.5" />
+                                        </button>
+                                      </>
+                                    )}
+                                  </>
                                 )}
                               </div>
                             </div>
@@ -880,6 +978,56 @@ export function RequirementsBoardView({
                                         规划异常：{item.analysisError}
                                       </div>
                                     )}
+
+                                    {/* Coding Agent Chat Window Final Reply Preview & Full Report Launcher */}
+                                    <div className="rounded-lg border border-[#2A3548] bg-[#111723] p-3.5 space-y-2.5">
+                                      <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <span className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#F8FAFC]">
+                                          <img
+                                            src={STUDIO_IMAGES.coder}
+                                            alt="陈汐"
+                                            referrerPolicy="no-referrer"
+                                            className="h-5 w-5 rounded-md object-cover border border-[#34D399]/40"
+                                          />
+                                          <MessageSquare className="h-3.5 w-3.5 text-[#34D399]" />
+                                          <span>陈汐 · Coding Agent 聊天窗口最终回复</span>
+                                          {item.latestCodingCommitSha && (
+                                            <span className="font-mono font-normal text-[11px] text-[#38BDF8]">
+                                              · {item.latestCodingCommitSha.slice(0, 7)}
+                                            </span>
+                                          )}
+                                          {item.totalTokens ? (
+                                            <span className="font-mono font-normal text-[11px] text-[#A78BFA]">
+                                              · {formatTokenCount(item.totalTokens)} Tokens
+                                            </span>
+                                          ) : null}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setReportTargetId(item.runId || item.jobId || item.id)
+                                          }
+                                          className="inline-flex items-center gap-1 rounded-md border border-[#2D384D] bg-[#1B2230] px-2.5 py-1 text-[11px] font-medium text-[#38BDF8] hover:bg-[#253044] hover:text-[#F8FAFC] transition-colors whitespace-nowrap"
+                                        >
+                                          <FileText className="h-3 w-3" />
+                                          <span>查看完整需求报告</span>
+                                        </button>
+                                      </div>
+                                      {item.latestCodingOutputPreview ? (
+                                        <div className="rounded-lg border border-[#242F42] bg-[#0B0F18] px-3 py-2.5">
+                                          <p className="text-[12px] text-[#DCE5F2] leading-relaxed whitespace-pre-wrap line-clamp-4">
+                                            {item.latestCodingOutputPreview}
+                                            {item.latestCodingOutputPreview.length >= 260 ? '…' : ''}
+                                          </p>
+                                        </div>
+                                      ) : (
+                                        <p className="text-[11px] text-[#94A3B8]">
+                                          {item.branchName
+                                            ? '尚未捕获到 Coding Agent 聊天窗口最终回复（点击「查看完整需求报告」可查阅 PRD 规划、盲测记录或回溯最新交付消息）。'
+                                            : '尚未进入编码阶段，点击「查看完整需求报告」可查阅完整 PRD 与规划方案。'}
+                                        </p>
+                                      )}
+                                    </div>
                                   </div>
 
                                   {/* Right: Requirement-specific Manual Operation Timeline */}
@@ -1009,6 +1157,15 @@ export function RequirementsBoardView({
           </div>
         )}
       </section>
+
+      {reportTargetId && (
+        <RequirementReportModal
+          requirementId={reportTargetId}
+          onClose={() => setReportTargetId(null)}
+          onSuccessToast={onSuccessToast}
+          onErrorToast={onErrorToast}
+        />
+      )}
     </div>
   );
 }

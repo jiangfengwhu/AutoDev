@@ -4,6 +4,7 @@ import type {
   ArchitectOutput,
   QaCriticOutput,
   QaSpecOutput,
+  TokenUsageSummary,
 } from '../types/autodev';
 
 export const AUTODEV_PLAN_WORKFLOW_PATH = '.github/workflows/autodev-plan.yml';
@@ -51,6 +52,8 @@ export interface PlanRemoteState {
   actionsRunId?: number;
   actionsUrl?: string;
   model?: string;
+  mode?: 'unified_single_turn' | 'three_stage';
+  tokenUsage?: TokenUsageSummary;
   error?: string;
   steps: Record<AgentStepId, PlanRemoteStepState>;
   outputFiles?: Partial<Record<AgentStepId, string>>;

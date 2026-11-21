@@ -57,8 +57,8 @@ export function validatePrdInput(input: PrdValidationInput): PrdValidationResult
   }
 
   const trimmedContent = input.prdContent.trim();
-  if (trimmedContent.length < 30) {
-    errors.prdContent = 'PRD 内容至少需要 30 个字符，以便 Architect Agent 完成有效架构拆解';
+  if (trimmedContent.length === 0) {
+    errors.prdContent = '请填写 PRD 需求正文';
   }
 
   return {

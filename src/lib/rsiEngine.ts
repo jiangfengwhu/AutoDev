@@ -1,3 +1,5 @@
+import type { TokenUsageSummary } from '../types/autodev';
+
 export type RsiRootCauseCategory =
   | 'test_assertion'
   | 'env_infra'
@@ -97,6 +99,9 @@ export interface TestExecutionReport {
   agySessionId?: string;
   agySessionReused?: boolean;
   agyExitCode?: number;
+  codingFinalOutput?: string;
+  repairRounds?: number;
+  tokenUsage?: TokenUsageSummary;
 }
 
 export interface RsiAttributionDecision {
@@ -175,6 +180,22 @@ export interface QualityTrendPoint {
   total: number;
   passRate: number | null;
   durationSec: number;
+}
+
+export interface RsiEvolutionTrendPoint {
+  id: string;
+  dateKey: string;
+  label: string;
+  timestamp: string;
+  passRatePct: number | null;
+  rollingSuccessRatePct: number | null;
+  adoptedPromptsCumulative: number;
+  newlyAdoptedPrompts: number;
+  totalCases: number;
+  passedCases: number;
+  failedCases: number;
+  branch?: string;
+  workflowName?: string;
 }
 
 export interface RootCauseDistributionItem {
@@ -767,6 +788,145 @@ export function buildRsiGuidelinesMarkdown(rules: RsiSystemRule[]): string {
 }
 
 /**
+ * Builds chronological RSI self-evolution series pairing test success-rate progression
+ * (individual run + 3-run rolling average) against cumulative & newly adopted active System Prompts.
+ */
+export function buildRsiEvolutionTrend(
+  testReports: TestExecutionReport[],
+  rules: RsiSystemRule[]
+): RsiEvolutionTrendPoint[] {
+  const adoptedRules = rules
+    .filter((r) => r.status === 'active')
+    .map((r) => ({
+      ...r,
+      adoptedAtMs: Date.parse(r.createdAt || r.updatedAt) || 0,
+    }))
+    .sort((a, b) => a.adoptedAtMs - b.adoptedAtMs);
+
+  const sortedReports = [...testReports]
+    .filter((r) => !Number.isNaN(Date.parse(r.executedAt)))
+    .sort((a, b) => Date.parse(a.executedAt) - Date.parse(b.executedAt));
+
+  const formatShortDate = (iso: string, fallback: string) => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return { dateKey: fallback, label: fallback };
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    return { dateKey: `${mm}-${dd} ${hh}:${mi}`, label: `${mm}-${dd}` };
+  };
+
+  if (sortedReports.length === 0) {
+    if (adoptedRules.length === 0) return [];
+    // Group adopted rules by day when no test reports exist yet so prompt adoption still visualizes cleanly
+    const byDay = new Map<string, { timestamp: string; count: number }>();
+    for (const rule of adoptedRules) {
+      const iso = rule.createdAt || rule.updatedAt;
+      const d = new Date(iso);
+      const dayKey = Number.isNaN(d.getTime())
+        ? '规则'
+        : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const existing = byDay.get(dayKey);
+      if (existing) {
+        existing.count += 1;
+        existing.timestamp = iso;
+      } else {
+        byDay.set(dayKey, { timestamp: iso, count: 1 });
+      }
+    }
+    let cumulative = 0;
+    return Array.from(byDay.entries()).map(([dayKey, info], idx) => {
+      cumulative += info.count;
+      return {
+        id: `evo-rule-${idx}`,
+        dateKey: dayKey,
+        label: dayKey,
+        timestamp: info.timestamp,
+        passRatePct: null,
+        rollingSuccessRatePct: null,
+        adoptedPromptsCumulative: cumulative,
+        newlyAdoptedPrompts: info.count,
+        totalCases: 0,
+        passedCases: 0,
+        failedCases: 0,
+      };
+    });
+  }
+
+  const recentReports = sortedReports.slice(-20);
+  const points: RsiEvolutionTrendPoint[] = [];
+  const rollingWindowRates: number[] = [];
+  let prevCumulative = 0;
+
+  for (let i = 0; i < recentReports.length; i++) {
+    const r = recentReports[i];
+    const tsMs = Date.parse(r.executedAt);
+    const { dateKey, label } = formatShortDate(r.executedAt, `R${i + 1}`);
+    const computedRate =
+      typeof r.passRate === 'number' ? r.passRate : computePassRate(r.passed, r.failed);
+
+    if (typeof computedRate === 'number') {
+      rollingWindowRates.push(computedRate);
+      if (rollingWindowRates.length > 3) {
+        rollingWindowRates.shift();
+      }
+    }
+
+    const rollingSuccessRatePct =
+      rollingWindowRates.length > 0
+        ? Math.round(
+            rollingWindowRates.reduce((acc, v) => acc + v, 0) / rollingWindowRates.length
+          )
+        : null;
+
+    const cumulativeAtRun = adoptedRules.filter((rule) => rule.adoptedAtMs <= tsMs).length;
+    const newlyAdopted = Math.max(0, cumulativeAtRun - prevCumulative);
+    prevCumulative = cumulativeAtRun;
+
+    points.push({
+      id: r.id,
+      dateKey,
+      label: r.actionsRunId ? `${label} #${String(r.actionsRunId).slice(-3)}` : label,
+      timestamp: r.executedAt,
+      passRatePct: computedRate,
+      rollingSuccessRatePct,
+      adoptedPromptsCumulative: cumulativeAtRun,
+      newlyAdoptedPrompts: newlyAdopted,
+      totalCases: r.total,
+      passedCases: r.passed,
+      failedCases: r.failed,
+      branch: r.branch,
+      workflowName: r.workflowName,
+    });
+  }
+
+  // If newer active prompts were adopted AFTER the last test report, append a latest milestone point
+  const totalAdoptedNow = adoptedRules.length;
+  if (points.length > 0 && totalAdoptedNow > prevCumulative) {
+    const latestRule = adoptedRules[adoptedRules.length - 1];
+    const latestIso = latestRule.createdAt || latestRule.updatedAt;
+    const { dateKey, label } = formatShortDate(latestIso, '最新');
+    const lastPt = points[points.length - 1];
+    points.push({
+      id: `evo-latest-prompts`,
+      dateKey,
+      label: `${label} 进化`,
+      timestamp: latestIso,
+      passRatePct: lastPt.passRatePct,
+      rollingSuccessRatePct: lastPt.rollingSuccessRatePct,
+      adoptedPromptsCumulative: totalAdoptedNow,
+      newlyAdoptedPrompts: totalAdoptedNow - prevCumulative,
+      totalCases: 0,
+      passedCases: 0,
+      failedCases: 0,
+    });
+  }
+
+  return points;
+}
+
+/**
  * Aggregates real test execution reports, failure incidents, and RSI rules into chart-ready data.
  */
 export function aggregateQualityAndRsiMetrics(params: {
@@ -776,6 +936,7 @@ export function aggregateQualityAndRsiMetrics(params: {
 }): {
   summary: QualityRsiSummary;
   testTrend: QualityTrendPoint[];
+  evolutionTrend: RsiEvolutionTrendPoint[];
   rootCauseDistribution: RootCauseDistributionItem[];
 } {
   const sortedReportsAsc = [...params.testReports].sort(
@@ -891,6 +1052,7 @@ export function aggregateQualityAndRsiMetrics(params: {
       totalRuleApplications,
     },
     testTrend,
+    evolutionTrend: buildRsiEvolutionTrend(params.testReports, params.rules),
     rootCauseDistribution,
   };
 }

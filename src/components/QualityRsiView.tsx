@@ -19,6 +19,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import {
+  Area,
   Bar,
   BarChart,
   CartesianGrid,
@@ -39,6 +40,7 @@ import {
   type QualityTrendPoint,
   type RootCauseDistributionItem,
   type RsiDecisionAction,
+  type RsiEvolutionTrendPoint,
   type RsiPromptBudgetUsage,
   type RsiRootCauseCategory,
   type RsiRuleSeverity,
@@ -48,8 +50,20 @@ import {
   type TestExecutionReport,
 } from '../lib/rsiEngine';
 
+import type { BackgroundTask } from '../types/autodev';
+
+export interface QualityFocusTarget {
+  reportId?: string;
+  actionsRunId?: number;
+  nonce: number;
+}
+
 interface QualityRsiViewProps {
   repoFullName: string;
+  focusedTarget?: QualityFocusTarget | null;
+  onClearFocusedTarget?: () => void;
+  onBackgroundTaskStarted?: (task: BackgroundTask) => void;
+  refreshNonce?: number;
   onErrorToast: (message: string, title?: string) => void;
   onSuccessToast: (message: string, title?: string) => void;
 }
@@ -62,6 +76,7 @@ interface RsiDashboardApiResponse {
   summary: QualityRsiSummary;
   budget?: RsiPromptBudgetUsage;
   testTrend: QualityTrendPoint[];
+  evolutionTrend?: RsiEvolutionTrendPoint[];
   rootCauseDistribution: RootCauseDistributionItem[];
   effectivePrompts: {
     architect: string;
@@ -196,8 +211,56 @@ function RootCauseTooltip({
   );
 }
 
+function RsiEvolutionTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: Array<{ payload?: RsiEvolutionTrendPoint }>;
+}) {
+  if (!active || !payload || payload.length === 0) return null;
+  const row = payload[0]?.payload;
+  if (!row) return null;
+
+  return (
+    <div className="rounded-md border border-[#30363D] bg-[#161B22] px-3 py-2.5 text-[12px] shadow-lg max-w-[270px]">
+      <div className="font-mono font-semibold text-[#F0F6FC] truncate">
+        {row.workflowName} ({row.label})
+      </div>
+      <div className="mt-0.5 font-mono text-[11px] text-[#8B949E] truncate">
+        {row.dateKey} · {row.branch}
+      </div>
+      <div className="mt-2 space-y-1 font-mono tabular-nums text-[11px]">
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-[#8B949E]">本轮成功率</span>
+          <span className="text-[#58A6FF] font-semibold">
+            {row.passRatePct !== null ? `${row.passRatePct}%` : '—'}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-[#8B949E]">3 轮滚动成功率</span>
+          <span className="text-[#3FB950] font-semibold">
+            {row.rollingSuccessRatePct !== null ? `${row.rollingSuccessRatePct}%` : '—'}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <span className="text-[#8B949E]">累计采纳 System Prompt</span>
+          <span className="text-[#A371F7] font-semibold">
+            {row.adoptedPromptsCumulative} 条
+            {row.newlyAdoptedPrompts > 0 ? ` (+${row.newlyAdoptedPrompts})` : ''}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function QualityRsiView({
   repoFullName,
+  focusedTarget,
+  onClearFocusedTarget,
+  onBackgroundTaskStarted,
+  refreshNonce = 0,
   onErrorToast,
   onSuccessToast,
 }: QualityRsiViewProps) {
@@ -209,6 +272,7 @@ export function QualityRsiView({
   const [activeTab, setActiveTab] = useState<WorkbenchTab>('reports');
   const [trendFilter, setTrendFilter] = useState<TrendKindFilter>('all');
   const [expandedReportId, setExpandedReportId] = useState<string | null>(null);
+  const [highlightedReportId, setHighlightedReportId] = useState<string | null>(null);
   const [analyzingIncidentId, setAnalyzingIncidentId] = useState<string | null>(null);
 
   // Manual Incident Report Drawer/Form
@@ -268,7 +332,43 @@ export function QualityRsiView({
 
   useEffect(() => {
     fetchState();
-  }, [fetchState]);
+  }, [fetchState, refreshNonce]);
+
+  // Direct jump from ApprovalView automated test summary to matching test report detail
+  useEffect(() => {
+    if (!focusedTarget || !data) return;
+    setActiveTab('reports');
+    const reports = data.testReports ?? [];
+    const matched =
+      (focusedTarget.reportId
+        ? reports.find((r) => r.id === focusedTarget.reportId)
+        : undefined) ??
+      (focusedTarget.actionsRunId
+        ? reports.find((r) => r.actionsRunId === focusedTarget.actionsRunId)
+        : undefined) ??
+      reports[0] ??
+      null;
+
+    if (matched) {
+      setExpandedReportId(matched.id);
+      setHighlightedReportId(matched.id);
+      const scrollTimer = setTimeout(() => {
+        document
+          .getElementById(`test-report-${matched.id}`)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 80);
+      const clearHighlightTimer = setTimeout(() => {
+        setHighlightedReportId((prev) => (prev === matched.id ? null : prev));
+      }, 4500);
+      onClearFocusedTarget?.();
+      return () => {
+        clearTimeout(scrollTimer);
+        clearTimeout(clearHighlightTimer);
+      };
+    }
+
+    onClearFocusedTarget?.();
+  }, [focusedTarget, data, onClearFocusedTarget]);
 
   const handleSync = async () => {
     setSyncing(true);
@@ -278,11 +378,20 @@ export function QualityRsiView({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          async: true,
           repoFullName,
           autoAnalyzeLimit: 4,
         }),
       });
       const json = await res.json().catch(() => ({}));
+      if (res.status === 202 && json.task) {
+        onBackgroundTaskStarted?.(json.task as BackgroundTask);
+        onSuccessToast(
+          '测试报告同步与 RSI AI 归因已转入服务端后台执行，切换房间不会中断',
+          '后台同步已启动'
+        );
+        return;
+      }
       if (!res.ok) {
         throw new Error(json.error || `同步失败 (${res.status})`);
       }
@@ -312,8 +421,18 @@ export function QualityRsiView({
     try {
       const res = await fetch(`/api/rsi/incidents/${encodeURIComponent(incidentId)}/analyze`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ async: true }),
       });
       const json = await res.json().catch(() => ({}));
+      if (res.status === 202 && json.task) {
+        onBackgroundTaskStarted?.(json.task as BackgroundTask);
+        onSuccessToast(
+          '故障归因与 RSI 门控分析已转入服务端后台执行，离开页面不会中断',
+          '后台归因已启动'
+        );
+        return;
+      }
       if (!res.ok) {
         throw new Error(json.error || `AI 归因失败 (${res.status})`);
       }
@@ -349,6 +468,7 @@ export function QualityRsiView({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          async: true,
           repoFullName,
           source: incidentSource,
           title: incidentTitle.trim(),
@@ -358,6 +478,19 @@ export function QualityRsiView({
         }),
       });
       const json = await res.json().catch(() => ({}));
+      if (res.status === 202 && json.task) {
+        onBackgroundTaskStarted?.(json.task as BackgroundTask);
+        setIncidentTitle('');
+        setIncidentSummary('');
+        setIncidentEvidence('');
+        setShowIncidentForm(false);
+        setActiveTab('incidents');
+        onSuccessToast(
+          '异常上报与 RSI 自动归因已转入服务端后台执行，切换房间不会中断',
+          '后台归因已启动'
+        );
+        return;
+      }
       if (!res.ok) {
         throw new Error(json.error || `提交失败 (${res.status})`);
       }
@@ -452,8 +585,20 @@ export function QualityRsiView({
   const handleConsolidateRules = async () => {
     setConsolidating(true);
     try {
-      const res = await fetch('/api/rsi/consolidate', { method: 'POST' });
+      const res = await fetch('/api/rsi/consolidate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ async: true }),
+      });
       const json = await res.json().catch(() => ({}));
+      if (res.status === 202 && json.task) {
+        onBackgroundTaskStarted?.(json.task as BackgroundTask);
+        onSuccessToast(
+          'RSI 规则蒸馏压缩已转入服务端后台执行，离开页面不会中断',
+          '后台蒸馏已启动'
+        );
+        return;
+      }
       if (!res.ok) {
         throw new Error(json.error || `AI 蒸馏压缩失败 (${res.status})`);
       }
@@ -516,6 +661,22 @@ export function QualityRsiView({
     }
     return raw;
   }, [data?.rules, ruleStageFilter, ruleStatusFilter]);
+
+  const evolutionTrend = useMemo(() => data?.evolutionTrend ?? [], [data?.evolutionTrend]);
+
+  const evolutionMetrics = useMemo(() => {
+    const ratePoints = evolutionTrend.filter((p) => p.passRatePct !== null);
+    const latestRate =
+      ratePoints.length > 0 ? ratePoints[ratePoints.length - 1].passRatePct : null;
+    const firstRate = ratePoints.length > 1 ? ratePoints[0].passRatePct : null;
+    const delta =
+      latestRate !== null && firstRate !== null ? latestRate - firstRate : null;
+    const latestAdopted =
+      evolutionTrend.length > 0
+        ? evolutionTrend[evolutionTrend.length - 1].adoptedPromptsCumulative
+        : (data?.summary?.activeRulesCount ?? 0);
+    return { latestRate, delta, latestAdopted };
+  }, [evolutionTrend, data?.summary?.activeRulesCount]);
 
   const summary = data?.summary;
   const activePromptText = data?.effectivePrompts?.[previewStage] ?? '';
@@ -795,6 +956,162 @@ export function QualityRsiView({
               ? `待观察 ${summary.candidateRulesCount} · 已归档 ${summary.archivedRulesCount} · 注入 ${summary.totalRuleApplications} 次`
               : '正在加载…'}
           </div>
+        </div>
+      </section>
+
+      {/* Primary Self-Evolution Recharts Panel: Success Rate Trend vs Adopted System Prompts */}
+      <section
+        aria-label="系统自进化成功率与采纳规则趋势"
+        className="rounded-md border border-[#30363D] bg-[#161B22] p-5 space-y-4"
+      >
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
+              系统自进化趋势：成功率变化 vs 采纳 System Prompt 数量
+            </h2>
+            <div className="mt-1.5 flex flex-wrap items-center gap-4 text-[11px] text-[#8B949E]">
+              <span className="inline-flex items-center gap-1.5">
+                <span className="h-2 w-2 rounded-xs bg-[#58A6FF]" aria-hidden="true" />
+                单轮成功率 %
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="h-0.5 w-3.5 bg-[#3FB950]" aria-hidden="true" />
+                3 轮滚动成功率 %
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="h-2 w-2 rounded-xs bg-[#A371F7]" aria-hidden="true" />
+                累计采纳 System Prompt 数
+              </span>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-1 font-mono tabular-nums text-[12px]">
+            <div>
+              <span className="text-[#8B949E] mr-1.5">最新成功率</span>
+              <span className="font-semibold text-[#F0F6FC]">
+                {evolutionMetrics.latestRate !== null ? `${evolutionMetrics.latestRate}%` : '—'}
+              </span>
+            </div>
+            <div>
+              <span className="text-[#8B949E] mr-1.5">进化净变化</span>
+              <span
+                className={`font-semibold ${
+                  evolutionMetrics.delta === null
+                    ? 'text-[#8B949E]'
+                    : evolutionMetrics.delta >= 0
+                      ? 'text-[#3FB950]'
+                      : 'text-[#F85149]'
+                }`}
+              >
+                {evolutionMetrics.delta === null
+                  ? '—'
+                  : `${evolutionMetrics.delta >= 0 ? '+' : ''}${evolutionMetrics.delta}%`}
+              </span>
+            </div>
+            <div>
+              <span className="text-[#8B949E] mr-1.5">已采纳规则</span>
+              <span className="font-semibold text-[#A371F7]">
+                {evolutionMetrics.latestAdopted} 条
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="h-[260px] w-full">
+          {loading && !data ? (
+            <div className="h-full w-full rounded bg-[#0D1117] animate-pulse" />
+          ) : evolutionTrend.length === 0 ? (
+            <div className="h-full w-full rounded border border-dashed border-[#30363D] bg-[#0D1117] flex flex-col items-center justify-center gap-2 text-[12px] text-[#8B949E] px-4 text-center">
+              <span>暂无自进化趋势样本，完成首轮测试或同步报告后将自动绘制成功率与规则增长曲线</span>
+              <button
+                type="button"
+                onClick={handleSync}
+                disabled={syncing}
+                className="text-[#58A6FF] hover:underline"
+              >
+                立即同步 GitHub Actions 测试报告
+              </button>
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart
+                data={evolutionTrend}
+                margin={{ top: 10, right: 16, left: -6, bottom: 0 }}
+              >
+                <defs>
+                  <linearGradient id="rsiPassRateGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#58A6FF" stopOpacity={0.28} />
+                    <stop offset="95%" stopColor="#58A6FF" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#21262D" vertical={false} />
+                <XAxis
+                  dataKey="label"
+                  padding={{ left: 16, right: 16 }}
+                  tick={{ fill: '#8B949E', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
+                  axisLine={{ stroke: '#30363D' }}
+                  tickLine={false}
+                />
+                <YAxis
+                  yAxisId="rate"
+                  domain={[0, 100]}
+                  tickFormatter={(v) => `${v}%`}
+                  tick={{ fill: '#8B949E', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={44}
+                />
+                <YAxis
+                  yAxisId="prompts"
+                  orientation="right"
+                  allowDecimals={false}
+                  tick={{ fill: '#A371F7', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={36}
+                />
+                <Tooltip
+                  content={<RsiEvolutionTooltip />}
+                  cursor={{ fill: 'rgba(88, 166, 255, 0.06)' }}
+                />
+                <Bar
+                  yAxisId="prompts"
+                  dataKey="adoptedPromptsCumulative"
+                  name="累计采纳 System Prompt"
+                  fill="#A371F7"
+                  fillOpacity={0.45}
+                  barSize={22}
+                  radius={[3, 3, 0, 0]}
+                  isAnimationActive={false}
+                />
+                <Area
+                  yAxisId="rate"
+                  type="monotone"
+                  dataKey="passRatePct"
+                  name="单轮成功率"
+                  stroke="#58A6FF"
+                  strokeWidth={2}
+                  fill="url(#rsiPassRateGradient)"
+                  connectNulls
+                  isAnimationActive={false}
+                  dot={{ r: 3.5, fill: '#0D1117', stroke: '#58A6FF', strokeWidth: 2 }}
+                  activeDot={{ r: 5, fill: '#58A6FF', stroke: '#F0F6FC', strokeWidth: 1.5 }}
+                />
+                <Line
+                  yAxisId="rate"
+                  type="monotone"
+                  dataKey="rollingSuccessRatePct"
+                  name="3 轮滚动成功率"
+                  stroke="#3FB950"
+                  strokeWidth={2.5}
+                  connectNulls
+                  isAnimationActive={false}
+                  dot={{ r: 3, fill: '#0D1117', stroke: '#3FB950', strokeWidth: 2 }}
+                  activeDot={{ r: 5, fill: '#3FB950', stroke: '#F0F6FC', strokeWidth: 1.5 }}
+                />
+              </ComposedChart>
+            </ResponsiveContainer>
+          )}
         </div>
       </section>
 
@@ -1147,8 +1464,17 @@ export function QualityRsiView({
                               ? '执行失败'
                               : '已跳过';
 
+                      const isHighlighted = highlightedReportId === report.id;
                       return (
-                        <div key={report.id}>
+                        <div
+                          key={report.id}
+                          id={`test-report-${report.id}`}
+                          className={
+                            isHighlighted
+                              ? 'bg-[#1F6FEB]/15 ring-1 ring-inset ring-[#58A6FF]/70 transition-colors'
+                              : undefined
+                          }
+                        >
                           <div
                             role="button"
                             tabIndex={0}

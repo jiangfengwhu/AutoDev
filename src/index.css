@@ -1,6 +1,7 @@
 @import "tailwindcss";
 
 @theme {
+  --font-display: "Bricolage Grotesque", "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-sans: "Plus Jakarta Sans", "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
@@ -12,9 +13,15 @@
 
   body {
     font-family: var(--font-sans);
-    background-color: #0d1117;
-    color: #c9d1d9;
+    background-color: #0c0f16;
+    color: #d8dee9;
     letter-spacing: 0.005em;
+  }
+
+  h1,
+  h2,
+  .font-display {
+    font-family: var(--font-display);
   }
 
   code,
@@ -28,7 +35,25 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* GitHub Primer dark scrollbar */
+/* Subtle architectural drafting-floor blueprint dot grid */
+.studio-blueprint-floor {
+  background-color: #0c0f16;
+  background-image:
+    radial-gradient(circle at 18% 0%, rgba(245, 158, 11, 0.06), transparent 42%),
+    radial-gradient(circle at 86% 8%, rgba(56, 189, 248, 0.05), transparent 40%),
+    radial-gradient(rgba(148, 163, 184, 0.11) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 26px 26px;
+}
+
+/* Wall-mounted office big-screen monitor bezel */
+.studio-bigscreen-bezel {
+  background: linear-gradient(180deg, #131823 0%, #0b0e15 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 20px 50px -28px rgba(0, 0, 0, 0.85);
+}
+
+/* Architectural studio scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -39,10 +64,10 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #30363d;
+  background: #2b3445;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #484f58;
+  background: #3d4a63;
 }

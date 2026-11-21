@@ -9,6 +9,8 @@ export interface PrArtifacts {
   prdMdContent: string;
   archivedPrdPath: string;
   e2eTestPath: string;
+  e2eVaultPath: string;
+  e2eVaultMetaPath: string;
   e2eTestContent: string;
   prTitle: string;
   prBody: string;
@@ -68,6 +70,8 @@ export function buildPrArtifacts(run: PipelineRun): PrArtifacts {
     baseBranch: run.defaultBranch,
     baseCommitSha: run.repoContext?.headSha || undefined,
     e2eTestPath: paths.e2eTestPath,
+    e2eVaultPath: paths.e2eVaultPath,
+    blindE2eVerification: true,
     archivedSpecPath: paths.archivedSpecPath,
     prdTitle: run.prdTitle,
     architecture: {
@@ -147,10 +151,10 @@ export function buildPrArtifacts(run: PipelineRun): PrArtifacts {
     ``,
     `本 Draft PR 由 **AutoDev Studio** 自动生成，基于最新 \`${run.defaultBranch}\` 代码上下文完成架构拆解与独立 QA Critic 评审。`,
     ``,
-    `### 提交制品（保留历次回归测试）`,
+    `### 提交制品（盲测隔离机制）`,
     `- \`${paths.prdMdPath}\` & \`${paths.archivedPrdPath}\` — 本轮结构化需求文档与归档`,
     `- \`${paths.specJsonPath}\` & \`${paths.archivedSpecPath}\` — 架构方案、接口契约 (${run.architect.apiContracts.length} 项) 与原子任务树 (${run.architect.tasks.length} 项)`,
-    `- \`${paths.e2eTestPath}\` — 本轮独立只读 Playwright E2E 测试脚本（不覆盖历史回归测试）`,
+    `- 独立 Playwright E2E 测试集已隔离存放于专用盲测金库（编码阶段对 Coding Agent 完全不可见，防止针对断言作弊，仅在编码提交后由独立验收阶段拉取执行）`,
     ``,
     `### 原子任务清单`,
     taskSummaryLines,
@@ -172,6 +176,8 @@ export function buildPrArtifacts(run: PipelineRun): PrArtifacts {
     prdMdContent,
     archivedPrdPath: paths.archivedPrdPath,
     e2eTestPath: paths.e2eTestPath,
+    e2eVaultPath: paths.e2eVaultPath,
+    e2eVaultMetaPath: paths.e2eVaultMetaPath,
     e2eTestContent,
     prTitle,
     prBody,

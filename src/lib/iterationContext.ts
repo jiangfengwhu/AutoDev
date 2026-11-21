@@ -1,5 +1,8 @@
 import type {
+  AnalysisJob,
+  GitHubActionRun,
   OpenAutodevPrSummary,
+  PipelineRun,
   RepoContextSnapshot,
   SingleTaskLockReason,
   SingleTaskLockStatus,
@@ -11,6 +14,8 @@ export interface IterationArtifactPaths {
   archivedSpecPath: string;
   archivedPrdPath: string;
   e2eTestPath: string;
+  e2eVaultPath: string;
+  e2eVaultMetaPath: string;
 }
 
 export function sanitizeIterationSlug(runId: string): string {
@@ -31,6 +36,8 @@ export function buildIterationArtifactPaths(runId: string): IterationArtifactPat
     archivedSpecPath: `docs/iterations/${slug}-spec.json`,
     archivedPrdPath: `docs/iterations/${slug}-prd.md`,
     e2eTestPath: `tests/e2e/${slug}.spec.ts`,
+    e2eVaultPath: `.autodev-e2e-vault/${slug}/e2e.spec.ts`,
+    e2eVaultMetaPath: `.autodev-e2e-vault/${slug}/meta.json`,
   };
 }
 
@@ -221,8 +228,45 @@ export function buildRevisionFeedbackMarkdown(params: {
     ``,
     `## 返工执行要求`,
     `1. 优先修复上述退回意见及未通过的验收项，切勿破坏既有已通过的功能。`,
-    `2. 严禁修改、弱化或删除 \`tests/e2e/\` 下任何只读测试文件。`,
-    `3. 修复后确保构建、类型检查与自动化测试全部通过。`,
+    `2. 严格依据需求规格与接口契约修复实现，不得篡改或绕过验收流程。`,
+    `3. 修复后确保构建、类型检查通过，并直接提交推送到当前特性分支。`,
     ``,
   ].join('\n');
+}
+
+/**
+ * Strictly filters GitHub Actions runs to only those belonging to the currently selected requirement.
+ */
+export function filterActionRunsForPipelineRun(
+  actionRuns: GitHubActionRun[],
+  activeRun: PipelineRun | null,
+  relatedJobs: AnalysisJob[] = []
+): GitHubActionRun[] {
+  if (!activeRun) return [];
+
+  const targetBranch = activeRun.draftPr?.branchName?.trim();
+  const prNumber = activeRun.draftPr?.prNumber;
+  const linkedPlanActionRunIds = new Set<number>();
+  const linkedJobIds = new Set<string>();
+
+  for (const job of relatedJobs) {
+    if (job.runId === activeRun.id || job.run?.id === activeRun.id) {
+      linkedJobIds.add(job.id);
+      if (job.planActionsRunId) {
+        linkedPlanActionRunIds.add(job.planActionsRunId);
+      }
+    }
+  }
+
+  return actionRuns.filter((ar) => {
+    if (ar.pipelineRunId && ar.pipelineRunId === activeRun.id) return true;
+    if (ar.jobId && linkedJobIds.has(ar.jobId)) return true;
+    if (linkedPlanActionRunIds.has(ar.id)) return true;
+    if (prNumber && ar.prNumber && ar.prNumber === prNumber) return true;
+    if (targetBranch) {
+      if (ar.targetBranch && ar.targetBranch === targetBranch) return true;
+      if (ar.headBranch && ar.headBranch === targetBranch) return true;
+    }
+    return false;
+  });
 }

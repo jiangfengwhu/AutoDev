@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  ArrowRight,
   CheckCircle2,
   Cloud,
   Database,
@@ -13,19 +14,18 @@ import {
   RotateCcw,
   ShieldCheck,
 } from 'lucide-react';
-import type { PipelineRun } from '../types/autodev';
+import type { BackgroundTask, PipelineRun } from '../types/autodev';
 import type { TestExecutionReport } from '../lib/rsiEngine';
-import { ensureReadOnlyTestHeader } from '../lib/specBuilder';
-import { buildIterationArtifactPaths } from '../lib/iterationContext';
-import { decideAgySessionPolicy } from '../lib/sessionReuse';
 
 interface ApprovalViewProps {
   runs: PipelineRun[];
   selectedRunId: string | null;
   onSelectRun: (runId: string) => void;
   onRunUpdated: (run: PipelineRun) => void;
+  onBackgroundTaskStarted?: (task: BackgroundTask) => void;
   onGoToNewPrd: () => void;
-  onGoToQuality?: () => void;
+  onGoToQuality?: (target?: { reportId?: string; actionsRunId?: number }) => void;
+  isRequirementInProgress?: boolean;
   onErrorToast: (message: string, title?: string) => void;
   onSuccessToast: (message: string, title?: string) => void;
 }
@@ -35,8 +35,10 @@ export function ApprovalView({
   selectedRunId,
   onSelectRun,
   onRunUpdated,
+  onBackgroundTaskStarted,
   onGoToNewPrd,
   onGoToQuality,
+  isRequirementInProgress = false,
   onErrorToast,
   onSuccessToast,
 }: ApprovalViewProps) {
@@ -46,7 +48,6 @@ export function ApprovalView({
   const [syncToGitHub, setSyncToGitHub] = useState(true);
   const [mergePrToMain, setMergePrToMain] = useState(true);
   const [autoReworkViaAgy, setAutoReworkViaAgy] = useState(true);
-  const [forceFreshSession, setForceFreshSession] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
@@ -56,12 +57,6 @@ export function ApprovalView({
   );
   const [deployingPreview, setDeployingPreview] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const [deployingCf, setDeployingCf] = useState(false);
-  const [deployFeedback, setDeployFeedback] = useState<{
-    type: 'success' | 'error';
-    text: string;
-    actionsUrl?: string;
-  } | null>(null);
   const [latestTestReport, setLatestTestReport] = useState<TestExecutionReport | null>(null);
 
   useEffect(() => {
@@ -114,15 +109,6 @@ export function ApprovalView({
     [activeRun?.checkedCriteriaIds]
   );
 
-  const predictedSessionPolicy = useMemo(() => {
-    if (!activeRun?.draftPr) return null;
-    return decideAgySessionPolicy({
-      targetBranch: activeRun.draftPr.branchName,
-      lastAgySession: activeRun.lastAgySession,
-      forceFresh: forceFreshSession,
-    });
-  }, [activeRun?.draftPr?.branchName, activeRun?.lastAgySession, forceFreshSession]);
-
   const handleToggleCriterion = async (criterionId: string) => {
     if (!activeRun) return;
     const nextSet = new Set(checkedSet);
@@ -164,6 +150,7 @@ export function ApprovalView({
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          async: true,
           checkedCriteriaIds: Array.from(checkedSet),
           decision,
           approvalNote: approvalNote.trim(),
@@ -172,12 +159,19 @@ export function ApprovalView({
           autoReworkViaAgy: Boolean(
             decision === 'changes_requested' && autoReworkViaAgy && activeRun.draftPr
           ),
-          forceFreshSession: Boolean(
-            decision === 'changes_requested' && forceFreshSession
-          ),
         }),
       });
       const data = await res.json().catch(() => ({}));
+      if (res.status === 202 && data.task) {
+        onBackgroundTaskStarted?.(data.task as BackgroundTask);
+        const msg =
+          decision === 'approved'
+            ? '审批合入与生产部署已转入服务端后台执行，切换房间或离开页面不会中断。'
+            : '退回修订与 AGY 自动返工派发已转入服务端后台执行，离开页面不会中断。';
+        setFeedback({ type: 'success', text: msg });
+        onSuccessToast(msg, decision === 'approved' ? '后台上线已启动' : '后台返工已启动');
+        return;
+      }
       if (!res.ok) {
         throw new Error(data.error || `提交审批失败 (${res.status})`);
       }
@@ -202,17 +196,17 @@ export function ApprovalView({
           decision === 'approved' && data.mergeResult?.merged
             ? data.mergeResult.alreadyMerged
               ? `，PR 已合入 ${data.mergeResult.baseBranch || 'main'}`
-              : `，已 Squash Merge 合入 ${data.mergeResult.baseBranch || 'main'}（${(data.mergeResult.mergeCommitSha || '').slice(0, 7)}）${data.mergeResult.branchDeleted ? '并自动清理特性分支' : ''}`
+              : `，已合入 ${data.mergeResult.baseBranch || 'main'}（${(data.mergeResult.mergeCommitSha || '').slice(0, 7)}）${data.mergeResult.branchDeleted ? '并清理特性分支' : ''}`
             : '';
-        const sessionTag =
-          data.reworkResult?.sessionMode === 'resume' && data.reworkResult?.resumeSessionId
-            ? `（复用会话 ${data.reworkResult.resumeSessionId}）`
-            : data.reworkResult?.dispatched
-              ? '（全新会话）'
-              : '';
+        const prodDeployMsg =
+          decision === 'approved' && data.productionDeployResult
+            ? data.productionDeployResult.deployed
+              ? `，已自动部署生产环境（${data.productionDeployResult.deployment?.url || 'Cloudflare Workers'}）`
+              : `，但生产自动部署失败：${data.productionDeployResult.error || '请检查 Cloudflare 配置'}`
+            : '';
         const reworkMsg =
           decision === 'changes_requested' && data.reworkResult?.dispatched
-            ? `，已写入 ${data.reworkResult.feedbackFilePath} 并自动派发 VPS AGY 返工修复${sessionTag}`
+            ? '，已自动在原分支派发 AGY 返工修复'
             : '';
         const rsiMsg =
           decision === 'changes_requested' && data.rsiIncidentId
@@ -223,9 +217,21 @@ export function ApprovalView({
             ? '，已同步至 PR 评论。'
             : `（${data.githubSync.error || '未同步至 GitHub'}）`
           : '。';
-        const text = `${decision === 'approved' ? '验收通过并批准上线' : '已退回修订'}${mergeMsg}${reworkMsg}${rsiMsg}${syncMsg}`;
-        setFeedback({ type: 'success', text });
-        onSuccessToast(text, decision === 'approved' ? '发布审批完成' : '已退回并进入 RSI 归因');
+        const text = `${decision === 'approved' ? '同意上线' : '已退回修订'}${mergeMsg}${prodDeployMsg}${reworkMsg}${rsiMsg}${syncMsg}`;
+        const hasProdError = Boolean(
+          decision === 'approved' &&
+            data.productionDeployResult &&
+            !data.productionDeployResult.deployed
+        );
+        setFeedback({ type: hasProdError ? 'error' : 'success', text });
+        if (hasProdError) {
+          onErrorToast(text, '生产部署异常');
+        } else {
+          onSuccessToast(
+            text,
+            decision === 'approved' ? '上线合并与生产部署完成' : '已退回修订'
+          );
+        }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : '审批提交失败';
@@ -247,6 +253,7 @@ export function ApprovalView({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          async: true,
           runId: activeRun.id,
           repoFullName: activeRun.repoFullName,
           branchName: targetBranch,
@@ -254,6 +261,14 @@ export function ApprovalView({
         }),
       });
       const data = await res.json().catch(() => ({}));
+      if (res.status === 202 && data.task) {
+        onBackgroundTaskStarted?.(data.task as BackgroundTask);
+        onSuccessToast(
+          `分支 ${targetBranch} 的 Cloudflare 预览部署已转入服务端后台执行，离开页面不会中断`,
+          '后台部署已启动'
+        );
+        return;
+      }
       if (!res.ok) {
         throw new Error(data.error || `预览部署失败 (${res.status})`);
       }
@@ -274,42 +289,6 @@ export function ApprovalView({
     }
   };
 
-  const handleDispatchCloudflareDeploy = async () => {
-    if (!activeRun) return;
-    setDeployingCf(true);
-    setDeployFeedback(null);
-    try {
-      const targetBranch =
-        deployBranch.trim() || activeRun.draftPr?.branchName || activeRun.defaultBranch || 'main';
-      const res = await fetch('/api/github/dispatch-deploy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          repoFullName: activeRun.repoFullName,
-          targetBranch,
-          baseBranch: activeRun.defaultBranch || 'main',
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error || `触发部署失败 (${res.status})`);
-      }
-      const msg = `已派发部署任务至 ${data.targetBranch}`;
-      setDeployFeedback({
-        type: 'success',
-        text: msg,
-        actionsUrl: data.actionsUrl,
-      });
-      onSuccessToast(msg, '已触发 Actions 部署');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '触发 Cloudflare 部署失败';
-      setDeployFeedback({ type: 'error', text: msg });
-      onErrorToast(msg, '触发部署失败');
-    } finally {
-      setDeployingCf(false);
-    }
-  };
-
   if (!activeRun) {
     return (
       <div className="space-y-6">
@@ -323,24 +302,20 @@ export function ApprovalView({
           <div className="text-[15px] font-semibold text-[#F0F6FC]">
             暂无待验收的需求
           </div>
-          <button
-            type="button"
-            onClick={onGoToNewPrd}
-            className="inline-flex items-center gap-2 rounded-md bg-[#238636] border border-[#3FB950]/30 px-4 py-2 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] transition-colors"
-          >
-            <Plus className="h-4 w-4" />
-            <span>前往新建需求</span>
-          </button>
+          {!isRequirementInProgress && (
+            <button
+              type="button"
+              onClick={onGoToNewPrd}
+              className="inline-flex items-center gap-2 rounded-md bg-[#238636] border border-[#3FB950]/30 px-4 py-2 text-[13px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] transition-colors"
+            >
+              <Plus className="h-4 w-4" />
+              <span>前往新建需求</span>
+            </button>
+          )}
         </div>
       </div>
     );
   }
-
-  const readOnlyE2e = ensureReadOnlyTestHeader(
-    activeRun.qaCritic.finalE2eTestCode,
-    activeRun.id,
-    activeRun.prdTitle
-  );
 
   return (
     <div className="space-y-6">
@@ -415,8 +390,19 @@ export function ApprovalView({
         )}
       </div>
 
-      {/* Compact Automated Test Verification Summary */}
-      <div className="rounded-md border border-[#30363D] bg-[#161B22] px-5 py-3.5 flex flex-wrap items-center justify-between gap-3">
+      {/* Clickable Automated Test Verification Summary -> Direct to Test Detail */}
+      <button
+        type="button"
+        onClick={() =>
+          onGoToQuality?.({
+            reportId: latestTestReport?.id,
+            actionsRunId: latestTestReport?.actionsRunId,
+          })
+        }
+        disabled={!onGoToQuality}
+        aria-label="查看对应自动化测试详情"
+        className="w-full text-left rounded-md border border-[#30363D] bg-[#161B22] hover:border-[#58A6FF]/70 hover:bg-[#1C2128] px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 transition-colors group disabled:cursor-default"
+      >
         <div className="flex flex-wrap items-center gap-2.5 text-[12px] min-w-0">
           <Activity className="h-4 w-4 text-[#58A6FF] shrink-0" />
           <span className="font-semibold text-[#F0F6FC]">自动化测试校验</span>
@@ -431,24 +417,24 @@ export function ApprovalView({
               {latestTestReport.passRate !== null && (
                 <span className="ml-2 text-[#58A6FF]">({latestTestReport.passRate}%)</span>
               )}
-              <span className="ml-2 text-[#8B949E]">· {latestTestReport.branch}</span>
+              <span className="ml-2 text-[#8B949E]">
+                · {latestTestReport.workflowName}
+                {latestTestReport.actionsRunId ? ` #${latestTestReport.actionsRunId}` : ''}
+              </span>
             </span>
           ) : (
             <span className="text-[#8B949E]">
-              尚未同步测试执行报告，退回修订时问题也将自动进入 RSI 归因闭环
+              尚未同步测试执行报告，点击进入测试看板同步或查看明细
             </span>
           )}
         </div>
         {onGoToQuality && (
-          <button
-            type="button"
-            onClick={onGoToQuality}
-            className="text-[12px] font-medium text-[#58A6FF] hover:underline whitespace-nowrap shrink-0"
-          >
-            查看测试看板与 RSI 规则
-          </button>
+          <span className="inline-flex items-center gap-1 text-[12px] font-medium text-[#58A6FF] group-hover:underline whitespace-nowrap shrink-0">
+            <span>直达测试详情</span>
+            <ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
+          </span>
         )}
-      </div>
+      </button>
 
       {/* Online Acceptance Environment (Cloudflare Workers Preview URL) */}
       <section
@@ -662,38 +648,46 @@ export function ApprovalView({
             </div>
           )}
 
-          {activeRun.lastRework && !activeRun.mergedRelease && (
-            <div className="rounded-md border border-[#D29922]/40 bg-[#D29922]/10 px-3.5 py-2.5 text-[12px] text-[#F2CC60] space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <RotateCcw className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate">
-                    {activeRun.lastRework.dispatched
-                      ? `已派发 AGY 返工 · ${activeRun.lastRework.feedbackFilePath}${
-                          activeRun.lastRework.sessionMode === 'resume' &&
-                          activeRun.lastRework.resumeSessionId
-                            ? `（复用会话 ${activeRun.lastRework.resumeSessionId}）`
-                            : '（全新会话）'
-                        }`
-                      : `返工派发失败：${activeRun.lastRework.error || '未知错误'}`}
-                  </span>
-                </div>
-                {activeRun.lastRework.actionsUrl && (
-                  <a
-                    href={activeRun.lastRework.actionsUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 underline shrink-0"
-                  >
-                    <span>Actions</span>
-                    <ExternalLink className="h-3 w-3" />
-                  </a>
-                )}
+          {activeRun.productionDeployment && (
+            <div className="rounded-md border border-[#3FB950]/40 bg-[#2EA043]/10 px-3.5 py-2.5 text-[12px] text-[#AFF5B4] flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <Globe className="h-3.5 w-3.5 shrink-0 text-[#3FB950]" />
+                <span className="truncate font-mono">
+                  生产环境已自动部署 · {activeRun.productionDeployment.workerName}
+                </span>
               </div>
-              {activeRun.lastRework.sessionReason && (
-                <div className="text-[11px] font-mono text-[#E3B341]/90 pl-5">
-                  会话策略：{activeRun.lastRework.sessionReason}
-                </div>
+              <a
+                href={activeRun.productionDeployment.url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 underline shrink-0"
+              >
+                <span>打开生产站</span>
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            </div>
+          )}
+
+          {activeRun.lastRework && !activeRun.mergedRelease && (
+            <div className="rounded-md border border-[#D29922]/40 bg-[#D29922]/10 px-3.5 py-2.5 text-[12px] text-[#F2CC60] flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <RotateCcw className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">
+                  {activeRun.lastRework.dispatched
+                    ? `已在原分支派发 AGY 返工修复`
+                    : `返工派发失败：${activeRun.lastRework.error || '未知错误'}`}
+                </span>
+              </div>
+              {activeRun.lastRework.actionsUrl && (
+                <a
+                  href={activeRun.lastRework.actionsUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 underline shrink-0"
+                >
+                  <span>Actions</span>
+                  <ExternalLink className="h-3 w-3" />
+                </a>
               )}
             </div>
           )}
@@ -710,11 +704,11 @@ export function ApprovalView({
                       className="mt-0.5 h-3.5 w-3.5 rounded accent-[#238636]"
                     />
                     <span>
-                      批准时合并 PR #{activeRun.draftPr.prNumber} 至{' '}
+                      同意上线后自动合并 PR #{activeRun.draftPr.prNumber} 至{' '}
                       <code className="font-mono text-[#58A6FF]">
                         {activeRun.defaultBranch || 'main'}
-                      </code>{' '}
-                      并自动清理特性分支
+                      </code>
+                      、清理分支并部署生产环境
                     </span>
                   </label>
                   <label className="flex items-start gap-2 text-[12px] text-[#C9D1D9] cursor-pointer">
@@ -724,44 +718,8 @@ export function ApprovalView({
                       onChange={(e) => setAutoReworkViaAgy(e.target.checked)}
                       className="mt-0.5 h-3.5 w-3.5 rounded accent-[#D29922]"
                     />
-                    <span>
-                      退回修订时在原需求分支{' '}
-                      <code className="font-mono text-[#58A6FF]">
-                        {activeRun.draftPr.branchName}
-                      </code>{' '}
-                      写入 <code className="font-mono text-[#58A6FF]">docs/revision-feedback.md</code> 并直接派发 VPS AGY 增量返工（不新建分支）
-                    </span>
+                    <span>退回修订后自动在原分支派发 AGY 修复</span>
                   </label>
-                  {autoReworkViaAgy && predictedSessionPolicy && (
-                    <div className="ml-5 rounded border border-[#30363D] bg-[#0D1117] px-3 py-2 space-y-1.5 text-[11px]">
-                      <div className="flex flex-wrap items-center gap-1.5 font-mono">
-                        <span className="text-[#8B949E]">返工 AGY 会话策略：</span>
-                        <span
-                          className={
-                            predictedSessionPolicy.mode === 'resume'
-                              ? 'text-[#3FB950] font-semibold'
-                              : 'text-[#58A6FF] font-semibold'
-                          }
-                        >
-                          {predictedSessionPolicy.mode === 'resume'
-                            ? `复用会话 ${predictedSessionPolicy.resumeSessionId}`
-                            : '全新纯净会话'}
-                        </span>
-                      </div>
-                      <p className="text-[#8B949E] leading-relaxed">
-                        {predictedSessionPolicy.reason}
-                      </p>
-                      <label className="flex items-center gap-2 text-[#C9D1D9] cursor-pointer pt-0.5">
-                        <input
-                          type="checkbox"
-                          checked={forceFreshSession}
-                          onChange={(e) => setForceFreshSession(e.target.checked)}
-                          className="h-3.5 w-3.5 rounded accent-[#58A6FF]"
-                        />
-                        <span>强制重置全新 AGY Session（不复用历史上下文）</span>
-                      </label>
-                    </div>
-                  )}
                 </>
               )}
               <label className="flex items-center gap-2 text-[12px] text-[#8B949E] cursor-pointer">
@@ -804,11 +762,13 @@ export function ApprovalView({
                 <CheckCircle2 className="h-4 w-4" />
               )}
               <span>
-                {activeRun.mergedRelease
-                  ? '更新审批备注'
-                  : activeRun.draftPr && mergePrToMain
-                    ? `批准并合并至 ${activeRun.defaultBranch || 'main'}`
-                    : '验收通过并批准上线'}
+                {submitting
+                  ? '合并并自动部署生产中…'
+                  : activeRun.mergedRelease
+                    ? '更新审批备注'
+                    : activeRun.draftPr && mergePrToMain
+                      ? '同意上线（自动合并并部署生产）'
+                      : '同意上线并自动部署生产'}
               </span>
             </button>
             <button
@@ -821,80 +781,8 @@ export function ApprovalView({
               <span>退回修订</span>
             </button>
           </div>
-
-          {/* Actions Workflow Deploy */}
-          <div className="pt-4 border-t border-[#30363D] space-y-3">
-            <div className="flex items-center gap-2 text-[13px] font-semibold text-[#F0F6FC]">
-              <Cloud className="h-4 w-4 text-[#58A6FF]" />
-              <span>Actions 部署到 Cloudflare</span>
-            </div>
-            <div className="flex flex-col sm:flex-row gap-2">
-              <input
-                type="text"
-                value={deployBranch}
-                onChange={(e) => setDeployBranch(e.target.value)}
-                aria-label="部署目标分支"
-                placeholder="main 或 autodev/feat-*"
-                className="flex-1 rounded-md border border-[#30363D] bg-[#0D1117] px-3 py-1.5 font-mono text-[12px] text-[#F0F6FC] focus:border-[#58A6FF] focus:outline-none"
-              />
-              <button
-                type="button"
-                disabled={deployingCf}
-                onClick={handleDispatchCloudflareDeploy}
-                className="inline-flex items-center justify-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-3.5 py-1.5 text-[12px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
-              >
-                {deployingCf ? (
-                  <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    <span>派发中…</span>
-                  </>
-                ) : (
-                  <>
-                    <Cloud className="h-3.5 w-3.5" />
-                    <span>触发 Actions 部署</span>
-                  </>
-                )}
-              </button>
-            </div>
-            {deployFeedback && (
-              <div
-                role={deployFeedback.type === 'error' ? 'alert' : 'status'}
-                className={`rounded-md border px-3.5 py-2.5 text-[12px] flex items-center justify-between gap-2 ${
-                  deployFeedback.type === 'success'
-                    ? 'border-[#3FB950]/40 bg-[#2EA043]/10 text-[#AFF5B4]'
-                    : 'border-[#F85149]/40 bg-[#F85149]/10 text-[#FFDCD7]'
-                }`}
-              >
-                <span>{deployFeedback.text}</span>
-                {deployFeedback.actionsUrl && (
-                  <a
-                    href={deployFeedback.actionsUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 underline shrink-0"
-                  >
-                    <span>查看</span>
-                    <ExternalLink className="h-3 w-3" />
-                  </a>
-                )}
-              </div>
-            )}
-          </div>
         </section>
       </div>
-
-      {/* Read-Only E2E Contract Reference */}
-      <section className="rounded-md border border-[#30363D] bg-[#010409] overflow-hidden">
-        <div className="px-4 py-2.5 border-b border-[#30363D] bg-[#161B22] flex items-center justify-between text-[12px]">
-          <span className="font-mono font-medium text-[#F0F6FC]">
-            {activeRun.draftPr?.e2eTestPath || buildIterationArtifactPaths(activeRun.id).e2eTestPath}
-          </span>
-          <span className="text-[#8B949E]">只读测试契约</span>
-        </div>
-        <pre className="p-4 max-h-[300px] overflow-auto font-mono text-[12px] leading-relaxed text-[#C9D1D9]">
-          {readOnlyE2e}
-        </pre>
-      </section>
     </div>
   );
 }

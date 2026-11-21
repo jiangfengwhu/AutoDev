@@ -17,14 +17,144 @@ import {
   AUTODEV_LIVE_LOG_ISSUE_TITLE,
   AUTODEV_PLAN_CHANNEL_BRANCH,
   AUTODEV_PLAN_WORKFLOW_PATH,
+  AUTODEV_VPS_CAPS_PATH,
   AUTODEV_WORKFLOW_PATH,
+  DEFAULT_AGY_MODE,
+  DEFAULT_AGY_MODEL,
   buildAgyPlanWorkflowYaml,
   buildAgyRunnerWorkflowYaml,
   buildCloudflareDeployWorkflowYaml,
 } from '../src/lib/workflowBuilder';
+import { extractCleanAssistantChatFromComment } from '../src/lib/codingChatOutput';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 const syncedWorkflowFingerprints = new Map<string, string>();
+
+interface GitHubCacheEntry {
+  etag?: string;
+  data: unknown;
+  fetchedAt: number;
+}
+
+export interface GitHubRateLimitSnapshot {
+  configured: boolean;
+  limit: number | null;
+  remaining: number | null;
+  used: number | null;
+  resetAt: string | null;
+  resource: string;
+  observedAt: string | null;
+  optimization: {
+    ttlCacheHits: number;
+    etag304Hits: number;
+    inflightDedupHits: number;
+    totalSavedRequests: number;
+    totalNetworkRequests: number;
+  };
+}
+
+const MAX_READ_CACHE_ENTRIES = 300;
+const githubReadCache = new Map<string, GitHubCacheEntry>();
+const inflightGetRequests = new Map<string, Promise<unknown>>();
+
+const rateLimitState = {
+  limit: null as number | null,
+  remaining: null as number | null,
+  used: null as number | null,
+  resetAt: null as string | null,
+  resource: 'core',
+  observedAt: null as string | null,
+  ttlCacheHits: 0,
+  etag304Hits: 0,
+  inflightDedupHits: 0,
+  totalNetworkRequests: 0,
+};
+
+function recordRateLimitHeaders(headers: Headers): void {
+  const limitRaw = headers.get('x-ratelimit-limit');
+  const remainingRaw = headers.get('x-ratelimit-remaining');
+  const usedRaw = headers.get('x-ratelimit-used');
+  const resetRaw = headers.get('x-ratelimit-reset');
+  const resource = headers.get('x-ratelimit-resource') || 'core';
+
+  if (limitRaw !== null && remainingRaw !== null) {
+    const limit = Number(limitRaw);
+    const remaining = Number(remainingRaw);
+    const used = usedRaw !== null ? Number(usedRaw) : Math.max(0, limit - remaining);
+    const resetSec = resetRaw ? Number(resetRaw) : NaN;
+    if (Number.isFinite(limit) && Number.isFinite(remaining)) {
+      rateLimitState.limit = limit;
+      rateLimitState.remaining = remaining;
+      rateLimitState.used = Number.isFinite(used) ? used : Math.max(0, limit - remaining);
+      rateLimitState.resetAt = Number.isFinite(resetSec)
+        ? new Date(resetSec * 1000).toISOString()
+        : rateLimitState.resetAt;
+      rateLimitState.resource = resource;
+      rateLimitState.observedAt = new Date().toISOString();
+    }
+  }
+}
+
+function getDefaultReadTtlMs(path: string): number {
+  if (path === '/user') return 60_000;
+  if (path.startsWith('/user/repos')) return 45_000;
+  if (path.includes('/actions/runners')) return 25_000;
+  if (path.includes('/branches')) return 15_000;
+  if (path.includes('/pulls?')) return 8_000;
+  if (path.includes('/actions/runs?')) return 6_000;
+  if (path.includes('.autodev-vps-capabilities.json')) return 60_000;
+  if (path.includes('/actions/runs/') && path.includes('/jobs')) return 5_000;
+  if (path.includes('/issues/') && path.includes('/comments')) return 5_000;
+  return 0;
+}
+
+export function invalidateGitHubReadCache(pathSubstring?: string): void {
+  if (!pathSubstring) {
+    githubReadCache.clear();
+    return;
+  }
+  for (const key of githubReadCache.keys()) {
+    if (key.includes(pathSubstring)) {
+      githubReadCache.delete(key);
+    }
+  }
+}
+
+function expireGitHubReadTtlsForMutation(mutatedPath: string): void {
+  // After any write/delete, immediately expire TTLs (and drop entries on mutated paths)
+  // so subsequent GETs reflect fresh state immediately while non-mutated paths still keep ETags.
+  for (const [key, entry] of githubReadCache.entries()) {
+    if (
+      mutatedPath.includes('/actions/runs') &&
+      key.includes('/actions/runs')
+    ) {
+      githubReadCache.delete(key);
+      continue;
+    }
+    if (
+      (mutatedPath.includes('/pulls') || mutatedPath.includes('/git/refs')) &&
+      (key.includes('/pulls') || key.includes('/branches') || key.includes('/git/ref'))
+    ) {
+      githubReadCache.delete(key);
+      continue;
+    }
+    if (mutatedPath.includes('/contents/') && key.includes('/contents/')) {
+      githubReadCache.delete(key);
+      continue;
+    }
+    entry.fetchedAt = 0;
+  }
+}
+
+function setReadCacheEntry(key: string, entry: GitHubCacheEntry): void {
+  if (githubReadCache.size >= MAX_READ_CACHE_ENTRIES && !githubReadCache.has(key)) {
+    const oldestKey = githubReadCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      githubReadCache.delete(oldestKey);
+    }
+  }
+  githubReadCache.set(key, entry);
+}
 
 function getGitHubHeaders(token: string): Record<string, string> {
   return {
@@ -36,11 +166,93 @@ function getGitHubHeaders(token: string): Record<string, string> {
   };
 }
 
-async function githubRequest<T>(
+export async function githubRequest<T>(
   token: string,
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
+  const method = (options.method || 'GET').toUpperCase();
+  const isGet = method === 'GET';
+  const bypassTtl = options.cache === 'no-store';
+  const cacheKey = path;
+
+  if (isGet) {
+    const cached = githubReadCache.get(cacheKey);
+    const ttlMs = bypassTtl ? 0 : getDefaultReadTtlMs(path);
+    if (cached && ttlMs > 0 && Date.now() - cached.fetchedAt < ttlMs) {
+      rateLimitState.ttlCacheHits += 1;
+      return cached.data as T;
+    }
+
+    const inflight = inflightGetRequests.get(cacheKey);
+    if (inflight) {
+      rateLimitState.inflightDedupHits += 1;
+      return inflight as Promise<T>;
+    }
+
+    const requestPromise = (async () => {
+      const headers: Record<string, string> = {
+        ...getGitHubHeaders(token),
+        ...(options.headers ? (options.headers as Record<string, string>) : {}),
+      };
+      if (cached?.etag) {
+        headers['If-None-Match'] = cached.etag;
+      }
+
+      rateLimitState.totalNetworkRequests += 1;
+      const response = await fetch(`${GITHUB_API_BASE}${path}`, {
+        ...options,
+        headers,
+      });
+      recordRateLimitHeaders(response.headers);
+
+      if (response.status === 304 && cached) {
+        // GitHub 304 Not Modified consumes ZERO rate-limit quota!
+        rateLimitState.etag304Hits += 1;
+        cached.fetchedAt = Date.now();
+        return cached.data as T;
+      }
+
+      const text = await response.text();
+      let parsed: unknown = null;
+      if (text) {
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = { message: text };
+        }
+      }
+
+      if (!response.ok) {
+        const errMsg =
+          typeof parsed === 'object' && parsed !== null && 'message' in parsed
+            ? String((parsed as { message: unknown }).message)
+            : `HTTP ${response.status}`;
+        throw new Error(`GitHub API 错误 (${response.status}): ${errMsg}`);
+      }
+
+      const etag = response.headers.get('etag') || undefined;
+      if (etag || getDefaultReadTtlMs(path) > 0) {
+        setReadCacheEntry(cacheKey, {
+          etag,
+          data: parsed,
+          fetchedAt: Date.now(),
+        });
+      }
+
+      return parsed as T;
+    })();
+
+    inflightGetRequests.set(cacheKey, requestPromise);
+    try {
+      return await requestPromise;
+    } finally {
+      inflightGetRequests.delete(cacheKey);
+    }
+  }
+
+  // Non-GET (POST / PUT / PATCH / DELETE)
+  rateLimitState.totalNetworkRequests += 1;
   const response = await fetch(`${GITHUB_API_BASE}${path}`, {
     ...options,
     headers: {
@@ -48,6 +260,7 @@ async function githubRequest<T>(
       ...(options.headers || {}),
     },
   });
+  recordRateLimitHeaders(response.headers);
 
   const text = await response.text();
   let parsed: unknown = null;
@@ -67,7 +280,82 @@ async function githubRequest<T>(
     throw new Error(`GitHub API 错误 (${response.status}): ${errMsg}`);
   }
 
+  expireGitHubReadTtlsForMutation(path);
   return parsed as T;
+}
+
+export async function getGitHubRateLimitSnapshot(
+  forceFetch = false
+): Promise<GitHubRateLimitSnapshot> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    return {
+      configured: false,
+      limit: null,
+      remaining: null,
+      used: null,
+      resetAt: null,
+      resource: 'core',
+      observedAt: null,
+      optimization: {
+        ttlCacheHits: rateLimitState.ttlCacheHits,
+        etag304Hits: rateLimitState.etag304Hits,
+        inflightDedupHits: rateLimitState.inflightDedupHits,
+        totalSavedRequests:
+          rateLimitState.ttlCacheHits +
+          rateLimitState.etag304Hits +
+          rateLimitState.inflightDedupHits,
+        totalNetworkRequests: rateLimitState.totalNetworkRequests,
+      },
+    };
+  }
+
+  // Note: GitHub's GET /rate_limit endpoint itself does NOT count against core rate limit!
+  if (forceFetch || rateLimitState.limit === null) {
+    try {
+      const response = await fetch(`${GITHUB_API_BASE}/rate_limit`, {
+        headers: getGitHubHeaders(token),
+      });
+      if (response.ok) {
+        const json = (await response.json()) as {
+          resources?: {
+            core?: { limit: number; remaining: number; used: number; reset: number };
+          };
+        };
+        const core = json.resources?.core;
+        if (core) {
+          rateLimitState.limit = core.limit;
+          rateLimitState.remaining = core.remaining;
+          rateLimitState.used = core.used;
+          rateLimitState.resetAt = new Date(core.reset * 1000).toISOString();
+          rateLimitState.resource = 'core';
+          rateLimitState.observedAt = new Date().toISOString();
+        }
+      }
+    } catch {
+      // Keep last passively observed values
+    }
+  }
+
+  return {
+    configured: true,
+    limit: rateLimitState.limit,
+    remaining: rateLimitState.remaining,
+    used: rateLimitState.used,
+    resetAt: rateLimitState.resetAt,
+    resource: rateLimitState.resource,
+    observedAt: rateLimitState.observedAt,
+    optimization: {
+      ttlCacheHits: rateLimitState.ttlCacheHits,
+      etag304Hits: rateLimitState.etag304Hits,
+      inflightDedupHits: rateLimitState.inflightDedupHits,
+      totalSavedRequests:
+        rateLimitState.ttlCacheHits +
+        rateLimitState.etag304Hits +
+        rateLimitState.inflightDedupHits,
+      totalNetworkRequests: rateLimitState.totalNetworkRequests,
+    },
+  };
 }
 
 interface RawGitHubUser {
@@ -227,13 +515,12 @@ export async function createSpecDraftPr(params: {
     initializedEmptyRepo = true;
   }
 
-  // 4. Create blobs for latest pointers + archived iteration specs + non-overwriting read-only E2E test
+  // 4. Blind E2E Testing: commit ONLY specs & PRDs to the coding PR branch (NEVER expose E2E test code to coding stage!)
   const filesToCommit = [
     { path: artifacts.specJsonPath, content: artifacts.specJsonContent },
     { path: artifacts.archivedSpecPath, content: artifacts.specJsonContent },
     { path: artifacts.prdMdPath, content: artifacts.prdMdContent },
     { path: artifacts.archivedPrdPath, content: artifacts.prdMdContent },
-    { path: artifacts.e2eTestPath, content: artifacts.e2eTestContent },
   ];
 
   const blobEntries = await Promise.all(
@@ -267,7 +554,7 @@ export async function createSpecDraftPr(params: {
   const newCommit = await githubRequest<{ sha: string }>(token, `${repoPath}/git/commits`, {
     method: 'POST',
     body: JSON.stringify({
-      message: `chore(autodev): add spec and read-only e2e contract for ${artifacts.prTitle.replace('[AutoDev Spec] ', '')}`,
+      message: `chore(autodev): add spec for ${artifacts.prTitle.replace('[AutoDev Spec] ', '')}`,
       tree: newTree.sha,
       parents: [baseCommitSha],
     }),
@@ -335,6 +622,39 @@ export async function createSpecDraftPr(params: {
     }
   }
 
+  // 9. Store blind E2E test contract securely in the Blind Verification Vault on autodev-plan-channel
+  try {
+    const channelInfo = await ensurePlanChannelBranch(owner, repo, AUTODEV_PLAN_CHANNEL_BRANCH);
+    await upsertRepoFile({
+      token,
+      repoPath,
+      owner,
+      repo,
+      baseBranch: channelInfo.branch,
+      filePath: artifacts.e2eVaultPath,
+      content: artifacts.e2eTestContent,
+      createMessage: `chore(autodev-vault): store blind E2E test for ${branchName}`,
+      updateMessage: `chore(autodev-vault): update blind E2E test for ${branchName}`,
+    });
+    await upsertPlanChannelJson({
+      owner,
+      repo,
+      channelBranch: channelInfo.branch,
+      filePath: artifacts.e2eVaultMetaPath,
+      data: {
+        branchName,
+        prNumber: pr.number,
+        e2eTestPath: artifacts.e2eTestPath,
+        e2eVaultPath: artifacts.e2eVaultPath,
+        prTitle: artifacts.prTitle,
+        createdAt: new Date().toISOString(),
+      },
+      commitMessage: `chore(autodev-vault): store blind E2E metadata for ${branchName}`,
+    });
+  } catch (vaultErr) {
+    console.warn('[AutoDev Vault] Failed to store blind E2E test in vault:', vaultErr);
+  }
+
   return {
     prUrl: pr.html_url,
     prNumber: pr.number,
@@ -343,6 +663,7 @@ export async function createSpecDraftPr(params: {
     commitSha: newCommit.sha,
     filesCommitted: filesToCommit.map((f) => f.path),
     e2eTestPath: artifacts.e2eTestPath,
+    e2eVaultPath: artifacts.e2eVaultPath,
     archivedSpecPath: artifacts.archivedSpecPath,
     createdAt: new Date().toISOString(),
     initializedEmptyRepo,
@@ -1094,7 +1415,8 @@ export async function dispatchAgyPlanWorkflow(params: {
   baseBranch?: string;
   channelBranch?: string;
   agyModel?: string;
-}): Promise<{ dispatched: boolean; model: string; actionsUrl: string }> {
+  agyMode?: string;
+}): Promise<{ dispatched: boolean; model: string; mode: string; actionsUrl: string }> {
   const token = process.env.GITHUB_TOKEN?.trim();
   if (!token) {
     throw new Error('服务端未配置 GITHUB_TOKEN，无法派发 Instabox AGY 规划工作流。');
@@ -1103,7 +1425,8 @@ export async function dispatchAgyPlanWorkflow(params: {
   const { owner, repo, jobId } = params;
   const baseBranch = params.baseBranch?.trim() || 'main';
   const channelBranch = params.channelBranch?.trim() || AUTODEV_PLAN_CHANNEL_BRANCH;
-  const agyModel = params.agyModel?.trim() || 'gemini-3.8-flash-high';
+  const agyModel = params.agyModel?.trim() || DEFAULT_AGY_MODEL;
+  const agyMode = params.agyMode?.trim() || DEFAULT_AGY_MODE;
   const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 
   // Ensure autodev-plan.yml is synced on baseBranch before dispatching
@@ -1112,26 +1435,52 @@ export async function dispatchAgyPlanWorkflow(params: {
     await new Promise((r) => setTimeout(r, 1800));
   }
 
-  await githubRequest<null>(
-    token,
-    `${repoPath}/actions/workflows/autodev-plan.yml/dispatches`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        ref: baseBranch,
-        inputs: {
-          job_id: jobId,
-          base_branch: baseBranch,
-          channel_branch: channelBranch,
-          agy_model: agyModel,
-        },
-      }),
+  try {
+    await githubRequest<null>(
+      token,
+      `${repoPath}/actions/workflows/autodev-plan.yml/dispatches`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ref: baseBranch,
+          inputs: {
+            job_id: jobId,
+            base_branch: baseBranch,
+            channel_branch: channelBranch,
+            agy_model: agyModel,
+            agy_mode: agyMode,
+          },
+        }),
+      }
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('(422)') && msg.includes('Unexpected inputs')) {
+      await githubRequest<null>(
+        token,
+        `${repoPath}/actions/workflows/autodev-plan.yml/dispatches`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            ref: baseBranch,
+            inputs: {
+              job_id: jobId,
+              base_branch: baseBranch,
+              channel_branch: channelBranch,
+              agy_model: agyModel,
+            },
+          }),
+        }
+      );
+    } else {
+      throw err;
     }
-  );
+  }
 
   return {
     dispatched: true,
     model: agyModel,
+    mode: agyMode,
     actionsUrl: `https://github.com/${owner}/${repo}/actions/workflows/autodev-plan.yml`,
   };
 }
@@ -1185,10 +1534,11 @@ export async function dispatchAgyWorkflow(params: {
   e2eTestPath?: string;
   revisionNote?: string;
   agyModel?: string;
+  agyMode?: string;
   baseBranch?: string;
   sessionMode?: 'fresh' | 'resume';
   resumeSessionId?: string;
-}): Promise<{ dispatched: boolean; branch: string; model: string; actionsUrl: string }> {
+}): Promise<{ dispatched: boolean; branch: string; model: string; mode: string; actionsUrl: string }> {
   const token = process.env.GITHUB_TOKEN?.trim();
   if (!token) {
     throw new Error('服务端未配置 GITHUB_TOKEN，无法触发 GitHub Actions Workflow。');
@@ -1205,7 +1555,8 @@ export async function dispatchAgyWorkflow(params: {
     sessionMode,
     resumeSessionId,
   } = params;
-  const agyModel = params.agyModel?.trim() || 'gemini-3.8-flash-high';
+  const agyModel = params.agyModel?.trim() || DEFAULT_AGY_MODEL;
+  const agyMode = params.agyMode?.trim() || DEFAULT_AGY_MODE;
   const baseBranch = params.baseBranch?.trim() || 'main';
   const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 
@@ -1226,6 +1577,7 @@ export async function dispatchAgyWorkflow(params: {
     e2e_test_path: e2eTestPath || '',
     revision_note: (revisionNote || '').slice(0, 1500),
     agy_model: agyModel,
+    agy_mode: agyMode,
     session_mode: sessionMode || 'fresh',
     resume_session_id: resumeSessionId || '',
   };
@@ -1244,7 +1596,6 @@ export async function dispatchAgyWorkflow(params: {
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Fallback if target repo has not yet synced the newest workflow YAML with extra inputs
     if (msg.includes('(422)') && msg.includes('Unexpected inputs')) {
       await githubRequest<null>(
         token,
@@ -1271,6 +1622,7 @@ export async function dispatchAgyWorkflow(params: {
     dispatched: true,
     branch: prBranch,
     model: agyModel,
+    mode: agyMode,
     actionsUrl: `https://github.com/${owner}/${repo}/actions/workflows/autodev-agy.yml`,
   };
 }
@@ -1422,6 +1774,7 @@ export interface GitHubActionJobDetail {
     conclusion: string | null;
   }>;
   logTail?: string;
+  agyHelpExcerpt?: string;
 }
 
 export async function getGitHubActionRunDetail(
@@ -1461,6 +1814,7 @@ export async function getGitHubActionRunDetail(
   const jobs: GitHubActionJobDetail[] = await Promise.all(
     (jobsData.jobs || []).map(async (job) => {
       let logTail: string | undefined;
+      let agyHelpExcerpt: string | undefined;
       if (job.status === 'completed') {
         try {
           const logRes = await fetch(`${GITHUB_API_BASE}${repoPath}/actions/jobs/${job.id}/logs`, {
@@ -1476,6 +1830,11 @@ export async function getGitHubActionRunDetail(
             const fullText = await logRes.text();
             const lines = fullText.split('\n');
             logTail = lines.slice(-120).join('\n');
+            const helpIdx = lines.findIndex((l) => l.includes('AGY CLI --help capabilities'));
+            if (helpIdx !== -1) {
+              const startIdx = Math.max(0, helpIdx - 6);
+              agyHelpExcerpt = lines.slice(startIdx, startIdx + 140).join('\n');
+            }
           }
         } catch {
           // non-fatal
@@ -1496,6 +1855,7 @@ export async function getGitHubActionRunDetail(
           conclusion: s.conclusion,
         })),
         logTail,
+        agyHelpExcerpt,
       };
     })
   );
@@ -1706,6 +2066,235 @@ export async function listOpenAutodevPrs(
   }
 }
 
+export async function fetchLiveAgyStreamIndex(
+  owner: string,
+  repo: string
+): Promise<Map<number, { branch?: string; pipelineRunId?: string; model?: string }>> {
+  const result = new Map<number, { branch?: string; pipelineRunId?: string; model?: string }>();
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) return result;
+  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+
+  try {
+    const issues = await githubRequest<
+      Array<{ number: number; title: string; comments?: number; pull_request?: unknown }>
+    >(token, `${repoPath}/issues?state=open&per_page=30`);
+    const trackingIssue = issues.find(
+      (i) => !i.pull_request && i.title === AUTODEV_LIVE_LOG_ISSUE_TITLE
+    );
+    if (!trackingIssue) return result;
+
+    const totalComments = Number(trackingIssue.comments || 0);
+    const lastPage = Math.max(1, Math.ceil((totalComments || 1) / 100));
+    const comments = await githubRequest<Array<{ body?: string }>>(
+      token,
+      `${repoPath}/issues/${trackingIssue.number}/comments?per_page=100&page=${lastPage}`
+    );
+    for (const c of comments || []) {
+      const body = c.body || '';
+      const idMatch = body.match(/<!-- AUTODEV-LIVE-LOG:(\d+) -->/);
+      if (!idMatch) continue;
+      const runId = Number(idMatch[1]);
+      const branchMatch = body.match(/^- Branch:\s*(.+)$/m);
+      const pipeMatch = body.match(/^- PipelineRunId:\s*(.+)$/m);
+      const modelMatch = body.match(/^- Model:\s*(.+)$/m);
+      result.set(runId, {
+        branch: branchMatch ? branchMatch[1].trim() : undefined,
+        pipelineRunId: pipeMatch ? pipeMatch[1].trim() : undefined,
+        model: modelMatch ? modelMatch[1].trim() : undefined,
+      });
+    }
+  } catch {
+    // non-fatal
+  }
+  return result;
+}
+
+export interface VpsAgyCapabilitiesSnapshot {
+  version?: string;
+  models: Array<{ id: string; label: string }>;
+  agents: Array<{ id: string; label: string }>;
+  modes: string[];
+  syncedAt?: string;
+}
+
+export async function readVpsAgyCapabilities(
+  owner: string,
+  repo: string
+): Promise<VpsAgyCapabilitiesSnapshot | null> {
+  return readPlanChannelJson<VpsAgyCapabilitiesSnapshot>(
+    owner,
+    repo,
+    AUTODEV_VPS_CAPS_PATH,
+    AUTODEV_PLAN_CHANNEL_BRANCH
+  );
+}
+
+export async function deleteGitHubActionRuns(
+  owner: string,
+  repo: string,
+  options: { maxPages?: number } = {}
+): Promise<{
+  deletedRunIds: number[];
+  skippedActiveCount: number;
+  failedCount: number;
+  error?: string;
+}> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    return {
+      deletedRunIds: [],
+      skippedActiveCount: 0,
+      failedCount: 0,
+      error: '未配置 GITHUB_TOKEN，无法删除 GitHub Actions 历史记录',
+    };
+  }
+
+  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const maxPages = Math.max(1, Math.min(5, options.maxPages ?? 3));
+  const completedIds: number[] = [];
+  let skippedActiveCount = 0;
+
+  for (let page = 1; page <= maxPages; page++) {
+    const res = await githubRequest<{
+      workflow_runs?: Array<{ id: number; status: string }>;
+    }>(token, `${repoPath}/actions/runs?per_page=100&page=${page}`, { cache: 'no-store' });
+
+    const runs = res.workflow_runs || [];
+    if (runs.length === 0) break;
+
+    for (const run of runs) {
+      if (run.status === 'completed') {
+        completedIds.push(run.id);
+      } else {
+        skippedActiveCount += 1;
+      }
+    }
+
+    if (runs.length < 100) break;
+  }
+
+  const deletedRunIds: number[] = [];
+  let failedCount = 0;
+  let lastError: string | undefined;
+
+  // Delete in small paced batches of 3 to avoid triggering GitHub secondary rate limits
+  const BATCH_SIZE = 3;
+  for (let i = 0; i < completedIds.length; i += BATCH_SIZE) {
+    const batch = completedIds.slice(i, i + BATCH_SIZE);
+    await Promise.all(
+      batch.map(async (runId) => {
+        try {
+          await githubRequest<unknown>(token, `${repoPath}/actions/runs/${runId}`, {
+            method: 'DELETE',
+          });
+          deletedRunIds.push(runId);
+        } catch (err) {
+          failedCount += 1;
+          lastError = err instanceof Error ? err.message : String(err);
+        }
+      })
+    );
+    if (i + BATCH_SIZE < completedIds.length) {
+      await new Promise((r) => setTimeout(r, 120));
+    }
+  }
+
+  invalidateGitHubReadCache('/actions/runs');
+
+  return {
+    deletedRunIds,
+    skippedActiveCount,
+    failedCount,
+    ...(lastError ? { error: lastError } : {}),
+  };
+}
+
+export async function resetAutodevRepoArtifacts(
+  owner: string,
+  repo: string,
+  options: {
+    resetPrsAndBranches?: boolean;
+    deleteActionRuns?: boolean;
+  } = {}
+): Promise<{
+  closedPrNumbers: number[];
+  deletedBranches: string[];
+  remainingBranches: string[];
+  deletedActionRuns: number;
+  skippedActiveActionRuns: number;
+  failedActionRunDeletions: number;
+  actionRunsError?: string;
+}> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('未配置 GITHUB_TOKEN，无法清理 GitHub PR、分支与 Actions 记录');
+  }
+  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const closedPrNumbers: number[] = [];
+  const deletedBranches: string[] = [];
+
+  if (options.resetPrsAndBranches !== false) {
+    // 1. Close all open AutoDev PRs
+    const openPrs = await listOpenAutodevPrs(owner, repo);
+    for (const pr of openPrs) {
+      try {
+        await githubRequest<unknown>(token, `${repoPath}/pulls/${pr.number}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ state: 'closed' }),
+        });
+        closedPrNumbers.push(pr.number);
+      } catch {
+        // continue cleaning remaining PRs
+      }
+    }
+
+    // 2. Delete all autodev/feat-* branches (preserve main, autodev-plan-channel & autodev-state)
+    const branches = await githubRequest<Array<{ name: string }>>(
+      token,
+      `${repoPath}/branches?per_page=100`,
+      { cache: 'no-store' }
+    );
+    for (const br of branches || []) {
+      if (br.name.startsWith('autodev/feat-')) {
+        const ok = await deleteBranchRef(owner, repo, br.name);
+        if (ok) deletedBranches.push(br.name);
+      }
+    }
+  }
+
+  // 3. Optionally delete historical completed GitHub Actions workflow runs
+  let deletedActionRuns = 0;
+  let skippedActiveActionRuns = 0;
+  let failedActionRunDeletions = 0;
+  let actionRunsError: string | undefined;
+  if (options.deleteActionRuns) {
+    const actionsDeleteRes = await deleteGitHubActionRuns(owner, repo);
+    deletedActionRuns = actionsDeleteRes.deletedRunIds.length;
+    skippedActiveActionRuns = actionsDeleteRes.skippedActiveCount;
+    failedActionRunDeletions = actionsDeleteRes.failedCount;
+    actionRunsError = actionsDeleteRes.error;
+  }
+
+  invalidateGitHubReadCache();
+
+  const afterBranches = await githubRequest<Array<{ name: string }>>(
+    token,
+    `${repoPath}/branches?per_page=100`,
+    { cache: 'no-store' }
+  ).catch(() => []);
+
+  return {
+    closedPrNumbers,
+    deletedBranches,
+    remainingBranches: (afterBranches || []).map((b) => b.name),
+    deletedActionRuns,
+    skippedActiveActionRuns,
+    failedActionRunDeletions,
+    ...(actionRunsError ? { actionRunsError } : {}),
+  };
+}
+
 async function fetchRepoFileText(
   token: string,
   repoPath: string,
@@ -1853,12 +2442,16 @@ export async function fetchRepoContextSnapshot(
       }
     }
 
+    const appCodeFiles = allBlobs.filter(
+      (p) => p !== 'README.md' && !p.startsWith('.github/')
+    );
+
     return {
       repoFullName: `${owner}/${repo}`,
       branch,
       headSha,
       fetchedAt,
-      isEmptyRepo: allBlobs.length === 0,
+      isEmptyRepo: appCodeFiles.length === 0,
       totalFiles: allBlobs.length,
       fileTree: filteredTree,
       packageJsonSnippet,
@@ -1931,3 +2524,176 @@ export async function commitRsiGuidelinesToBranch(params: {
     skipped: res.skipped,
   };
 }
+
+export interface WipeRepoCodeResult {
+  wiped: boolean;
+  baseBranch: string;
+  commitSha?: string;
+  removedFilesCount: number;
+  preservedFiles: string[];
+  planChannelReset: boolean;
+  note: string;
+}
+
+/**
+ * Danger-zone clean-slate code reset:
+ * Replaces the root tree on `baseBranch` (e.g. `main`) via a clean fast-forward commit
+ * containing ONLY bootstrap README.md and the 3 AutoDev GitHub Actions workflows so
+ * all business/application code is wiped from scratch while AutoDev remains immediately usable.
+ * Also resets the orphan `autodev-plan-channel` branch (clearing old E2E vault & plan artifacts).
+ */
+export async function wipeRepoCodeToScratch(
+  owner: string,
+  repo: string,
+  baseBranch = 'main'
+): Promise<WipeRepoCodeResult> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('服务端未配置 GITHUB_TOKEN，无法清空目标仓库代码。');
+  }
+
+  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+
+  // 1. Read current baseBranch HEAD + count existing files
+  let parentCommitSha: string | null = null;
+  let existingFilesCount = 0;
+  try {
+    const refData = await githubRequest<{ object: { sha: string } }>(
+      token,
+      `${repoPath}/git/ref/heads/${encodeURIComponent(baseBranch)}`
+    );
+    parentCommitSha = refData.object.sha;
+    const treeData = await githubRequest<{ tree?: Array<{ path: string; type: string }> }>(
+      token,
+      `${repoPath}/git/trees/${parentCommitSha}?recursive=1`
+    );
+    existingFilesCount = (treeData.tree || []).filter(
+      (e) => e.type === 'blob' && e.path !== 'README.md' && !e.path.startsWith('.github/workflows/autodev-')
+    ).length;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!isEmptyGitHubRepoError(msg)) {
+      throw err;
+    }
+  }
+
+  // 2. Build clean bootstrap blobs (README.md + 3 AutoDev workflows)
+  const cleanFiles: Array<{ path: string; content: string }> = [
+    { path: 'README.md', content: buildBootstrapReadmeContent(owner, repo) },
+    { path: AUTODEV_WORKFLOW_PATH, content: buildAgyRunnerWorkflowYaml(owner) },
+    { path: AUTODEV_PLAN_WORKFLOW_PATH, content: buildAgyPlanWorkflowYaml(owner) },
+    { path: AUTODEV_DEPLOY_WORKFLOW_PATH, content: buildCloudflareDeployWorkflowYaml(owner) },
+  ];
+
+  const createdBlobs = await Promise.all(
+    cleanFiles.map(async (f) => {
+      const blob = await githubRequest<{ sha: string }>(token, `${repoPath}/git/blobs`, {
+        method: 'POST',
+        body: JSON.stringify({ content: f.content, encoding: 'utf-8' }),
+      });
+      return {
+        path: f.path,
+        mode: '100644' as const,
+        type: 'blob' as const,
+        sha: blob.sha,
+      };
+    })
+  );
+
+  // Create root tree WITHOUT base_tree so every other business file/dir is cleanly removed
+  const newTree = await githubRequest<{ sha: string }>(token, `${repoPath}/git/trees`, {
+    method: 'POST',
+    body: JSON.stringify({ tree: createdBlobs }),
+  });
+
+  const newCommit = await githubRequest<{ sha: string }>(token, `${repoPath}/git/commits`, {
+    method: 'POST',
+    body: JSON.stringify({
+      message: 'chore(autodev): reset repository code to clean scratch baseline (workflows preserved)',
+      tree: newTree.sha,
+      parents: parentCommitSha ? [parentCommitSha] : [],
+    }),
+  });
+
+  if (parentCommitSha) {
+    await githubRequest(
+      token,
+      `${repoPath}/git/refs/heads/${encodeURIComponent(baseBranch)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ sha: newCommit.sha, force: false }),
+      }
+    );
+  } else {
+    await githubRequest(token, `${repoPath}/git/refs`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ref: `refs/heads/${baseBranch}`,
+        sha: newCommit.sha,
+      }),
+    });
+  }
+
+  // 3. Reset orphan autodev-plan-channel so old E2E vault tests & old plans are cleared cleanly
+  let planChannelReset = false;
+  try {
+    await githubRequest(
+      token,
+      `${repoPath}/git/refs/heads/${encodeURIComponent(AUTODEV_PLAN_CHANNEL_BRANCH)}`,
+      { method: 'DELETE' }
+    ).catch(() => {});
+    await ensurePlanChannelBranch(owner, repo, AUTODEV_PLAN_CHANNEL_BRANCH);
+    planChannelReset = true;
+  } catch {
+    planChannelReset = false;
+  }
+
+  syncedWorkflowFingerprints.delete(`${owner}/${repo}@${baseBranch}`);
+  invalidateGitHubReadCache();
+
+  return {
+    wiped: true,
+    baseBranch,
+    commitSha: newCommit.sha,
+    removedFilesCount: existingFilesCount,
+    preservedFiles: cleanFiles.map((f) => f.path),
+    planChannelReset,
+    note: `已清空 ${baseBranch} 分支上的 ${existingFilesCount} 个业务代码文件（保留 README.md 与 3 条 AutoDev 工作流），并重置盲测测试仓库。`,
+  };
+}
+
+/**
+ * Fallback extractor for historical runs that predate structured `codingFinalOutput`:
+ * extracts ONLY the Coding Agent's clean final chat window message (never raw Actions terminal logs).
+ */
+export async function extractCodingOutputFromLiveLogFallback(
+  owner: string,
+  repo: string,
+  branchName?: string,
+  actionsRunId?: number
+): Promise<string | undefined> {
+  try {
+    const token = process.env.GITHUB_TOKEN?.trim();
+    if (!token) return undefined;
+    const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+
+    let targetRunId = actionsRunId;
+    if (!targetRunId && branchName) {
+      const index = await fetchLiveAgyStreamIndex(owner, repo);
+      const candidates = Array.from(index.entries())
+        .filter(([, meta]) => meta.branch === branchName)
+        .map(([runId]) => runId)
+        .sort((a, b) => b - a);
+      targetRunId = candidates[0];
+    }
+    if (!targetRunId) return undefined;
+
+    const snapshot = await fetchLiveAgyStreamForRun(token, repoPath, targetRunId);
+    if (!snapshot) return undefined;
+
+    return extractCleanAssistantChatFromComment(snapshot.rawBody, snapshot.output);
+  } catch {
+    return undefined;
+  }
+}
+
