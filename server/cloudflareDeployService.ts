@@ -4,8 +4,8 @@ import path from 'path';
 import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import type { PreviewDeployment } from '../src/types/autodev';
-import { postGitHubPrComment } from './githubService';
+import type { PreviewDeployment } from '../src/types/autodev.ts';
+import { postGitHubPrComment } from './githubService.ts';
 
 const execFileAsync = promisify(execFile);
 const CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4';

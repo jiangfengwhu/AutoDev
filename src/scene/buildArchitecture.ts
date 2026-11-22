@@ -49,6 +49,9 @@ export interface CelebrationConfettiRig {
 export interface AnimatedVillageHandles {
   rotundaSpire: THREE.Object3D;
   weathervane: THREE.Object3D;
+  clockHourHand: THREE.Object3D;
+  clockMinuteHand: THREE.Object3D;
+  clockSecondHand: THREE.Object3D;
   satelliteDish: THREE.Object3D | null;
   gears: THREE.Object3D[];
   spinnersY: THREE.Object3D[];
@@ -483,6 +486,9 @@ function buildCentralGlassRotunda(
   hitbox: THREE.Mesh;
   hoverRing: THREE.Mesh;
   snowMeshes: THREE.Mesh[];
+  clockHourHand: THREE.Object3D;
+  clockMinuteHand: THREE.Object3D;
+  clockSecondHand: THREE.Object3D;
 } {
   const group = new THREE.Group();
   group.position.set(CENTRAL_ROTUNDA_POS.x, 0, CENTRAL_ROTUNDA_POS.z);
@@ -704,21 +710,12 @@ function buildCentralGlassRotunda(
     group.add(post);
   }
 
-  // Front Clock Pediment seated cleanly ON TOP of the stone cornice (ZERO rail/cornice clipping!)
+  // Pure Circular Front Clock Medallion seated cleanly onto the cornice (zero rectangular base!)
   const pedimentGroup = new THREE.Group();
-  pedimentGroup.position.set(0, 4.74, 3.98);
-
-  // Sculpted stone pedestal base anchoring clock flush onto the cornice at y = 3.91
-  const pedBase = new THREE.Mesh(
-    new THREE.BoxGeometry(1.78, 0.84, 0.46),
-    shared.creamStone
-  );
-  pedBase.position.set(0, -0.44, -0.02);
-  pedBase.castShadow = true;
-  pedimentGroup.add(pedBase);
+  pedimentGroup.position.set(0, 4.78, 3.98);
 
   const pedBody = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.92, 0.96, 0.44, 28),
+    new THREE.CylinderGeometry(0.92, 0.96, 0.44, 32),
     shared.warmSandstone
   );
   pedBody.rotation.x = Math.PI / 2;
@@ -726,14 +723,14 @@ function buildCentralGlassRotunda(
   pedimentGroup.add(pedBody);
 
   const clockBezel = new THREE.Mesh(
-    new THREE.TorusGeometry(0.79, 0.055, 8, 28),
+    new THREE.TorusGeometry(0.79, 0.055, 10, 32),
     shared.brassMetal
   );
   clockBezel.position.z = 0.22;
   pedimentGroup.add(clockBezel);
 
   const clockDisc = new THREE.Mesh(
-    new THREE.CircleGeometry(0.76, 28),
+    new THREE.CircleGeometry(0.76, 32),
     new THREE.MeshStandardMaterial({
       map: textures.clockFace,
       roughness: 0.32,
@@ -743,8 +740,49 @@ function buildCentralGlassRotunda(
   clockDisc.position.z = 0.23;
   pedimentGroup.add(clockDisc);
 
+  // Real-time 3D analog clock hands (pivoted at center; +Y = 12 o'clock, negative Z rotation = clockwise)
+  const clockHandMat = new THREE.MeshStandardMaterial({
+    color: '#1E293B',
+    roughness: 0.35,
+    metalness: 0.25,
+  });
+  const clockSecondMat = new THREE.MeshStandardMaterial({
+    color: '#DC2626',
+    roughness: 0.3,
+    metalness: 0.2,
+  });
+
+  const clockHourHand = new THREE.Group();
+  clockHourHand.position.set(0, 0, 0.246);
+  const hourMesh = new THREE.Mesh(new THREE.BoxGeometry(0.068, 0.44, 0.014), clockHandMat);
+  hourMesh.position.y = 0.16;
+  clockHourHand.add(hourMesh);
+  pedimentGroup.add(clockHourHand);
+
+  const clockMinuteHand = new THREE.Group();
+  clockMinuteHand.position.set(0, 0, 0.258);
+  const minuteMesh = new THREE.Mesh(new THREE.BoxGeometry(0.044, 0.62, 0.012), clockHandMat);
+  minuteMesh.position.y = 0.23;
+  clockMinuteHand.add(minuteMesh);
+  pedimentGroup.add(clockMinuteHand);
+
+  const clockSecondHand = new THREE.Group();
+  clockSecondHand.position.set(0, 0, 0.268);
+  const secondMesh = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.7, 0.01), clockSecondMat);
+  secondMesh.position.y = 0.22;
+  clockSecondHand.add(secondMesh);
+  pedimentGroup.add(clockSecondHand);
+
+  const clockCenterCap = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.068, 0.068, 0.036, 16),
+    shared.brassMetal
+  );
+  clockCenterCap.rotation.x = Math.PI / 2;
+  clockCenterCap.position.z = 0.274;
+  pedimentGroup.add(clockCenterCap);
+
   const pedRoof = new THREE.Mesh(
-    new THREE.TorusGeometry(0.94, 0.11, 10, 24, Math.PI),
+    new THREE.TorusGeometry(0.94, 0.11, 10, 28, Math.PI),
     shared.terracottaRoof
   );
   pedRoof.position.z = 0.03;
@@ -921,7 +959,17 @@ function buildCentralGlassRotunda(
   const hitbox = createHitbox('ST-00', 'ST-00', 8.8, 9.2, 8.8, 4.6);
   group.add(hitbox);
 
-  return { group, spire, weathervane, hitbox, hoverRing, snowMeshes };
+  return {
+    group,
+    spire,
+    weathervane,
+    clockHourHand,
+    clockMinuteHand,
+    clockSecondHand,
+    hitbox,
+    hoverRing,
+    snowMeshes,
+  };
 }
 
 /**
@@ -3348,9 +3396,15 @@ export function buildMiniatureVillage(
     clickables.push(built.hitbox);
     hoverRings.set(ws.id, built.hoverRing);
     workingSparks.set(ws.id, workSparks);
+    const anchorY =
+      ws.id === 'ST-01'
+        ? 4.95
+        : ws.id === 'BG-OPS'
+        ? 4.55
+        : 4.65;
     buildingAnchors.set(
       ws.id,
-      new THREE.Vector3(ws.position.x, 4.3, ws.position.z)
+      new THREE.Vector3(ws.position.x, anchorY, ws.position.z)
     );
     if (built.satelliteDish) satelliteDish = built.satelliteDish;
     if (built.gateBoomPivot) gateBoomPivot = built.gateBoomPivot;
@@ -3795,6 +3849,9 @@ export function buildMiniatureVillage(
   return {
     rotundaSpire: rotunda.spire,
     weathervane: rotunda.weathervane,
+    clockHourHand: rotunda.clockHourHand,
+    clockMinuteHand: rotunda.clockMinuteHand,
+    clockSecondHand: rotunda.clockSecondHand,
     satelliteDish,
     gears,
     spinnersY,

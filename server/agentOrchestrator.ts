@@ -4,10 +4,10 @@ import type {
   ArchitectOutput,
   QaCriticOutput,
   QaSpecOutput,
-} from '../src/types/autodev';
-import { resolveEffectiveTechStack } from '../src/lib/workflowBuilder';
-import { formatRsiPromptBlock } from '../src/lib/rsiEngine';
-import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore';
+} from '../src/types/autodev.ts';
+import { resolveEffectiveTechStack } from '../src/lib/workflowBuilder.ts';
+import { formatRsiPromptBlock } from '../src/lib/rsiEngine.ts';
+import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore.ts';
 
 export const GEMINI_AGENT_MODEL = 'gemini-4-hydrogen';
 const GEMINI_FALLBACK_MODEL = 'gemini-3.1-flash-lite';

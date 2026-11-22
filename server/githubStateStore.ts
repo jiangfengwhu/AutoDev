@@ -1,9 +1,9 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { FIXED_TARGET_REPO } from '../src/lib/workflowBuilder';
-import { parseRepoFullName } from '../src/lib/taskGraph';
-import { githubRequest } from './githubService';
+import { FIXED_TARGET_REPO } from '../src/lib/workflowBuilder.ts';
+import { parseRepoFullName } from '../src/lib/taskGraph.ts';
+import { githubRequest } from './githubService.ts';
 
 export const AUTODEV_STATE_BRANCH = 'autodev-state';
 

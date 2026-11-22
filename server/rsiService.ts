@@ -10,14 +10,14 @@ import type {
   RsiSystemRule,
   RsiTargetStage,
   TestExecutionReport,
-} from '../src/lib/rsiEngine';
+} from '../src/lib/rsiEngine.ts';
 import {
   clampDirectiveLength,
   computePassRate,
   evaluateRsiDecisionOutcome,
   parseTestMetricsFromLog,
   RSI_BUDGET_LIMITS,
-} from '../src/lib/rsiEngine';
+} from '../src/lib/rsiEngine.ts';
 import {
   applyIncidentAttribution,
   getIncidentById,
@@ -29,15 +29,15 @@ import {
   replaceConsolidatedRsiRules,
   setRsiLastSyncedAt,
   upsertTestReport,
-} from './rsiStore';
-import type { TokenUsageSummary } from '../src/types/autodev';
-import { attachAgySessionToRun, attachCodingOutputToRun } from './runStore';
+} from './rsiStore.ts';
+import type { TokenUsageSummary } from '../src/types/autodev.ts';
+import { attachAgySessionToRun, attachCodingOutputToRun } from './runStore.ts';
 import {
   getGitHubActionRunDetail,
   listGitHubActionRuns,
   readPlanChannelJson,
-} from './githubService';
-import { AUTODEV_PLAN_CHANNEL_BRANCH } from '../src/lib/planProtocol';
+} from './githubService.ts';
+import { AUTODEV_PLAN_CHANNEL_BRANCH } from '../src/lib/planProtocol.ts';
 
 const RSI_ANALYZER_MODEL = 'gemini-4-hydrogen';
 const RSI_FALLBACK_MODEL = 'gemini-3.1-flash-lite';

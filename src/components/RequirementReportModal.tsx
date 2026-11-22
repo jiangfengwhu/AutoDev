@@ -7,7 +7,6 @@ import {
   Copy,
   Download,
   ExternalLink,
-  FileCode2,
   FileText,
   GitBranch,
   GitMerge,
@@ -28,6 +27,7 @@ import type {
 import type { TestExecutionReport } from '../lib/rsiEngine';
 import type { AuditLogEntry } from '../lib/requirementsBoard';
 import { formatTokenCount } from '../lib/overviewMetrics';
+import { MarkdownPreview } from './MarkdownPreview';
 
 interface RequirementReportPayload {
   id: string;
@@ -321,11 +321,12 @@ export function RequirementReportModal({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-[1060px] max-h-[90vh] flex flex-col rounded-xl border border-[#CBD5E1] bg-white shadow-2xl overflow-hidden"
+        data-testid="requirement-report-dialog"
+        className="w-full max-w-[1060px] h-[86vh] max-h-[840px] flex flex-col rounded-xl border border-[#CBD5E1] bg-white shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Top Modal Header */}
-        <div className="px-5 py-4 border-b border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-start justify-between gap-4">
+        {/* Top Modal Header (locked height across tab switches) */}
+        <div className="shrink-0 px-5 py-4 border-b border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <FileText className="h-4 w-4 text-[#2563EB] shrink-0" />
@@ -403,8 +404,8 @@ export function RequirementReportModal({
           </div>
         </div>
 
-        {/* Sub-Navigation Tabs */}
-        <div className="px-5 pt-2.5 border-b border-[#E2E8F0] bg-white flex items-center gap-5 overflow-x-auto">
+        {/* Sub-Navigation Tabs (locked position across tab switches) */}
+        <div className="shrink-0 px-5 pt-2.5 border-b border-[#E2E8F0] bg-white flex items-center gap-5 overflow-x-auto">
           {(
             [
               {
@@ -450,8 +451,8 @@ export function RequirementReportModal({
           })}
         </div>
 
-        {/* Scrollable Body */}
-        <div className="cleanroom-drawer-surface flex-1 overflow-y-auto p-5 space-y-5 bg-[#F6F8FA]/50">
+        {/* Scrollable Body (independently scrolled so modal height & header/tabs never shift) */}
+        <div className="cleanroom-drawer-surface flex-1 min-h-0 overflow-y-auto p-5 space-y-5 bg-[#F6F8FA]/50">
           {loading ? (
             <div className="py-16 flex flex-col items-center justify-center gap-3 text-[13px] text-[#64748B]">
               <Loader2 className="h-5 w-5 animate-spin text-[#58A6FF]" />
@@ -506,17 +507,17 @@ export function RequirementReportModal({
                     </div>
                   </div>
 
-                  {/* Coding Agent Final Chat Window Delivery Card */}
-                  <div className="rounded-xl border border-[#2A3548] bg-[#0D121D] overflow-hidden">
-                    <div className="px-4 py-3 border-b border-[#253042] bg-[#141B28] flex flex-wrap items-center justify-between gap-2">
+                  {/* Coding Agent Final Chat Window Delivery Card (Rendered Markdown Preview) */}
+                  <div className="rounded-xl border border-[#E2E8F0] bg-white overflow-hidden shadow-xs">
+                    <div className="px-4 py-3 border-b border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2.5 min-w-0">
                         <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-1.5 text-[12.5px] font-semibold text-[#F8FAFC]">
-                            <MessageSquare className="h-3.5 w-3.5 text-[#34D399] shrink-0" />
-                            <span>代码研发车间 · Coding Agent 聊天窗口最终回复</span>
+                          <div className="flex flex-wrap items-center gap-1.5 text-[12.5px] font-semibold text-[#0F172A]">
+                            <MessageSquare className="h-3.5 w-3.5 text-[#059669] shrink-0" />
+                            <span>Gemini 编码圣殿 · Coding Agent 最终交付回复</span>
                           </div>
-                          <div className="text-[11px] font-mono text-[#8E9DB5]">
-                            仅展示任务完成时发送给用户的最终交付说明（非 Actions 终端日志）
+                          <div className="text-[11px] font-mono text-[#64748B]">
+                            仅展示任务完成时发送给用户的最终交付说明（Markdown 渲染预览）
                             {report.codingOutput?.capturedAt && (
                               <span> · {formatFullDateTime(report.codingOutput.capturedAt)}</span>
                             )}
@@ -529,7 +530,7 @@ export function RequirementReportModal({
                             href={report.codingOutput.actionsUrl}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex items-center gap-1 text-[11px] font-mono text-[#38BDF8] hover:underline whitespace-nowrap"
+                            className="inline-flex items-center gap-1 text-[11px] font-mono text-[#2563EB] hover:underline whitespace-nowrap"
                           >
                             <span>查看原始 Actions #{report.codingOutput.actionsRunId}</span>
                             <ExternalLink className="h-3 w-3" />
@@ -539,11 +540,11 @@ export function RequirementReportModal({
                           <button
                             type="button"
                             onClick={handleCopyCodingOutput}
-                            className="inline-flex items-center gap-1 rounded-md border border-[#2D384D] bg-[#1B2230] px-2.5 py-1 text-[11px] text-[#CBD5E1] hover:bg-[#253044] hover:text-[#F8FAFC] whitespace-nowrap"
+                            className="inline-flex items-center gap-1 rounded-md border border-[#CBD5E1] bg-white px-2.5 py-1 text-[11px] font-medium text-[#334155] hover:bg-[#F1F5F9] hover:text-[#0F172A] whitespace-nowrap cursor-pointer"
                           >
                             {copiedCoding ? (
                               <>
-                                <Check className="h-3 w-3 text-[#34D399]" />
+                                <Check className="h-3 w-3 text-[#059669]" />
                                 <span>已复制</span>
                               </>
                             ) : (
@@ -558,17 +559,13 @@ export function RequirementReportModal({
                     </div>
 
                     {report.codingOutput?.content ? (
-                      <div className="p-4 sm:p-5 bg-[#0B0F18]">
-                        <div className="rounded-xl border border-[#263246] bg-[#131A27] p-4 sm:p-5 shadow-inner">
-                          <pre className="text-[13px] leading-relaxed text-[#E8EEF7] whitespace-pre-wrap break-words font-sans max-h-[460px] overflow-y-auto">
-                            {report.codingOutput.content}
-                          </pre>
-                        </div>
+                      <div className="p-5 sm:p-6 bg-white">
+                        <MarkdownPreview content={report.codingOutput.content} />
                       </div>
                     ) : (
-                      <div className="p-8 text-center space-y-2 text-[13px] text-[#94A3B8]">
+                      <div className="p-8 text-center space-y-2 text-[13px] text-[#64748B] bg-white">
                         <div>本次运行未捕获到 Coding Agent 发送到聊天窗口的最终总结消息。</div>
-                        <div className="text-[12px] text-[#64748B]">
+                        <div className="text-[12px] text-[#94A3B8]">
                           原始 GitHub Actions 执行日志请点击右上角 Actions 链接查看；新一次 VPS AGY 编码完成后，Agent 的最终聊天答复会自动归档于此。
                         </div>
                       </div>
@@ -792,18 +789,6 @@ export function RequirementReportModal({
                   ) : (
                     <div className="rounded-md border border-[#30363D] bg-[#161B22] p-8 text-center text-[13px] text-[#8B949E]">
                       暂无自动化盲测或构建验证报告。
-                    </div>
-                  )}
-
-                  {run?.qaCritic?.finalE2eTestCode && (
-                    <div className="rounded-md border border-[#30363D] bg-[#010409] overflow-hidden">
-                      <div className="px-4 py-2.5 border-b border-[#30363D] bg-[#161B22] flex items-center gap-2 text-[12px] font-semibold text-[#F0F6FC]">
-                        <FileCode2 className="h-3.5 w-3.5 text-[#58A6FF]" />
-                        <span>终版只读 E2E 盲测脚本（Vault 隔离）</span>
-                      </div>
-                      <pre className="p-4 max-h-[280px] overflow-auto font-mono text-[11.5px] leading-relaxed text-[#C9D1D9]">
-                        {run.qaCritic.finalE2eTestCode}
-                      </pre>
                     </div>
                   )}
                 </div>

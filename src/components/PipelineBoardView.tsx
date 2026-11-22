@@ -3,14 +3,11 @@ import {
   AlertCircle,
   CheckCircle2,
   Clock,
-  Cloud,
   ExternalLink,
-  GitPullRequest,
   Loader2,
   Play,
   Plus,
   RefreshCw,
-  Server,
   Square,
 } from 'lucide-react';
 import type {
@@ -86,7 +83,6 @@ export function PipelineBoardView({
   relatedJobs = [],
   selectedRunId,
   onSelectRun,
-  cloudflareStatus,
   githubConnected,
   isRequirementInProgress = false,
   onGoToNewPrd,
@@ -259,6 +255,20 @@ export function PipelineBoardView({
     () => actionRuns.some((r) => r.status === 'in_progress' || r.status === 'queued'),
     [actionRuns]
   );
+
+  const hasRunningAgyTask = useMemo(() => {
+    if (hasCurrentRunExecuting) return true;
+    if (
+      actionRuns.some(
+        (r) =>
+          (r.status === 'in_progress' || r.status === 'queued') &&
+          r.name.toLowerCase().includes('agy')
+      )
+    ) {
+      return true;
+    }
+    return relatedJobs.some((j) => j.status === 'running');
+  }, [actionRuns, hasCurrentRunExecuting, relatedJobs]);
 
   useEffect(() => {
     if (!githubConnected || !hasActiveActionRun) return;
@@ -492,145 +502,12 @@ export function PipelineBoardView({
         {/* Right Detail Column */}
         {activeRun && (
           <div className="lg:col-span-8 space-y-4">
-            {/* Stage Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {/* Stage 1: Multi-Agent Spec */}
-              <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4 space-y-2">
-                <div className="flex items-center justify-between text-[12px]">
-                  <span className="font-medium text-[#8B949E]">01 · 架构与测试左移</span>
-                  <span className="inline-flex items-center gap-1 text-[#3FB950] font-medium">
-                    <CheckCircle2 className="h-3.5 w-3.5" />
-                    已完成
-                  </span>
-                </div>
-                <div className="text-[14px] font-semibold text-[#F0F6FC]">
-                  规格与只读测试集
-                </div>
-                <div className="text-[12px] text-[#8B949E] tabular-nums">
-                  {activeRun.architect.tasks.length} 项任务 · {activeRun.architect.apiContracts.length} 项契约 · {activeRun.qaCritic.findings.length} 项加固
-                </div>
-              </div>
-
-              {/* Stage 2: GitHub Draft PR */}
-              <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4 space-y-2">
-                <div className="flex items-center justify-between text-[12px]">
-                  <span className="font-medium text-[#8B949E]">02 · GitHub 规格分支</span>
-                  {activeRun.draftPr ? (
-                    <span className="inline-flex items-center gap-1 text-[#3FB950] font-medium">
-                      <CheckCircle2 className="h-3.5 w-3.5" />
-                      PR #{activeRun.draftPr.prNumber}
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1 text-[#D29922] font-medium">
-                      <Clock className="h-3.5 w-3.5" />
-                      待建 PR
-                    </span>
-                  )}
-                </div>
-                <div className="text-[14px] font-semibold text-[#F0F6FC] font-mono truncate">
-                  docs/spec.json · 盲测用例已隔离至 Vault
-                </div>
-                {activeRun.draftPr ? (
-                  <a
-                    href={activeRun.draftPr.prUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 font-mono text-[12px] text-[#58A6FF] hover:underline"
-                  >
-                    <GitPullRequest className="h-3.5 w-3.5" />
-                    <span className="truncate">{activeRun.draftPr.branchName}</span>
-                    <ExternalLink className="h-3 w-3 shrink-0" />
-                  </a>
-                ) : (
-                  <div className="text-[12px] text-[#8B949E]">
-                    尚未创建 Draft PR
-                  </div>
-                )}
-              </div>
-
-              {/* Stage 3: Cloudflare Workers Runtime */}
-              <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4 space-y-2">
-                <div className="flex items-center justify-between text-[12px]">
-                  <span className="font-medium text-[#8B949E]">03 · Cloudflare 预览部署</span>
-                  {activeRun.previewDeployment ? (
-                    <span className="inline-flex items-center gap-1 text-[#3FB950] font-medium">
-                      <CheckCircle2 className="h-3.5 w-3.5" />
-                      在线
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1 text-[#8B949E] font-medium">
-                      <Cloud className="h-3.5 w-3.5" />
-                      {cloudflareStatus?.connected ? '已就绪' : '未连接'}
-                    </span>
-                  )}
-                </div>
-                <div className="text-[14px] font-semibold text-[#F0F6FC]">
-                  Workers (Hono) + D1 + KV
-                </div>
-                {activeRun.previewDeployment ? (
-                  <a
-                    href={activeRun.previewDeployment.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1.5 font-mono text-[12px] text-[#3FB950] hover:underline max-w-full"
-                  >
-                    <span className="truncate">{activeRun.previewDeployment.url}</span>
-                    <ExternalLink className="h-3 w-3 shrink-0" />
-                  </a>
-                ) : (
-                  <div className="text-[12px] text-[#8B949E] tabular-nums">
-                    {cloudflareStatus?.connected
-                      ? `Workers ${cloudflareStatus.workers.length} · KV ${cloudflareStatus.kvNamespaces.length}`
-                      : 'Cloudflare 未连接'}
-                  </div>
-                )}
-              </div>
-
-              {/* Stage 4: VPS Self-Hosted AGY Runner */}
-              <div className="rounded-md border border-[#30363D] bg-[#161B22] p-4 space-y-2">
-                <div className="flex items-center justify-between text-[12px]">
-                  <span className="font-medium text-[#8B949E]">04 · VPS AGY Runner</span>
-                  {onlineRunners.length > 0 ? (
-                    <span className="inline-flex items-center gap-1 text-[#3FB950] font-medium tabular-nums">
-                      <Server className="h-3.5 w-3.5" />
-                      在线 ({onlineRunners.length})
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1 text-[#D29922] font-medium">
-                      <Server className="h-3.5 w-3.5" />
-                      离线
-                    </span>
-                  )}
-                </div>
-                <div className="text-[14px] font-semibold text-[#F0F6FC]">
-                  AGY Coding Agent
-                </div>
-                <div className="text-[12px] text-[#8B949E] truncate font-mono">
-                  {onlineRunners.length > 0
-                    ? `${onlineRunners[0].name} · ${onlineRunners[0].busy ? 'Busy' : 'Idle'}`
-                    : '未检测到在线 Runner'}
-                </div>
-              </div>
-            </div>
-
-            {/* VPS AGY Coding Agent Dispatch Console (Hidden while current requirement is executing) */}
-            {hasCurrentRunExecuting ? (
+            {/* VPS AGY Coding Agent Dispatch Console (Completely hidden whenever any AGY task is running) */}
+            {!hasRunningAgyTask && (
               <div
-                role="status"
-                className="rounded-md border border-[#58A6FF]/40 bg-[#1F6FEB]/10 px-5 py-4 flex flex-wrap items-center justify-between gap-3"
+                data-testid="agy-dispatch-panel"
+                className="rounded-md border border-[#30363D] bg-[#161B22] p-5 space-y-4"
               >
-                <div className="flex items-center gap-2.5 text-[13px] text-[#F0F6FC]">
-                  <Loader2 className="h-4 w-4 animate-spin text-[#58A6FF] shrink-0" />
-                  <span>
-                    当前需求正在 VPS AGY 上执行（无超时限制，完成后自动 push 并运行隔离 E2E 盲测）
-                  </span>
-                </div>
-                <span className="font-mono text-[11px] text-[#79C0FF]">
-                  专注模式 · 已锁定重复派发
-                </span>
-              </div>
-            ) : (
-              <div className="rounded-md border border-[#30363D] bg-[#161B22] p-5 space-y-4">
                 <div className="flex items-center justify-between gap-2">
                   <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
                     派发 VPS AGY 自动开发

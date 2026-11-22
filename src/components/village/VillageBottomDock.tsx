@@ -4,6 +4,8 @@ import {
   ChevronDown,
   ChevronUp,
   CloudSnow,
+  Eye,
+  EyeOff,
   FilePlus2,
   Grid2x2,
   Layers,
@@ -34,6 +36,8 @@ interface VillageBottomDockProps {
   runningTasksCount: number;
   demoPhaseIndex: number;
   demoPlaying: boolean;
+  showBuildingLabels?: boolean;
+  onToggleBuildingLabels?: () => void;
   onSelectCameraPreset: (preset: CameraPresetId) => void;
   onSelectAtmosphere: (preset: AtmospherePresetId) => void;
   onOpenStation: (stationId: FactoryStationId) => void;
@@ -80,6 +84,8 @@ export function VillageBottomDock({
   runningTasksCount,
   demoPhaseIndex,
   demoPlaying,
+  showBuildingLabels = true,
+  onToggleBuildingLabels,
   onSelectCameraPreset,
   onSelectAtmosphere,
   onOpenStation,
@@ -307,6 +313,26 @@ export function VillageBottomDock({
           >
             <Layers className="h-3.5 w-3.5" />
             <span className="font-mono tabular-nums">{runningTasksCount}</span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="dock-toggle-labels"
+            aria-label={showBuildingLabels ? '隐藏建筑顶部常驻说明' : '显示建筑顶部常驻说明'}
+            aria-pressed={showBuildingLabels}
+            onClick={onToggleBuildingLabels}
+            title={showBuildingLabels ? '隐藏建筑顶部说明文案' : '常驻显示建筑顶部说明文案'}
+            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition-colors cursor-pointer ${
+              showBuildingLabels
+                ? 'border-[#2563EB] bg-[#EFF6FF] text-[#1D4ED8] hover:bg-[#DBEAFE]'
+                : 'border-[#CBD5E1] bg-white text-[#64748B] hover:text-[#0F172A] hover:bg-[#F8FAFC]'
+            }`}
+          >
+            {showBuildingLabels ? (
+              <Eye className="h-3.5 w-3.5" />
+            ) : (
+              <EyeOff className="h-3.5 w-3.5" />
+            )}
           </button>
 
           <button

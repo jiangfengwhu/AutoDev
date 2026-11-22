@@ -11,12 +11,12 @@ import type {
   PipelineRun,
   QaCriticOutput,
   QaSpecOutput,
-} from '../src/types/autodev';
+} from '../src/types/autodev.ts';
 import {
   runArchitectAgent,
   runQaCriticAgent,
   runQaSpecAgent,
-} from './agentOrchestrator';
+} from './agentOrchestrator.ts';
 import {
   cancelGitHubActionRun,
   dispatchAgyPlanWorkflow,
@@ -25,13 +25,13 @@ import {
   findLatestPlanActionRun,
   readPlanChannelJson,
   upsertPlanChannelJson,
-} from './githubService';
-import { parseRepoFullName } from '../src/lib/taskGraph';
+} from './githubService.ts';
+import { parseRepoFullName } from '../src/lib/taskGraph.ts';
 import {
   DEFAULT_AGY_MODE,
   DEFAULT_AGY_MODEL,
   resolveEffectiveTechStack,
-} from '../src/lib/workflowBuilder';
+} from '../src/lib/workflowBuilder.ts';
 import {
   AUTODEV_PLAN_CHANNEL_BRANCH,
   getPlanArtifactPath,
@@ -40,12 +40,12 @@ import {
   validateArchitectOutput,
   validateQaCriticOutput,
   validateQaSpecOutput,
-} from '../src/lib/planProtocol';
-import { saveRun } from './runStore';
-import { formatRsiPromptBlock } from '../src/lib/rsiEngine';
-import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore';
-import { captureAndReflectIncident } from './rsiService';
-import { scheduleGitHubStateSync } from './githubStateStore';
+} from '../src/lib/planProtocol.ts';
+import { saveRun } from './runStore.ts';
+import { formatRsiPromptBlock } from '../src/lib/rsiEngine.ts';
+import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore.ts';
+import { captureAndReflectIncident } from './rsiService.ts';
+import { scheduleGitHubStateSync } from './githubStateStore.ts';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const JOBS_FILE = path.join(DATA_DIR, 'jobs-v1.json');

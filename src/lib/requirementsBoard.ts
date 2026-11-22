@@ -1,6 +1,6 @@
-import type { AnalysisJob, PipelineRun } from '../types/autodev';
-import type { TestExecutionReport } from './rsiEngine';
-import { sanitizeCodingChatOutput } from './codingChatOutput';
+import type { AnalysisJob, PipelineRun } from '../types/autodev.ts';
+import type { TestExecutionReport } from './rsiEngine.ts';
+import { sanitizeCodingChatOutput } from './codingChatOutput.ts';
 
 export type AuditLogCategory = 'planning' | 'execution' | 'approval' | 'quality';
 

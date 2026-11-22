@@ -6,8 +6,8 @@ import {
   type AuditActionType,
   type AuditLogCategory,
   type AuditLogEntry,
-} from '../src/lib/requirementsBoard';
-import { scheduleGitHubStateSync } from './githubStateStore';
+} from '../src/lib/requirementsBoard.ts';
+import { scheduleGitHubStateSync } from './githubStateStore.ts';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const AUDIT_LOG_FILE = path.join(DATA_DIR, 'audit-logs-v1.json');

@@ -2,7 +2,6 @@ import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import {
   cancelGitHubActionRun,
   checkGitHubIntegration,
@@ -27,24 +26,24 @@ import {
   resetAutodevRepoArtifacts,
   syncAgyWorkflowFile,
   wipeRepoCodeToScratch,
-} from './server/githubService';
+} from './server/githubService.ts';
 import {
   flushGitHubStateNow,
   forcePushAllLocalStateToGitHub,
   getGitHubStatePersistenceStatus,
   hydrateGitHubStateStores,
-} from './server/githubStateStore';
+} from './server/githubStateStore.ts';
 import {
   checkCloudflareIntegration,
   wipeCloudflareD1Databases,
-} from './server/cloudflareService';
-import { deployBranchPreviewToCloudflare } from './server/cloudflareDeployService';
+} from './server/cloudflareService.ts';
+import { deployBranchPreviewToCloudflare } from './server/cloudflareDeployService.ts';
 import {
   GEMINI_AGENT_MODEL,
   runArchitectAgent,
   runQaCriticAgent,
   runQaSpecAgent,
-} from './server/agentOrchestrator';
+} from './server/agentOrchestrator.ts';
 import {
   attachDraftPrToRun,
   attachPreviewDeploymentToRun,
@@ -56,7 +55,7 @@ import {
   saveRun,
   updateRunPlan,
   updateRunReview,
-} from './server/runStore';
+} from './server/runStore.ts';
 import {
   cancelAnalysisJob,
   clearAllAnalysisJobs,
@@ -69,7 +68,7 @@ import {
   reloadJobsFromDisk,
   resumeRunningVpsPlanJobs,
   syncRunPlanToLinkedJobs,
-} from './server/analysisJobStore';
+} from './server/analysisJobStore.ts';
 import {
   clearRsiHistory,
   createManualRsiRule,
@@ -81,42 +80,42 @@ import {
   recordRulesAppliedForStage,
   reloadRsiStateFromDisk,
   updateRsiRule,
-} from './server/rsiStore';
+} from './server/rsiStore.ts';
 import {
   captureAndReflectIncident,
   consolidateRsiRulesWithGemini,
   runAttributionForIncident,
   syncRepoTestReportsAndFailures,
-} from './server/rsiService';
+} from './server/rsiService.ts';
 import {
   appendAuditLog,
   clearAllAuditLogs,
   listAuditLogs,
   reloadAuditLogsFromDisk,
-} from './server/auditLogStore';
+} from './server/auditLogStore.ts';
 import {
   enqueueBackgroundTask,
   getBackgroundTaskById,
   listBackgroundTasks,
-} from './server/backgroundTaskStore';
-import { sanitizeCodingChatOutput } from './src/lib/codingChatOutput';
-import { parseRepoFullName, validatePrdInput } from './src/lib/taskGraph';
-import { buildPrArtifacts } from './src/lib/specBuilder';
+} from './server/backgroundTaskStore.ts';
+import { sanitizeCodingChatOutput } from './src/lib/codingChatOutput.ts';
+import { parseRepoFullName, validatePrdInput } from './src/lib/taskGraph.ts';
+import { buildPrArtifacts } from './src/lib/specBuilder.ts';
 import {
   buildRevisionFeedbackMarkdown,
   evaluateSingleTaskLock,
-} from './src/lib/iterationContext';
-import { buildSevenDayOverviewMetrics } from './src/lib/overviewMetrics';
+} from './src/lib/iterationContext.ts';
+import { buildSevenDayOverviewMetrics } from './src/lib/overviewMetrics.ts';
 import {
   buildRequirementsBoardData,
   synthesizeBaselineAuditEvents,
-} from './src/lib/requirementsBoard';
+} from './src/lib/requirementsBoard.ts';
 import {
   validateArchitectOutput,
   validateQaCriticOutput,
   validateQaSpecOutput,
-} from './src/lib/planProtocol';
-import { decideAgySessionPolicy } from './src/lib/sessionReuse';
+} from './src/lib/planProtocol.ts';
+import { decideAgySessionPolicy } from './src/lib/sessionReuse.ts';
 import {
   aggregateQualityAndRsiMetrics,
   buildRsiGuidelinesMarkdown,
@@ -127,19 +126,19 @@ import {
   type RsiRuleSeverity,
   type RsiRuleStatus,
   type RsiTargetStage,
-} from './src/lib/rsiEngine';
+} from './src/lib/rsiEngine.ts';
 import {
   AGY_AGENT_MODES,
   AGY_AVAILABLE_MODELS,
   FIXED_TARGET_REPO,
-} from './src/lib/workflowBuilder';
+} from './src/lib/workflowBuilder.ts';
 import type {
   AnalysisSseEvent,
   IntegrationsStatusResponse,
   PipelineRun,
   PreviewDeployment,
   ReworkDispatchResult,
-} from './src/types/autodev';
+} from './src/types/autodev.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -2289,8 +2288,9 @@ async function startServer() {
     res.json(payload);
   });
 
-  // Vite middleware in dev, static build in production
+  // Vite middleware in dev (lazy-loaded so production startup never imports Vite), static build in production
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -2304,52 +2304,56 @@ async function startServer() {
     });
   }
 
-  // Hydrate control-plane state from GitHub orphan branch `autodev-state` on startup (with 6s guard)
-  if (process.env.GITHUB_TOKEN?.trim()) {
-    await Promise.race([
-      hydrateGitHubStateStores({
-        repoFullName: FIXED_TARGET_REPO.fullName,
-        onReloadStores: () => {
-          reloadRunsFromDisk();
-          reloadJobsFromDisk();
-          reloadAuditLogsFromDisk();
-          reloadRsiStateFromDisk();
-        },
-      }).then((res) => {
-        if (res.hydrated) {
-          console.log(
-            `[AutoDev State] Hydrated from ${FIXED_TARGET_REPO.fullName}@autodev-state (restored: ${res.restoredKeys.join(', ') || 'empty'}${res.createdBranch ? ', initialized branch' : ''})`
-          );
-        } else if (res.error) {
-          console.warn('[AutoDev State] Startup hydration skipped:', res.error);
-        }
-      }),
-      new Promise<void>((resolve) => setTimeout(resolve, 6000)),
-    ]).catch((err) => {
-      console.warn('[AutoDev State] Startup hydration error:', err?.message || err);
-    });
-  }
-
+  // Bind PORT immediately so Cloud Run / container health probes pass without waiting on external network I/O
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`AutoDev Studio server running on http://0.0.0.0:${PORT}`);
-    resumeRunningVpsPlanJobs();
-    if (process.env.GITHUB_TOKEN?.trim()) {
-      ensureWorkflowsUpToDate({
-        owner: FIXED_TARGET_REPO.owner,
-        repo: FIXED_TARGET_REPO.name,
-        baseBranch: FIXED_TARGET_REPO.defaultBranch,
-      })
-        .then((res) => {
-          if (res.changed) {
-            console.log(
-              `[AutoDev] Auto-synced latest workflows to ${FIXED_TARGET_REPO.fullName}@${FIXED_TARGET_REPO.defaultBranch}`
-            );
-          }
+
+    // Hydrate control-plane state from GitHub orphan branch `autodev-state` asynchronously, then resume jobs
+    const hydratePromise = process.env.GITHUB_TOKEN?.trim()
+      ? Promise.race([
+          hydrateGitHubStateStores({
+            repoFullName: FIXED_TARGET_REPO.fullName,
+            onReloadStores: () => {
+              reloadRunsFromDisk();
+              reloadJobsFromDisk();
+              reloadAuditLogsFromDisk();
+              reloadRsiStateFromDisk();
+            },
+          }).then((res) => {
+            if (res.hydrated) {
+              console.log(
+                `[AutoDev State] Hydrated from ${FIXED_TARGET_REPO.fullName}@autodev-state (restored: ${res.restoredKeys.join(', ') || 'empty'}${res.createdBranch ? ', initialized branch' : ''})`
+              );
+            } else if (res.error) {
+              console.warn('[AutoDev State] Startup hydration skipped:', res.error);
+            }
+          }),
+          new Promise<void>((resolve) => setTimeout(resolve, 6000)),
+        ]).catch((err) => {
+          console.warn('[AutoDev State] Startup hydration error:', err?.message || err);
         })
-        .catch((err) => {
-          console.warn('[AutoDev] Background workflow auto-sync skipped:', err?.message || err);
-        });
-    }
+      : Promise.resolve();
+
+    void hydratePromise.finally(() => {
+      resumeRunningVpsPlanJobs();
+      if (process.env.GITHUB_TOKEN?.trim()) {
+        ensureWorkflowsUpToDate({
+          owner: FIXED_TARGET_REPO.owner,
+          repo: FIXED_TARGET_REPO.name,
+          baseBranch: FIXED_TARGET_REPO.defaultBranch,
+        })
+          .then((res) => {
+            if (res.changed) {
+              console.log(
+                `[AutoDev] Auto-synced latest workflows to ${FIXED_TARGET_REPO.fullName}@${FIXED_TARGET_REPO.defaultBranch}`
+              );
+            }
+          })
+          .catch((err) => {
+            console.warn('[AutoDev] Background workflow auto-sync skipped:', err?.message || err);
+          });
+      }
+    });
   });
 
   // Flush any pending dirty state to GitHub `autodev-state` on graceful shutdown

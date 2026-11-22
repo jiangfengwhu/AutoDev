@@ -13,8 +13,8 @@ import type {
   QaCriticOutput,
   QaSpecOutput,
   ReworkDispatchResult,
-} from '../src/types/autodev';
-import { scheduleGitHubStateSync } from './githubStateStore';
+} from '../src/types/autodev.ts';
+import { scheduleGitHubStateSync } from './githubStateStore.ts';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const STORE_FILE = path.join(DATA_DIR, 'runs-v1.json');

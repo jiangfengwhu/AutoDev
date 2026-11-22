@@ -11,7 +11,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { AlertCircle, Monitor, RefreshCw } from 'lucide-react';
+import { AlertCircle, RefreshCw } from 'lucide-react';
 import {
   formatTokenCount,
   type OverviewDailyBucket,
@@ -233,38 +233,10 @@ export function OverviewDashboard({
 
   return (
     <section
-      aria-label="指挥大厅墙面数据大屏"
-      className="studio-bigscreen-bezel rounded-2xl overflow-hidden"
+      aria-label="近 7 日全局研发效能与 Token 算力遥测"
+      data-testid="overview-metrics-flat"
+      className="space-y-4"
     >
-      {/* Top Precision Signal Hairline */}
-      <div
-        aria-hidden="true"
-        className="h-1 w-full bg-gradient-to-r from-[#2563EB] via-[#059669] to-[#D97706]"
-      />
-
-      {/* Cleanroom Big-Screen Header Strip */}
-      <div className="px-5 py-3.5 border-b border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2.5 text-[13px]">
-          <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#BFDBFE] bg-[#EFF6FF] text-[#2563EB] shrink-0">
-            <Monitor className="h-4 w-4" />
-          </span>
-          <h2 className="font-display text-[15px] font-bold text-[#0F172A] tracking-tight">
-            ST-00 指挥调度中心 · 精密产线数据大屏
-          </h2>
-          <span aria-hidden="true" className="text-[#CBD5E1]">·</span>
-          <span className="text-[12px] text-[#64748B]">
-            近 7 日全局研发效能与 Token 算力实时遥测
-          </span>
-        </div>
-        {metrics?.generatedAt && (
-          <span className="font-mono text-[11px] tabular-nums text-[#64748B]">
-            同步于{' '}
-            {new Date(metrics.generatedAt).toLocaleTimeString('zh-CN', { hour12: false })}
-          </span>
-        )}
-      </div>
-
-      <div className="p-5 space-y-5">
       {error && (
         <div
           role="alert"
@@ -654,7 +626,6 @@ export function OverviewDashboard({
             )}
           </div>
         </div>
-      </div>
       </div>
     </section>
   );

@@ -32,6 +32,7 @@ interface VillageViewportProps {
   runningTasksCount?: number;
   focusBuildingId?: VillageBuildingId | null;
   focusBuildingNonce?: number;
+  showBuildingLabels?: boolean;
   paused?: boolean;
   onSelectStation: (stationId: FactoryStationId) => void;
   onSelectBackgroundTasks: () => void;
@@ -81,6 +82,7 @@ export function VillageViewport({
   runningTasksCount = 0,
   focusBuildingId,
   focusBuildingNonce,
+  showBuildingLabels = true,
   paused = false,
   onSelectStation,
   onSelectBackgroundTasks,
@@ -229,11 +231,7 @@ export function VillageViewport({
             tag.buildingId === hud?.terminal.anchorBuilding;
           const showLabel =
             tag.hovered ||
-            tag.isWorking ||
-            (!occludedByTerminal &&
-              (tag.buildingId === 'ST-00' ||
-                tag.buildingId === 'AI-CODER' ||
-                tag.buildingId === 'AI-CLOUD'));
+            (!occludedByTerminal && showBuildingLabels);
           if (!showLabel) return null;
           return (
             <button

@@ -1286,3 +1286,23 @@ export function deriveVillageHudState(
     celebrationDone: realCelebrationDone,
   };
 }
+
+/**
+ * Computes Three.js Z-axis clockwise rotations (in radians, 12 o'clock = 0 along +Y)
+ * for the Central Rotunda analog clock hands given a local Date.
+ */
+export function computeClockHandAngles(date: Date): {
+  hourRad: number;
+  minuteRad: number;
+  secondRad: number;
+} {
+  const seconds = date.getSeconds() + date.getMilliseconds() / 1000;
+  const minutes = date.getMinutes() + seconds / 60;
+  const hours = (date.getHours() % 12) + minutes / 60;
+  return {
+    hourRad: -(hours / 12) * Math.PI * 2,
+    minuteRad: -(minutes / 60) * Math.PI * 2,
+    secondRad: -(seconds / 60) * Math.PI * 2,
+  };
+}
+

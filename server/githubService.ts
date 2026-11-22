@@ -8,10 +8,10 @@ import type {
   OpenAutodevPrSummary,
   RepoContextSnapshot,
   RepoMigrationSnippet,
-} from '../src/types/autodev';
-import type { PrArtifacts } from '../src/lib/specBuilder';
-import { buildBootstrapReadmeContent, isEmptyGitHubRepoError } from '../src/lib/specBuilder';
-import { generateBranchName } from '../src/lib/taskGraph';
+} from '../src/types/autodev.ts';
+import type { PrArtifacts } from '../src/lib/specBuilder.ts';
+import { buildBootstrapReadmeContent, isEmptyGitHubRepoError } from '../src/lib/specBuilder.ts';
+import { generateBranchName } from '../src/lib/taskGraph.ts';
 import {
   AUTODEV_DEPLOY_WORKFLOW_PATH,
   AUTODEV_LIVE_LOG_ISSUE_TITLE,
@@ -24,8 +24,8 @@ import {
   buildAgyPlanWorkflowYaml,
   buildAgyRunnerWorkflowYaml,
   buildCloudflareDeployWorkflowYaml,
-} from '../src/lib/workflowBuilder';
-import { extractCleanAssistantChatFromComment } from '../src/lib/codingChatOutput';
+} from '../src/lib/workflowBuilder.ts';
+import { extractCleanAssistantChatFromComment } from '../src/lib/codingChatOutput.ts';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 const syncedWorkflowFingerprints = new Map<string, string>();

@@ -78,6 +78,7 @@ export default function App() {
   const [previewZoomOpen, setPreviewZoomOpen] = useState(false);
   const [reportModalRequirementId, setReportModalRequirementId] = useState<string | null>(null);
   const [approvedStampRunId, setApprovedStampRunId] = useState<string | null>(null);
+  const [showBuildingLabels, setShowBuildingLabels] = useState(true);
 
   // Real Backend State
   const [status, setStatus] = useState<IntegrationsStatusResponse | null>(null);
@@ -843,6 +844,7 @@ export default function App() {
         runningTasksCount={runningTasksCount}
         focusBuildingId={focusBuildingId}
         focusBuildingNonce={focusBuildingNonce}
+        showBuildingLabels={showBuildingLabels}
         paused={Boolean(
           drawerStationId ||
             tasksDrawerOpen ||
@@ -866,6 +868,8 @@ export default function App() {
         runningTasksCount={runningTasksCount}
         demoPhaseIndex={demoPhaseIndex}
         demoPlaying={demoPlaying}
+        showBuildingLabels={showBuildingLabels}
+        onToggleBuildingLabels={() => setShowBuildingLabels((prev) => !prev)}
         onSelectCameraPreset={handleSelectCameraPreset}
         onSelectAtmosphere={setAtmospherePreset}
         onOpenStation={openStationDrawer}

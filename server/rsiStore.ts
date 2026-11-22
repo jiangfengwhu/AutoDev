@@ -12,15 +12,15 @@ import type {
   RsiSystemRule,
   RsiTargetStage,
   TestExecutionReport,
-} from '../src/lib/rsiEngine';
+} from '../src/lib/rsiEngine.ts';
 import {
   applyRsiLifecycleHygiene,
   clampDirectiveLength,
   mergeOrCreateRsiRule,
   normalizeRuleDedupeKey,
   selectActiveRsiRulesForStage,
-} from '../src/lib/rsiEngine';
-import { scheduleGitHubStateSync } from './githubStateStore';
+} from '../src/lib/rsiEngine.ts';
+import { scheduleGitHubStateSync } from './githubStateStore.ts';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const RSI_STORE_FILE = path.join(DATA_DIR, 'rsi-state-v1.json');

@@ -237,7 +237,7 @@ export function createProceduralTextures(
     repeatY: 16,
   });
 
-  // 8. Classical analog rotunda clock face
+  // 8. Classical analog rotunda clock dial (clean face — hands are real-time 3D meshes!)
   const [clockCanvas, cCtx] = makeCanvas(256, 256);
   cCtx.fillStyle = '#FAF6EB';
   cCtx.beginPath();
@@ -246,31 +246,27 @@ export function createProceduralTextures(
   cCtx.strokeStyle = '#9C7B47';
   cCtx.lineWidth = 10;
   cCtx.stroke();
-  cCtx.strokeStyle = '#334155';
-  for (let i = 0; i < 12; i++) {
-    const a = (i / 12) * Math.PI * 2;
-    cCtx.lineWidth = i % 3 === 0 ? 6 : 3;
+  // Subtle 60-minute outer graduation ring
+  cCtx.strokeStyle = '#94A3B8';
+  for (let m = 0; m < 60; m++) {
+    if (m % 5 === 0) continue;
+    const a = (m / 60) * Math.PI * 2;
+    cCtx.lineWidth = 1.6;
     cCtx.beginPath();
-    cCtx.moveTo(128 + Math.cos(a) * 86, 128 + Math.sin(a) * 86);
+    cCtx.moveTo(128 + Math.cos(a) * 98, 128 + Math.sin(a) * 98);
     cCtx.lineTo(128 + Math.cos(a) * 106, 128 + Math.sin(a) * 106);
     cCtx.stroke();
   }
+  // Crisp 12-hour indices
   cCtx.strokeStyle = '#1E293B';
-  cCtx.lineCap = 'round';
-  cCtx.lineWidth = 8;
-  cCtx.beginPath();
-  cCtx.moveTo(128, 128);
-  cCtx.lineTo(74, 108);
-  cCtx.stroke();
-  cCtx.lineWidth = 5;
-  cCtx.beginPath();
-  cCtx.moveTo(128, 128);
-  cCtx.lineTo(106, 194);
-  cCtx.stroke();
-  cCtx.fillStyle = '#C9963B';
-  cCtx.beginPath();
-  cCtx.arc(128, 128, 9, 0, Math.PI * 2);
-  cCtx.fill();
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    cCtx.lineWidth = i % 3 === 0 ? 7 : 3.5;
+    cCtx.beginPath();
+    cCtx.moveTo(128 + Math.cos(a) * (i % 3 === 0 ? 83 : 89), 128 + Math.sin(a) * (i % 3 === 0 ? 83 : 89));
+    cCtx.lineTo(128 + Math.cos(a) * 107, 128 + Math.sin(a) * 107);
+    cCtx.stroke();
+  }
   const clockFace = finalizeTexture(clockCanvas, maxAnisotropy);
   clockFace.wrapS = THREE.ClampToEdgeWrapping;
   clockFace.wrapT = THREE.ClampToEdgeWrapping;

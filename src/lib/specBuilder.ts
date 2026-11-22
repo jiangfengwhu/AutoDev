@@ -1,5 +1,5 @@
-import type { PipelineRun } from '../types/autodev';
-import { buildIterationArtifactPaths } from './iterationContext';
+import type { PipelineRun } from '../types/autodev.ts';
+import { buildIterationArtifactPaths } from './iterationContext.ts';
 
 export interface PrArtifacts {
   specJsonPath: string;

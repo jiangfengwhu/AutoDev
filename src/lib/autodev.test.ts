@@ -2615,6 +2615,29 @@ test('villageConfig: zero-crossing conveyors, state-driven parcel journey, 4-sea
   assert.equal(launchFinished.parcels.length, 0);
 });
 
+test('computeClockHandAngles maps local time to clockwise Three.js Z-rotations from 12 oclock', async () => {
+  const { computeClockHandAngles } = await import('../scene/villageConfig');
+
+  const noon = computeClockHandAngles(new Date(2026, 10, 22, 12, 0, 0));
+  assert.ok(Math.abs(noon.hourRad) < 1e-9);
+  assert.ok(Math.abs(noon.minuteRad) < 1e-9);
+  assert.ok(Math.abs(noon.secondRad) < 1e-9);
+
+  const three = computeClockHandAngles(new Date(2026, 10, 22, 15, 0, 0));
+  assert.ok(Math.abs(three.hourRad - -Math.PI / 2) < 1e-9);
+  assert.ok(Math.abs(three.minuteRad) < 1e-9);
+  assert.ok(Math.abs(three.secondRad) < 1e-9);
+
+  const sixThirtyFifteen = computeClockHandAngles(new Date(2026, 10, 22, 6, 30, 15));
+  assert.ok(Math.abs(sixThirtyFifteen.secondRad - -Math.PI / 2) < 1e-9);
+  assert.ok(
+    Math.abs(sixThirtyFifteen.minuteRad - -((30 + 15 / 60) / 60) * Math.PI * 2) < 1e-9
+  );
+  assert.ok(
+    Math.abs(sixThirtyFifteen.hourRad - -((6 + 30.25 / 60) / 12) * Math.PI * 2) < 1e-9
+  );
+});
+
 
 
 

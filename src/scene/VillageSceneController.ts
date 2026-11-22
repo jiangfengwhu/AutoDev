@@ -5,6 +5,7 @@ import {
   CAMERA_PRESETS,
   PARCEL_ROUTE_SEGMENTS,
   WORKSHOPS,
+  computeClockHandAngles,
   deriveVillageHudState,
   evaluateAtmosphere,
   type AtmospherePresetId,
@@ -634,7 +635,12 @@ export class VillageSceneController {
     const isArchiveWorking = activeWorkingSet.has('ST-05');
     const isOpsWorking = activeWorkingSet.has('BG-OPS');
 
-    // Animate Kinetic Diorama Details + Working Stage Boosts!
+    // Animate Kinetic Diorama Details + Real-Time Local Clock Hands + Working Stage Boosts!
+    const clockAngles = computeClockHandAngles(new Date());
+    this.handles.clockHourHand.rotation.z = clockAngles.hourRad;
+    this.handles.clockMinuteHand.rotation.z = clockAngles.minuteRad;
+    this.handles.clockSecondHand.rotation.z = clockAngles.secondRad;
+
     this.handles.rotundaSpire.rotation.y += dt * (isSt00Working ? 2.1 : 0.48);
     this.handles.weathervane.rotation.y = Math.sin(this.elapsedSec * 0.55) * 0.65;
     if (this.handles.satelliteDish) {
