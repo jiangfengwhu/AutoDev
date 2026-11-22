@@ -48,9 +48,12 @@ export function ensureReadOnlyTestHeader(code: string, runId: string, prdTitle: 
     ` * Run ID: ${runId}`,
     ` * Requirement: ${prdTitle}`,
     ` *`,
-    ` * READ-ONLY CONTRACT: Coding agents and GitHub Actions execution sandboxes`,
-    ` * MUST NOT weaken or modify assertions in this file. Fix implementation code`,
-    ` * until all test assertions pass.`,
+    ` * E2E VERIFICATION CONTRACT: This test file is committed directly in the repository.`,
+    ` * When a test fails, analyze the root cause first:`,
+    ` * - If application behavior or UI logic is defective, fix the application code.`,
+    ` * - If the failure is caused by a brittle test script (e.g. Playwright strict-mode`,
+    ` *   multi-element locator ambiguity, timeout, or flawed selector assumption), refine`,
+    ` *   the test script while preserving genuine functional verification coverage.`,
     ` */`,
     ``,
   ].join('\n');
@@ -71,7 +74,7 @@ export function buildPrArtifacts(run: PipelineRun): PrArtifacts {
     baseCommitSha: run.repoContext?.headSha || undefined,
     e2eTestPath: paths.e2eTestPath,
     e2eVaultPath: paths.e2eVaultPath,
-    blindE2eVerification: true,
+    blindE2eVerification: false,
     archivedSpecPath: paths.archivedSpecPath,
     prdTitle: run.prdTitle,
     architecture: {
@@ -147,14 +150,14 @@ export function buildPrArtifacts(run: PipelineRun): PrArtifacts {
 
   const prTitle = `[AutoDev Spec] ${run.prdTitle}`;
   const prBody = [
-    `## AutoDev Studio — 增量迭代规格与只读测试集 (Draft PR)`,
+    `## AutoDev Studio — 增量迭代规格与 E2E 验收测试集 (Draft PR)`,
     ``,
     `本 Draft PR 由 **AutoDev Studio** 自动生成，基于最新 \`${run.defaultBranch}\` 代码上下文完成架构拆解与独立 QA Critic 评审。`,
     ``,
-    `### 提交制品（盲测隔离机制）`,
+    `### 提交制品（测试脚本透明可见）`,
     `- \`${paths.prdMdPath}\` & \`${paths.archivedPrdPath}\` — 本轮结构化需求文档与归档`,
     `- \`${paths.specJsonPath}\` & \`${paths.archivedSpecPath}\` — 架构方案、接口契约 (${run.architect.apiContracts.length} 项) 与原子任务树 (${run.architect.tasks.length} 项)`,
-    `- 独立 Playwright E2E 测试集已隔离存放于专用盲测金库（编码阶段对 Coding Agent 完全不可见，防止针对断言作弊，仅在编码提交后由独立验收阶段拉取执行）`,
+    `- \`${paths.e2eTestPath}\` — Playwright E2E 验收测试脚本（直接提交至代码仓对 Coding Agent 开放，测试失败时先根因分析区分业务代码缺陷还是测试脚本问题后再精准修复）`,
     ``,
     `### 原子任务清单`,
     taskSummaryLines,

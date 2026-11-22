@@ -550,21 +550,26 @@ export function ApprovalView({
       </section>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Acceptance Criteria Checklist */}
+        {/* Acceptance Criteria Checklist (PM & QA Functional Verification) */}
         <section
-          aria-label="验收标准核对表"
+          aria-label="产品与测试功能验收清单"
           className="lg:col-span-7 rounded-md border border-[#30363D] bg-[#161B22] overflow-hidden"
         >
-          <div className="px-5 py-3.5 border-b border-[#30363D] flex items-center justify-between">
-            <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
-              验收标准清单
-            </h2>
-            <span className="font-mono text-[12px] tabular-nums text-[#58A6FF]">
+          <div className="px-5 py-3.5 border-b border-[#30363D] flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-[14px] font-semibold text-[#F0F6FC]">
+                功能验收清单（产品 / 测试核验）
+              </h2>
+              <p className="mt-0.5 text-[11px] text-[#8B949E]">
+                按用户实际操作与页面可见结果逐项核对核心功能是否达标
+              </p>
+            </div>
+            <span className="font-mono text-[12px] tabular-nums text-[#58A6FF] shrink-0">
               {checkedSet.size}/{allCriteria.length}
             </span>
           </div>
           <div className="divide-y divide-[#21262D] max-h-[460px] overflow-y-auto bg-[#0D1117]">
-            {allCriteria.map((item) => {
+            {allCriteria.map((item, idx) => {
               const checked = checkedSet.has(item.id);
               return (
                 <label
@@ -577,16 +582,19 @@ export function ApprovalView({
                     onChange={() => handleToggleCriterion(item.id)}
                     className="mt-1 h-4 w-4 rounded border-[#30363D] bg-[#0D1117] accent-[#238636]"
                   />
-                  <div className="min-w-0 space-y-0.5">
+                  <div className="min-w-0 space-y-1">
                     <div
-                      className={`text-[13px] ${
+                      className={`text-[13px] leading-relaxed ${
                         checked ? 'text-[#8B949E] line-through' : 'text-[#F0F6FC]'
                       }`}
                     >
+                      <span className="mr-1.5 font-mono text-[11px] text-[#8B949E]">
+                        {String(idx + 1).padStart(2, '0')}.
+                      </span>
                       {item.text}
                     </div>
-                    <div className="text-[11px] text-[#8B949E] font-mono">
-                      {item.taskId} · {item.taskTitle}
+                    <div className="text-[11px] text-[#8B949E]">
+                      所属功能模块：{item.taskTitle}
                     </div>
                   </div>
                 </label>

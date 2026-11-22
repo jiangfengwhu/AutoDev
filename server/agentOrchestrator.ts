@@ -352,7 +352,8 @@ export async function runArchitectAgent(
     '- 明确标注哪些接口/模块是增量新增、哪些需要兼容既有功能，严禁破坏已有功能或历史回归测试。',
     '你的职责分为严格的步骤：',
     '1) 先审查 PRD 是否存在明显逻辑漏洞、状态机缺失、边界未定义或业务歧义，列出具体澄清建议 (ambiguities，至少列出 2-5 条高质量洞察)；',
-    '2) 基于目标仓库最新代码上下文与技术栈输出清晰可落地的技术架构方案 (architectureSummary, techDecisions)、明确的接口契约 (apiContracts) 以及带依赖关系的有向无环原子开发任务清单 (tasks，5-8 个原子任务，每个任务包含可验证的中文 acceptanceCriteria，dependsOn 必须引用已存在的任务 ID 且严禁出现环依赖)；',
+    '2) 基于目标仓库最新代码上下文与技术栈输出清晰可落地的技术架构方案 (architectureSummary, techDecisions)、明确的接口契约 (apiContracts) 以及带依赖关系的有向无环原子开发任务清单 (tasks，5-8 个原子任务，dependsOn 必须引用已存在的任务 ID 且严禁出现环依赖)；',
+    '3) 验收标准强约束（面向产品与测试人员）：tasks[].acceptanceCriteria 将直接展示在「验收签批部」供产品经理和测试人员手工功能核验，每条必须仅从终端用户操作与页面可见功能结果出发（例如：“在登录页输入有效邮箱并点击获取验证码，输入正确验证码后成功进入社区首页”），严禁出现 HTTP 状态码、API 路径、数据库表字段、Token/Cookie、CSS 类名、代码文件名或 Playwright 等技术实现术语！',
     ...cloudflareConstraint,
     ...(rsiBlock ? ['', rsiBlock] : []),
   ].join('\n');

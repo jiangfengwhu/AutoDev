@@ -515,12 +515,15 @@ export async function createSpecDraftPr(params: {
     initializedEmptyRepo = true;
   }
 
-  // 4. Blind E2E Testing: commit ONLY specs & PRDs to the coding PR branch (NEVER expose E2E test code to coding stage!)
+  // 4. Transparent E2E Testing: commit specs, PRDs, and the generated E2E test script directly into the PR branch
   const filesToCommit = [
     { path: artifacts.specJsonPath, content: artifacts.specJsonContent },
     { path: artifacts.archivedSpecPath, content: artifacts.specJsonContent },
     { path: artifacts.prdMdPath, content: artifacts.prdMdContent },
     { path: artifacts.archivedPrdPath, content: artifacts.prdMdContent },
+    ...(artifacts.e2eTestPath && artifacts.e2eTestContent.trim()
+      ? [{ path: artifacts.e2eTestPath, content: artifacts.e2eTestContent }]
+      : []),
   ];
 
   const blobEntries = await Promise.all(
@@ -2220,6 +2223,11 @@ export async function resetAutodevRepoArtifacts(
 ): Promise<{
   closedPrNumbers: number[];
   deletedBranches: string[];
+  cleanedIssues: Array<{
+    number: number;
+    title: string;
+    action: 'deleted' | 'closed_and_cleared';
+  }>;
   remainingBranches: string[];
   deletedActionRuns: number;
   skippedActiveActionRuns: number;
@@ -2233,6 +2241,11 @@ export async function resetAutodevRepoArtifacts(
   const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const closedPrNumbers: number[] = [];
   const deletedBranches: string[] = [];
+  const cleanedIssues: Array<{
+    number: number;
+    title: string;
+    action: 'deleted' | 'closed_and_cleared';
+  }> = [];
 
   if (options.resetPrsAndBranches !== false) {
     // 1. Close all open AutoDev PRs
@@ -2261,6 +2274,97 @@ export async function resetAutodevRepoArtifacts(
         if (ok) deletedBranches.push(br.name);
       }
     }
+
+    // 2.5 Clean up AutoDev tracking issues ([AutoDev] Live AGY Execution Stream & legacy [AutoDev] AGY Plan Artifacts)
+    const LEGACY_PLAN_ISSUE_TITLE = '[AutoDev] AGY Plan Artifacts';
+    const trackingTitles = new Set([AUTODEV_LIVE_LOG_ISSUE_TITLE, LEGACY_PLAN_ISSUE_TITLE]);
+    try {
+      const issues = await githubRequest<
+        Array<{
+          number: number;
+          node_id?: string;
+          title: string;
+          state: string;
+          pull_request?: unknown;
+        }>
+      >(token, `${repoPath}/issues?state=all&per_page=100`, { cache: 'no-store' });
+
+      const targets = (issues || []).filter(
+        (item) => !item.pull_request && trackingTitles.has(item.title)
+      );
+
+      for (const issue of targets) {
+        let deleted = false;
+        if (issue.node_id) {
+          try {
+            const gqlRes = await fetch('https://api.github.com/graphql', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/vnd.github+json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                query:
+                  'mutation($issueId: ID!) { deleteIssue(input: { issueId: $issueId }) { clientMutationId } }',
+                variables: { issueId: issue.node_id },
+              }),
+            });
+            const gqlJson = (await gqlRes.json().catch(() => null)) as {
+              errors?: Array<{ message?: string }>;
+            } | null;
+            if (gqlRes.ok && (!gqlJson?.errors || gqlJson.errors.length === 0)) {
+              deleted = true;
+            }
+          } catch {
+            // Fall back to clearing comments + closing issue below
+          }
+        }
+
+        if (deleted) {
+          cleanedIssues.push({ number: issue.number, title: issue.title, action: 'deleted' });
+          continue;
+        }
+
+        // Fallback when token cannot hard-delete issues: purge all comments & close issue
+        try {
+          for (let page = 1; page <= 10; page++) {
+            const comments = await githubRequest<Array<{ id: number }>>(
+              token,
+              `${repoPath}/issues/${issue.number}/comments?per_page=100&page=${page}`,
+              { cache: 'no-store' }
+            );
+            if (!comments || comments.length === 0) break;
+            for (const c of comments) {
+              try {
+                await githubRequest<unknown>(token, `${repoPath}/issues/comments/${c.id}`, {
+                  method: 'DELETE',
+                });
+              } catch {
+                // continue purging remaining comments
+              }
+            }
+            if (comments.length < 100) break;
+          }
+          await githubRequest<unknown>(token, `${repoPath}/issues/${issue.number}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              state: 'closed',
+              body: 'Cleared by AutoDev Studio reset.',
+            }),
+          });
+          cleanedIssues.push({
+            number: issue.number,
+            title: issue.title,
+            action: 'closed_and_cleared',
+          });
+        } catch {
+          // continue cleaning remaining issues
+        }
+      }
+    } catch {
+      // non-fatal if issue listing fails
+    }
   }
 
   // 3. Optionally delete historical completed GitHub Actions workflow runs
@@ -2287,6 +2391,7 @@ export async function resetAutodevRepoArtifacts(
   return {
     closedPrNumbers,
     deletedBranches,
+    cleanedIssues,
     remainingBranches: (afterBranches || []).map((b) => b.name),
     deletedActionRuns,
     skippedActiveActionRuns,

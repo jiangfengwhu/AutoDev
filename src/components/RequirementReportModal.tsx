@@ -28,7 +28,6 @@ import type {
 import type { TestExecutionReport } from '../lib/rsiEngine';
 import type { AuditLogEntry } from '../lib/requirementsBoard';
 import { formatTokenCount } from '../lib/overviewMetrics';
-import { STUDIO_IMAGES } from '../lib/studioTheme';
 
 interface RequirementReportPayload {
   id: string;
@@ -318,31 +317,31 @@ export function RequirementReportModal({
       role="dialog"
       aria-modal="true"
       aria-label={`完整需求报告：${title}`}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-3 sm:p-6"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-[#0F172A]/35 backdrop-blur-[2px] p-3 sm:p-6"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-[1060px] max-h-[90vh] flex flex-col rounded-lg border border-[#30363D] bg-[#0D1117] shadow-2xl overflow-hidden"
+        className="w-full max-w-[1060px] max-h-[90vh] flex flex-col rounded-xl border border-[#CBD5E1] bg-white shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Top Modal Header */}
-        <div className="px-5 py-4 border-b border-[#30363D] bg-[#161B22] flex flex-wrap items-start justify-between gap-4">
+        <div className="px-5 py-4 border-b border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
-              <FileText className="h-4 w-4 text-[#58A6FF] shrink-0" />
-              <h2 className="text-[16px] font-semibold text-[#F0F6FC] truncate">
+              <FileText className="h-4 w-4 text-[#2563EB] shrink-0" />
+              <h2 className="text-[16px] font-bold text-[#0F172A] truncate">
                 {title}
               </h2>
-              <span className="font-mono text-[11px] text-[#8B949E] shrink-0">
+              <span className="font-mono text-[11px] text-[#64748B] shrink-0">
                 {requirementId}
               </span>
             </div>
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono text-[#8B949E] tabular-nums">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-mono text-[#64748B] tabular-nums">
               <span>{run?.repoFullName || job?.repoFullName || '—'}</span>
               {run?.draftPr?.branchName && (
                 <>
                   <span aria-hidden="true">·</span>
-                  <span className="inline-flex items-center gap-1 text-[#58A6FF]">
+                  <span className="inline-flex items-center gap-1 text-[#2563EB]">
                     <GitBranch className="h-3 w-3" />
                     {run.draftPr.branchName}
                   </span>
@@ -351,7 +350,7 @@ export function RequirementReportModal({
               {combinedTokens > 0 && (
                 <>
                   <span aria-hidden="true">·</span>
-                  <span className="text-[#A371F7]">
+                  <span className="text-[#7C3AED] font-semibold">
                     算力 {formatTokenCount(combinedTokens)} Tokens
                   </span>
                 </>
@@ -370,11 +369,11 @@ export function RequirementReportModal({
               type="button"
               disabled={!report || loading}
               onClick={handleCopyMarkdown}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-3 py-1.5 text-[12px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] disabled:opacity-50 transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-[12px] font-medium text-[#334155] hover:bg-[#F1F5F9] hover:text-[#0F172A] disabled:opacity-50 transition-colors cursor-pointer"
             >
               {copiedMd ? (
                 <>
-                  <Check className="h-3.5 w-3.5 text-[#3FB950]" />
+                  <Check className="h-3.5 w-3.5 text-[#059669]" />
                   <span>已复制 MD</span>
                 </>
               ) : (
@@ -388,7 +387,7 @@ export function RequirementReportModal({
               type="button"
               disabled={!report || loading}
               onClick={handleDownloadMarkdown}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-3 py-1.5 text-[12px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] disabled:opacity-50 transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#CBD5E1] bg-white px-3 py-1.5 text-[12px] font-medium text-[#334155] hover:bg-[#F1F5F9] hover:text-[#0F172A] disabled:opacity-50 transition-colors cursor-pointer"
             >
               <Download className="h-3.5 w-3.5" />
               <span>导出 .md</span>
@@ -397,7 +396,7 @@ export function RequirementReportModal({
               type="button"
               onClick={onClose}
               aria-label="关闭需求报告"
-              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[#30363D] bg-[#21262D] text-[#8B949E] hover:bg-[#30363D] hover:text-[#F0F6FC] transition-colors"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[#CBD5E1] bg-white text-[#475569] hover:bg-[#F1F5F9] hover:text-[#0F172A] transition-colors cursor-pointer"
             >
               <X className="h-4 w-4" />
             </button>
@@ -405,7 +404,7 @@ export function RequirementReportModal({
         </div>
 
         {/* Sub-Navigation Tabs */}
-        <div className="px-5 pt-2.5 border-b border-[#30363D] bg-[#161B22]/60 flex items-center gap-5 overflow-x-auto">
+        <div className="px-5 pt-2.5 border-b border-[#E2E8F0] bg-white flex items-center gap-5 overflow-x-auto">
           {(
             [
               {
@@ -436,14 +435,14 @@ export function RequirementReportModal({
                 key={tab.id}
                 type="button"
                 onClick={() => setActiveTab(tab.id)}
-                className={`pb-2.5 text-[12px] font-medium border-b-2 transition-colors whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 ${
+                className={`pb-2.5 text-[12px] font-semibold border-b-2 transition-colors whitespace-nowrap shrink-0 inline-flex items-center gap-1.5 cursor-pointer ${
                   active
-                    ? 'border-[#F78166] text-[#F0F6FC]'
-                    : 'border-transparent text-[#8B949E] hover:text-[#C9D1D9]'
+                    ? 'border-[#2563EB] text-[#2563EB]'
+                    : 'border-transparent text-[#64748B] hover:text-[#0F172A]'
                 }`}
               >
                 <span>{tab.label}</span>
-                <span className="font-mono text-[11px] text-[#8B949E] tabular-nums">
+                <span className="font-mono text-[11px] opacity-75 tabular-nums">
                   ({tab.badge})
                 </span>
               </button>
@@ -452,9 +451,9 @@ export function RequirementReportModal({
         </div>
 
         {/* Scrollable Body */}
-        <div className="flex-1 overflow-y-auto p-5 space-y-5">
+        <div className="cleanroom-drawer-surface flex-1 overflow-y-auto p-5 space-y-5 bg-[#F6F8FA]/50">
           {loading ? (
-            <div className="py-16 flex flex-col items-center justify-center gap-3 text-[13px] text-[#8B949E]">
+            <div className="py-16 flex flex-col items-center justify-center gap-3 text-[13px] text-[#64748B]">
               <Loader2 className="h-5 w-5 animate-spin text-[#58A6FF]" />
               <span>正在汇总完整需求报告与 Coding Agent 交付输出…</span>
             </div>
@@ -511,16 +510,10 @@ export function RequirementReportModal({
                   <div className="rounded-xl border border-[#2A3548] bg-[#0D121D] overflow-hidden">
                     <div className="px-4 py-3 border-b border-[#253042] bg-[#141B28] flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2.5 min-w-0">
-                        <img
-                          src={STUDIO_IMAGES.coder}
-                          alt="陈汐 — Coding Agent 工程师"
-                          referrerPolicy="no-referrer"
-                          className="h-8 w-8 rounded-lg object-cover border border-[#34D399]/40 bg-[#1B2433] shrink-0"
-                        />
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-1.5 text-[12.5px] font-semibold text-[#F8FAFC]">
                             <MessageSquare className="h-3.5 w-3.5 text-[#34D399] shrink-0" />
-                            <span>陈汐 · Coding Agent 聊天窗口最终回复</span>
+                            <span>代码研发车间 · Coding Agent 聊天窗口最终回复</span>
                           </div>
                           <div className="text-[11px] font-mono text-[#8E9DB5]">
                             仅展示任务完成时发送给用户的最终交付说明（非 Actions 终端日志）

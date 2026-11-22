@@ -9,7 +9,6 @@ import type {
 
 export const AUTODEV_PLAN_WORKFLOW_PATH = '.github/workflows/autodev-plan.yml';
 export const AUTODEV_PLAN_CHANNEL_BRANCH = 'autodev-plan-channel';
-export const AUTODEV_PLAN_ISSUE_TITLE = '[AutoDev] AGY Plan Artifacts';
 
 export type PlanArtifactFile = 'input.json' | 'state.json' | 'architect.json' | 'qa_spec.json' | 'qa_critic.json';
 

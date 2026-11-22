@@ -1,21 +1,27 @@
 @import "tailwindcss";
 
 @theme {
-  --font-display: "Bricolage Grotesque", "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-display: "Plus Jakarta Sans", "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-sans: "Plus Jakarta Sans", "Noto Sans SC", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 @layer base {
   :root {
-    color-scheme: dark;
+    color-scheme: light;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
   }
 
   body {
     font-family: var(--font-sans);
-    background-color: #0c0f16;
-    color: #d8dee9;
-    letter-spacing: 0.005em;
+    background-color: #f6f8fa;
+    color: #0f172a;
+    overflow-x: hidden;
   }
 
   h1,
@@ -35,28 +41,710 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Subtle architectural drafting-floor blueprint dot grid */
-.studio-blueprint-floor {
-  background-color: #0c0f16;
+/* Swiss Cleanroom 24px engineering blueprint dot + fine hairline grid */
+.cleanroom-floor-bg {
+  background-color: #f6f8fa;
   background-image:
-    radial-gradient(circle at 18% 0%, rgba(245, 158, 11, 0.06), transparent 42%),
-    radial-gradient(circle at 86% 8%, rgba(56, 189, 248, 0.05), transparent 40%),
-    radial-gradient(rgba(148, 163, 184, 0.11) 1px, transparent 1px);
-  background-size: 100% 100%, 100% 100%, 26px 26px;
+    radial-gradient(circle, rgba(148, 163, 184, 0.38) 1px, transparent 1px),
+    linear-gradient(to right, rgba(226, 232, 240, 0.42) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(226, 232, 240, 0.42) 1px, transparent 1px);
+  background-size: 24px 24px, 96px 96px, 96px 96px;
 }
 
-/* Wall-mounted office big-screen monitor bezel */
-.studio-bigscreen-bezel {
-  background: linear-gradient(180deg, #131823 0%, #0b0e15 100%);
+/* Precision Cleanroom Station Pod Card */
+.cleanroom-station-card {
+  background-color: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.07),
-    0 20px 50px -28px rgba(0, 0, 0, 0.85);
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 8px 24px -12px rgba(15, 23, 42, 0.08);
+  transition:
+    transform 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 180ms ease,
+    box-shadow 180ms ease;
 }
 
-/* Architectural studio scrollbar */
+.cleanroom-station-card:hover {
+  border-color: #cbd5e1;
+  box-shadow:
+    0 2px 4px rgba(15, 23, 42, 0.05),
+    0 14px 30px -14px rgba(15, 23, 42, 0.13);
+  transform: translateY(-1px);
+}
+
+.cleanroom-station-running {
+  border-color: rgba(37, 99, 235, 0.55);
+  box-shadow:
+    0 0 0 3px rgba(37, 99, 235, 0.09),
+    0 12px 28px -12px rgba(37, 99, 235, 0.2);
+}
+
+.cleanroom-station-waiting {
+  border-color: rgba(217, 119, 6, 0.55);
+  box-shadow:
+    0 0 0 3px rgba(217, 119, 6, 0.1),
+    0 12px 28px -12px rgba(217, 119, 6, 0.18);
+}
+
+.cleanroom-station-passed {
+  border-color: rgba(5, 150, 105, 0.48);
+  box-shadow:
+    0 0 0 2px rgba(5, 150, 105, 0.08),
+    0 10px 24px -12px rgba(5, 150, 105, 0.15);
+}
+
+.cleanroom-station-rework {
+  border-color: rgba(220, 38, 38, 0.55);
+  box-shadow:
+    0 0 0 3px rgba(220, 38, 38, 0.1),
+    0 12px 28px -12px rgba(220, 38, 38, 0.2);
+}
+
+/* Brushed aluminum server rack surface inside ST-00 */
+.cleanroom-rack-panel {
+  background: linear-gradient(180deg, #f1f5f9 0%, #e2e8f0 100%);
+  border: 1px solid #cbd5e1;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+}
+
+/* SVG Conveyor animated dash flow */
+@keyframes conveyorDashForward {
+  from {
+    stroke-dashoffset: 32;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes conveyorDashReverse {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: 32;
+  }
+}
+
+.conveyor-flow-forward {
+  stroke-dasharray: 8 8;
+  animation: conveyorDashForward 0.7s linear infinite;
+}
+
+.conveyor-flow-reverse {
+  stroke-dasharray: 7 7;
+  animation: conveyorDashReverse 0.55s linear infinite;
+}
+
+/* Subtle server LED heartbeat */
+@keyframes rackLedPulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.rack-led-blink {
+  animation: rackLedPulse var(--led-dur, 2.2s) ease-in-out var(--led-delay, 0s) infinite;
+}
+
+/* Smooth miniature code terminal marquee scroll */
+@keyframes terminalScrollSlow {
+  0% {
+    transform: translateY(0%);
+  }
+  100% {
+    transform: translateY(-50%);
+  }
+}
+
+.terminal-scroll-track {
+  animation: terminalScrollSlow 9s linear infinite;
+}
+
+.terminal-scroll-track-fast {
+  animation: terminalScrollSlow 5.5s linear infinite;
+}
+
+/* Crisp mechanical emerald ink-stamp slam animation in ST-04 */
+@keyframes stampSlam {
+  0% {
+    opacity: 0;
+    transform: scale(1.75) rotate(-15deg);
+  }
+  65% {
+    opacity: 1;
+    transform: scale(0.95) rotate(-6deg);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) rotate(-7deg);
+  }
+}
+
+.approval-stamp-slam {
+  animation: stampSlam 260ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+/* Right frosted drawer slide-in */
+@keyframes drawerSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.cleanroom-drawer-enter {
+  animation: drawerSlideIn 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/*
+ * Precision Light-Mode Surface Adapter for the 6 real workstation modules inside
+ * the frosted white Cleanroom deep-dive drawer (keeps dark terminal <pre> blocks
+ * dark graphite and preserves semantic green/blue/red CTA buttons cleanly).
+ */
+.cleanroom-drawer-surface {
+  color: #0f172a;
+}
+
+.cleanroom-drawer-surface section,
+.cleanroom-drawer-surface .bg-\[\#161B22\],
+.cleanroom-drawer-surface .bg-\[\#141925\],
+.cleanroom-drawer-surface .bg-\[\#121722\],
+.cleanroom-drawer-surface .bg-\[\#111828\],
+.cleanroom-drawer-surface .bg-\[\#111723\],
+.cleanroom-drawer-surface .bg-\[\#131A27\],
+.cleanroom-drawer-surface .bg-\[\#141B28\],
+.cleanroom-drawer-surface .bg-\[\#0F1522\] {
+  background-color: #ffffff;
+  border-color: #e2e8f0;
+  color: #0f172a;
+}
+
+.cleanroom-drawer-surface .bg-\[\#0D1117\],
+.cleanroom-drawer-surface .bg-\[\#0E131D\],
+.cleanroom-drawer-surface .bg-\[\#0B0E15\],
+.cleanroom-drawer-surface .bg-\[\#0B101A\],
+.cleanroom-drawer-surface .bg-\[\#0B0F18\],
+.cleanroom-drawer-surface .bg-\[\#0D121D\],
+.cleanroom-drawer-surface .bg-\[\#010409\] {
+  background-color: #f8fafc;
+  border-color: #e2e8f0;
+  color: #0f172a;
+}
+
+.cleanroom-drawer-surface .bg-\[\#21262D\],
+.cleanroom-drawer-surface .bg-\[\#1C2128\],
+.cleanroom-drawer-surface .bg-\[\#1A2130\],
+.cleanroom-drawer-surface .bg-\[\#1B2435\],
+.cleanroom-drawer-surface .bg-\[\#1B2433\],
+.cleanroom-drawer-surface .bg-\[\#1B2230\],
+.cleanroom-drawer-surface .bg-\[\#253044\] {
+  background-color: #f1f5f9;
+  border-color: #cbd5e1;
+  color: #1e293b;
+}
+
+.cleanroom-drawer-surface .studio-bigscreen-bezel {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 4px 16px -8px rgba(15, 23, 42, 0.08);
+}
+
+.cleanroom-drawer-surface .border-\[\#30363D\],
+.cleanroom-drawer-surface .border-\[\#21262D\],
+.cleanroom-drawer-surface .border-\[\#263042\],
+.cleanroom-drawer-surface .border-\[\#2A3752\],
+.cleanroom-drawer-surface .border-\[\#2A3548\],
+.cleanroom-drawer-surface .border-\[\#253042\],
+.cleanroom-drawer-surface .border-\[\#263246\],
+.cleanroom-drawer-surface .border-\[\#2D384D\] {
+  border-color: #e2e8f0;
+}
+
+.cleanroom-drawer-surface .text-\[\#F0F6FC\],
+.cleanroom-drawer-surface .text-\[\#F8FAFC\],
+.cleanroom-drawer-surface .text-\[\#E6EDF3\],
+.cleanroom-drawer-surface .text-\[\#E8EEF7\],
+.cleanroom-drawer-surface .text-\[\#E2E8F0\] {
+  color: #0f172a;
+}
+
+.cleanroom-drawer-surface .text-\[\#C9D1D9\],
+.cleanroom-drawer-surface .text-\[\#CBD5E1\],
+.cleanroom-drawer-surface .text-\[\#B8C4D4\] {
+  color: #334155;
+}
+
+.cleanroom-drawer-surface .text-\[\#8B949E\],
+.cleanroom-drawer-surface .text-\[\#94A3B8\],
+.cleanroom-drawer-surface .text-\[\#8E9DB5\],
+.cleanroom-drawer-surface .text-\[\#7E8FA6\],
+.cleanroom-drawer-surface .text-\[\#6E7681\] {
+  color: #64748b;
+}
+
+.cleanroom-drawer-surface .text-\[\#58A6FF\],
+.cleanroom-drawer-surface .text-\[\#38BDF8\] {
+  color: #2563eb;
+}
+
+.cleanroom-drawer-surface .text-\[\#3FB950\],
+.cleanroom-drawer-surface .text-\[\#34D399\] {
+  color: #059669;
+}
+
+.cleanroom-drawer-surface .text-\[\#D29922\],
+.cleanroom-drawer-surface .text-\[\#FBBF24\],
+.cleanroom-drawer-surface .text-\[\#F59E0B\] {
+  color: #b45309;
+}
+
+.cleanroom-drawer-surface .text-\[\#F85149\],
+.cleanroom-drawer-surface .text-\[\#FB7185\] {
+  color: #dc2626;
+}
+
+.cleanroom-drawer-surface .text-\[\#A371F7\],
+.cleanroom-drawer-surface .text-\[\#A78BFA\] {
+  color: #7c3aed;
+}
+
+/* Keep solid semantic buttons crisp with white text */
+.cleanroom-drawer-surface .bg-\[\#238636\],
+.cleanroom-drawer-surface .bg-\[\#2EA043\] {
+  background-color: #059669;
+  color: #ffffff;
+  border-color: #047857;
+}
+
+.cleanroom-drawer-surface .bg-\[\#1F6FEB\] {
+  background-color: #2563eb;
+  color: #ffffff;
+  border-color: #1d4ed8;
+}
+
+.cleanroom-drawer-surface .bg-\[\#DA3633\] {
+  background-color: #dc2626;
+  color: #ffffff;
+  border-color: #b91c1c;
+}
+
+.cleanroom-drawer-surface .bg-\[\#238636\] .text-\[\#F0F6FC\],
+.cleanroom-drawer-surface .bg-\[\#1F6FEB\] .text-\[\#F0F6FC\],
+.cleanroom-drawer-surface .bg-\[\#DA3633\] .text-\[\#F0F6FC\] {
+  color: #ffffff;
+}
+
+/* Preserve dark graphite contrast for code/log <pre> blocks inside drawers */
+.cleanroom-drawer-surface pre {
+  background-color: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid #1e293b;
+}
+
+.cleanroom-drawer-surface pre.font-sans {
+  background-color: #ffffff;
+  color: #1e293b;
+  border-color: #e2e8f0;
+}
+
+.cleanroom-drawer-surface input:not([type="checkbox"]):not([type="radio"]),
+.cleanroom-drawer-surface textarea,
+.cleanroom-drawer-surface select {
+  background-color: #ffffff;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+
+.cleanroom-drawer-surface input:not([type="checkbox"]):not([type="radio"]):focus,
+.cleanroom-drawer-surface textarea:focus,
+.cleanroom-drawer-surface select:focus {
+  border-color: #2563eb;
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+}
+
+.cleanroom-drawer-surface thead th {
+  background-color: #f8fafc;
+  color: #475569;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+/* ============================================================================
+   Sunlit Miniature Village — Centered Department Pavilion Surface Theme
+   Harmonizes all real operational views into warm alabaster-limestone drafting craft
+   ============================================================================ */
+
+@keyframes villagePavilionReveal {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.village-pavilion-enter {
+  animation: villagePavilionReveal 220ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes cleanroomFloat3D {
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes cleanroomScanSweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(260%);
+  }
+}
+
+.cleanroom-float-3d {
+  animation: cleanroomFloat3D 4.2s ease-in-out infinite;
+  will-change: transform;
+}
+
+.cleanroom-scan-sweep {
+  animation: cleanroomScanSweep 3.2s linear infinite;
+  will-change: transform;
+}
+
+.cleanroom-glass-shell {
+  background: linear-gradient(
+    165deg,
+    rgba(255, 255, 255, 0.9) 0%,
+    rgba(248, 250, 252, 0.85) 54%,
+    rgba(241, 245, 249, 0.89) 100%
+  );
+  backdrop-filter: blur(20px) saturate(1.35);
+  -webkit-backdrop-filter: blur(20px) saturate(1.35);
+  isolation: isolate;
+  transform: translateZ(0);
+  border: 1px solid rgba(255, 255, 255, 0.92);
+  box-shadow:
+    0 32px 72px -18px rgba(15, 23, 42, 0.22),
+    0 12px 28px -10px rgba(15, 23, 42, 0.1),
+    0 2px 6px rgba(15, 23, 42, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98);
+}
+
+.cleanroom-blueprint-dots {
+  background-image: radial-gradient(rgba(148, 163, 184, 0.34) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+.village-pavilion-surface {
+  color: #0f172a;
+}
+
+/* Bright Swiss Cleanroom frosted-white glass card surfaces */
+.village-pavilion-surface .bg-\[\#010409\],
+.village-pavilion-surface .bg-\[\#0B0E15\],
+.village-pavilion-surface .bg-\[\#0B0F18\],
+.village-pavilion-surface .bg-\[\#0B101A\],
+.village-pavilion-surface .bg-\[\#0B101B\],
+.village-pavilion-surface .bg-\[\#0C111C\],
+.village-pavilion-surface .bg-\[\#0D1117\],
+.village-pavilion-surface .bg-\[\#0D121D\],
+.village-pavilion-surface .bg-\[\#0D131F\],
+.village-pavilion-surface .bg-\[\#0E131D\],
+.village-pavilion-surface .bg-\[\#0F1522\],
+.village-pavilion-surface .bg-\[\#0F1624\],
+.village-pavilion-surface .bg-\[\#111723\],
+.village-pavilion-surface .bg-\[\#121826\],
+.village-pavilion-surface .bg-\[\#141B28\],
+.village-pavilion-surface .bg-\[\#161B22\],
+.village-pavilion-surface .bg-\[\#161E2E\],
+.village-pavilion-surface .bg-\[\#182030\],
+.village-pavilion-surface .bg-\[\#1B2230\],
+.village-pavilion-surface .bg-\[\#1B2433\],
+.village-pavilion-surface .bg-\[\#1C2128\],
+.village-pavilion-surface .bg-\[\#1C2331\],
+.village-pavilion-surface .bg-\[\#1F2633\],
+.village-pavilion-surface .bg-\[\#21262D\],
+.village-pavilion-surface .bg-\[\#0E1525\] {
+  background-color: rgba(255, 255, 255, 0.9);
+}
+
+/* Soft recessed slate tint for expanded row drawers so nested white cards stand out cleanly */
+.village-pavilion-surface .bg-\[\#010409\]:not(pre):not(textarea) {
+  background-color: #f8fafc;
+}
+
+/* Soft ambient elevation for Cleanroom cards — zero harsh stepped bottom lip */
+.village-pavilion-surface .rounded-md.border:not(input):not(textarea):not(select):not(button),
+.village-pavilion-surface .rounded-xl.border:not(input):not(textarea):not(select):not(button),
+.village-pavilion-surface .rounded-2xl.border:not(input):not(textarea):not(select):not(button) {
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.03),
+    0 8px 24px -12px rgba(15, 23, 42, 0.09);
+}
+
+.village-pavilion-surface .bg-\[\#161B22\]\/60,
+.village-pavilion-surface .bg-\[\#161B22\]\/70,
+.village-pavilion-surface .bg-\[\#161B22\]\/80,
+.village-pavilion-surface .bg-\[\#0D1117\]\/50,
+.village-pavilion-surface .bg-\[\#0D1117\]\/60,
+.village-pavilion-surface .bg-\[\#0D1117\]\/80,
+.village-pavilion-surface .bg-\[\#141B28\]\/80,
+.village-pavilion-surface .bg-\[\#1B2433\]\/70,
+.village-pavilion-surface .bg-\[\#111723\]\/80 {
+  background-color: rgba(246, 248, 250, 0.86);
+}
+
+/* Bright Cleanroom hover backgrounds — NEVER dark/black flash on hover */
+.village-pavilion-surface .hover\:bg-\[\#161B22\]:hover,
+.village-pavilion-surface .hover\:bg-\[\#161B22\]\/60:hover,
+.village-pavilion-surface .hover\:bg-\[\#161B22\]\/80:hover,
+.village-pavilion-surface .hover\:bg-\[\#1C2128\]:hover,
+.village-pavilion-surface .hover\:bg-\[\#21262D\]:hover,
+.village-pavilion-surface .hover\:bg-\[\#21262D\]\/40:hover,
+.village-pavilion-surface .hover\:bg-\[\#253044\]:hover,
+.village-pavilion-surface .hover\:bg-\[\#30363D\]:hover {
+  background-color: #f1f5f9 !important;
+}
+
+.village-pavilion-surface .hover\:text-\[\#F0F6FC\]:hover,
+.village-pavilion-surface .hover\:text-\[\#F8FAFC\]:hover,
+.village-pavilion-surface .hover\:text-\[\#C9D1D9\]:hover {
+  color: #0f172a !important;
+}
+
+/* Crisp Cleanroom dividers inside lists and checklists */
+.village-pavilion-surface .divide-\[\#21262D\] > *,
+.village-pavilion-surface .divide-\[\#30363D\] > *,
+.village-pavilion-surface .divide-\[\#1F2937\] > *,
+.village-pavilion-surface .divide-y > * {
+  border-color: #e2e8f0 !important;
+}
+
+/* Cleanroom precision hairlines */
+.village-pavilion-surface .border-\[\#30363D\],
+.village-pavilion-surface .border-\[\#253042\],
+.village-pavilion-surface .border-\[\#2A3548\],
+.village-pavilion-surface .border-\[\#21262D\],
+.village-pavilion-surface .border-\[\#3B4659\],
+.village-pavilion-surface .border-\[\#2D3748\],
+.village-pavilion-surface .border-\[\#2D384D\],
+.village-pavilion-surface .border-\[\#263245\] {
+  border-color: #e2e8f0;
+}
+
+/* Crisp Cleanroom semantic callout surfaces (ApprovalView & status banners) */
+.village-pavilion-surface .bg-\[\#2EA043\]\/10,
+.village-pavilion-surface .bg-\[\#3FB950\]\/10 {
+  background-color: #ecfdf5;
+  border-color: #6ee7b7;
+}
+
+.village-pavilion-surface .bg-\[\#1F6FEB\]\/10 {
+  background-color: #eff6ff;
+  border-color: #93c5fd;
+}
+
+.village-pavilion-surface .bg-\[\#D29922\]\/10 {
+  background-color: #fffbeb;
+  border-color: #fcd34d;
+}
+
+.village-pavilion-surface .bg-\[\#F85149\]\/10 {
+  background-color: #fef2f2;
+  border-color: #fca5a5;
+}
+
+/* Swiss Cleanroom slate ink hierarchy */
+.village-pavilion-surface .text-\[\#F0F6FC\],
+.village-pavilion-surface .text-\[\#F8FAFC\],
+.village-pavilion-surface .text-\[\#E6EDF3\],
+.village-pavilion-surface .text-\[\#E2E8F0\],
+.village-pavilion-surface .text-\[\#DCE5F2\],
+.village-pavilion-surface .text-\[\#C9D1D9\] {
+  color: #0f172a;
+}
+
+.village-pavilion-surface .text-\[\#8B949E\],
+.village-pavilion-surface .text-\[\#8E9DB5\],
+.village-pavilion-surface .text-\[\#94A3B8\],
+.village-pavilion-surface .text-\[\#9BA7B8\],
+.village-pavilion-surface .text-\[\#6E7681\] {
+  color: #475569;
+}
+
+/* High-contrast Cleanroom semantic accents */
+.village-pavilion-surface .text-\[\#58A6FF\],
+.village-pavilion-surface .text-\[\#38BDF8\],
+.village-pavilion-surface .text-\[\#79C0FF\],
+.village-pavilion-surface .text-\[\#A5D6FF\] {
+  color: #2563eb;
+}
+
+.village-pavilion-surface .text-\[\#3FB950\],
+.village-pavilion-surface .text-\[\#34D399\],
+.village-pavilion-surface .text-\[\#56D364\],
+.village-pavilion-surface .text-\[\#7EE787\],
+.village-pavilion-surface .text-\[\#AFF5B4\] {
+  color: #047857;
+}
+
+.village-pavilion-surface .text-\[\#D29922\],
+.village-pavilion-surface .text-\[\#FBBF24\],
+.village-pavilion-surface .text-\[\#F59E0B\],
+.village-pavilion-surface .text-\[\#E3B341\],
+.village-pavilion-surface .text-\[\#F2CC60\],
+.village-pavilion-surface .text-\[\#FFA657\] {
+  color: #b45309;
+}
+
+.village-pavilion-surface .text-\[\#F85149\],
+.village-pavilion-surface .text-\[\#FB7185\],
+.village-pavilion-surface .text-\[\#FF7B72\],
+.village-pavilion-surface .text-\[\#FFDCD7\] {
+  color: #b91c1c;
+}
+
+.village-pavilion-surface .text-\[\#A371F7\],
+.village-pavilion-surface .text-\[\#A78BFA\],
+.village-pavilion-surface .text-\[\#D2A8FF\] {
+  color: #6d28d9;
+}
+
+/* Refined Cleanroom CTA buttons with soft diffused glow (no stepped double-layer ledge) */
+.village-pavilion-surface .bg-\[\#238636\],
+.village-pavilion-surface .bg-\[\#2EA043\] {
+  background: linear-gradient(180deg, #10b981 0%, #059669 100%);
+  color: #ffffff;
+  border-color: #059669;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 8px 18px -6px rgba(5, 150, 105, 0.34);
+}
+
+.village-pavilion-surface .bg-\[\#238636\]:hover,
+.village-pavilion-surface .bg-\[\#2EA043\]:hover {
+  background: linear-gradient(180deg, #12c48a 0%, #059e6e 100%);
+  color: #ffffff !important;
+}
+
+.village-pavilion-surface .bg-\[\#1F6FEB\] {
+  background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+  color: #ffffff;
+  border-color: #2563eb;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 8px 18px -6px rgba(37, 99, 235, 0.34);
+}
+
+.village-pavilion-surface .bg-\[\#DA3633\] {
+  background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
+  color: #ffffff;
+  border-color: #dc2626;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 8px 18px -6px rgba(220, 38, 38, 0.3);
+}
+
+.village-pavilion-surface .bg-\[\#238636\] .text-\[\#F0F6FC\],
+.village-pavilion-surface .bg-\[\#1F6FEB\] .text-\[\#F0F6FC\],
+.village-pavilion-surface .bg-\[\#DA3633\] .text-\[\#F0F6FC\] {
+  color: #ffffff;
+}
+
+/* Harmonize OverviewDashboard KPI cards with Cleanroom frosted glass borders */
+.village-pavilion-surface .border-\[\#242F44\],
+.village-pavilion-surface .border-\[\#1F2937\] {
+  border-color: #e2e8f0 !important;
+  background-color: rgba(255, 255, 255, 0.92) !important;
+}
+
+/* Crisp obsidian-slate terminal & code surfaces for clear diff/log legibility */
+.village-pavilion-surface pre {
+  background-color: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid #1e293b;
+  box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.45);
+}
+
+.village-pavilion-surface pre.font-sans {
+  background-color: rgba(255, 255, 255, 0.94);
+  color: #0f172a;
+  border-color: #e2e8f0;
+  box-shadow: none;
+}
+
+/* Crisp Cleanroom glass form controls — clean single border, zero misaligned double bottom lip! */
+.village-pavilion-surface input:not([type="checkbox"]):not([type="radio"]),
+.village-pavilion-surface textarea,
+.village-pavilion-surface select {
+  background-color: rgba(255, 255, 255, 0.96);
+  border: 1px solid #cbd5e1;
+  color: #0f172a;
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.village-pavilion-surface input:not([type="checkbox"]):not([type="radio"]):hover,
+.village-pavilion-surface textarea:hover,
+.village-pavilion-surface select:hover {
+  border-color: #94a3b8;
+}
+
+.village-pavilion-surface input:not([type="checkbox"]):not([type="radio"]):focus,
+.village-pavilion-surface textarea:focus,
+.village-pavilion-surface select:focus {
+  border-color: #2563eb;
+  outline: none;
+  box-shadow:
+    inset 0 1px 2px rgba(15, 23, 42, 0.03),
+    0 0 0 3px rgba(37, 99, 235, 0.16);
+}
+
+.village-pavilion-surface thead th {
+  background-color: #f1f5f9;
+  color: #475569;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conveyor-flow-forward,
+  .conveyor-flow-reverse,
+  .rack-led-blink,
+  .terminal-scroll-track,
+  .terminal-scroll-track-fast,
+  .approval-stamp-slam,
+  .cleanroom-drawer-enter,
+  .village-pavilion-enter,
+  .cleanroom-float-3d,
+  .cleanroom-scan-sweep {
+    animation: none !important;
+  }
+  .cleanroom-station-card {
+    transition: none !important;
+  }
+}
+
+/* Cleanroom crisp subtle scrollbar */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
 }
 
 ::-webkit-scrollbar-track {
@@ -64,10 +752,12 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #2b3445;
+  background: #cbd5e1;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3d4a63;
+  background: #94a3b8;
 }
+
+

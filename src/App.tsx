@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AnalysisJob,
   BackgroundTask,
@@ -8,9 +8,7 @@ import type {
   SelectedTargetRepo,
   ToastItem,
 } from './types/autodev';
-import { StudioNavigationShell } from './components/StudioNavigationShell';
-import { StudioOfficeMap, buildRoomLiveState } from './components/StudioOfficeMap';
-import { StudioRoomBanner } from './components/StudioRoomBanner';
+import type { RsiSystemRule, TestExecutionReport } from './lib/rsiEngine';
 import { BackgroundTasksPanel } from './components/BackgroundTasksPanel';
 import { EnvironmentView } from './components/EnvironmentView';
 import { PrdWorkspaceView } from './components/PrdWorkspaceView';
@@ -18,13 +16,24 @@ import { RequirementsBoardView } from './components/RequirementsBoardView';
 import { PipelineBoardView } from './components/PipelineBoardView';
 import { ApprovalView } from './components/ApprovalView';
 import { QualityRsiView, type QualityFocusTarget } from './components/QualityRsiView';
+import { RequirementReportModal } from './components/RequirementReportModal';
 import { ToastContainer } from './components/ToastContainer';
+import { DepartmentPavilionModal } from './components/village/DepartmentPavilionModal';
+import { PreviewZoomModal } from './components/cleanroom/PreviewZoomModal';
+import { VillageViewport } from './components/village/VillageViewport';
+import { VillageBottomDock } from './components/village/VillageBottomDock';
+import type { AtmospherePresetId, CameraPresetId, VillageBuildingId } from './scene/villageConfig';
 import { FIXED_TARGET_REPO } from './lib/workflowBuilder';
-import type { StudioRoomId } from './lib/studioTheme';
+import { clearPrdDraft, loadPrdDraft } from './lib/prdDraftStorage';
+import type { SevenDayOverviewMetrics } from './lib/overviewMetrics';
 import {
-  clearPrdDraft,
-  loadPrdDraft,
-} from './lib/prdDraftStorage';
+  DEMO_PIPELINE_PHASES,
+  deriveRealFactorySnapshot,
+  getDemoFactorySnapshot,
+  type FactoryMode,
+  type FactoryStationId,
+} from './lib/factoryPipelineState';
+import { soundEngine } from './game/soundEngine';
 
 const DEFAULT_PINNED_REPO: SelectedTargetRepo = {
   fullName: FIXED_TARGET_REPO.fullName,
@@ -41,15 +50,44 @@ export interface PrdDraftState {
   prdContent: string;
 }
 
-export default function App() {
-  const [activeSection, setActiveSection] = useState<NavSectionId>('studio');
+const ROOM_TO_STATION: Record<Exclude<NavSectionId, 'studio'>, FactoryStationId> = {
+  environment: 'ST-00',
+  prd: 'ST-01',
+  pipeline: 'ST-02',
+  quality: 'ST-03',
+  approval: 'ST-04',
+  requirements: 'ST-05',
+};
 
+export default function App() {
+  // Factory Display Mode: Real Live Production vs Interactive Closed-Loop Demo Simulation
+  const [factoryMode, setFactoryMode] = useState<FactoryMode>('real');
+  const [demoPhaseIndex, setDemoPhaseIndex] = useState(0);
+  const [demoPlaying, setDemoPlaying] = useState(true);
+  const [demoManualStamped, setDemoManualStamped] = useState(false);
+
+  // 3D Miniature Village Camera & 4-Season Atmosphere State
+  const [atmospherePreset, setAtmospherePreset] = useState<AtmospherePresetId>('day');
+  const [cameraPreset, setCameraPreset] = useState<CameraPresetId | null>('overview');
+  const [cameraPresetNonce, setCameraPresetNonce] = useState(0);
+  const [focusBuildingId, setFocusBuildingId] = useState<VillageBuildingId | null>(null);
+  const [focusBuildingNonce, setFocusBuildingNonce] = useState(0);
+
+  // Active right-side deep-dive station drawer
+  const [drawerStationId, setDrawerStationId] = useState<FactoryStationId | null>(null);
+  const [previewZoomOpen, setPreviewZoomOpen] = useState(false);
+  const [reportModalRequirementId, setReportModalRequirementId] = useState<string | null>(null);
+  const [approvedStampRunId, setApprovedStampRunId] = useState<string | null>(null);
+
+  // Real Backend State
   const [status, setStatus] = useState<IntegrationsStatusResponse | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [overviewMetrics, setOverviewMetrics] = useState<SevenDayOverviewMetrics | null>(null);
+  const [rsiReports, setRsiReports] = useState<TestExecutionReport[]>([]);
+  const [rsiRules, setRsiRules] = useState<RsiSystemRule[]>([]);
 
   const [selectedRepo, setSelectedRepo] = useState<SelectedTargetRepo>(DEFAULT_PINNED_REPO);
-
   const [runs, setRuns] = useState<PipelineRun[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
@@ -57,11 +95,18 @@ export default function App() {
   const [analysisJobs, setAnalysisJobs] = useState<AnalysisJob[]>([]);
   const [focusedQualityTarget, setFocusedQualityTarget] = useState<QualityFocusTarget | null>(null);
 
-  // Global detached server-side background tasks
   const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
+  const [activeCodingActionRunning, setActiveCodingActionRunning] = useState(false);
+  const [latestCodingActionConclusion, setLatestCodingActionConclusion] = useState<string | null>(
+    null
+  );
+  const [celebratingDeliveredRunId, setCelebratingDeliveredRunId] = useState<string | null>(null);
+  const [runsHydrated, setRunsHydrated] = useState(false);
   const [tasksDrawerOpen, setTasksDrawerOpen] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const prevTaskStatusRef = useRef<Map<string, BackgroundTask['status']>>(new Map());
+  const prevCodingRunningRef = useRef(false);
+  const knownDeliveredIdsRef = useRef<Set<string> | null>(null);
 
   const [prdDraft, setPrdDraft] = useState<PrdDraftState>(() => {
     const saved = loadPrdDraft();
@@ -86,21 +131,22 @@ export default function App() {
 
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
+  useEffect(() => {
+    document.body.dataset.mode = factoryMode;
+  }, [factoryMode]);
+
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const pushToast = useCallback(
-    (toast: Omit<ToastItem, 'id'>) => {
-      const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-      setToasts((prev) => [...prev.slice(-4), { ...toast, id }]);
-      const ttl = toast.type === 'error' ? 7500 : 4800;
-      setTimeout(() => {
-        setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, ttl);
-    },
-    []
-  );
+  const pushToast = useCallback((toast: Omit<ToastItem, 'id'>) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setToasts((prev) => [...prev.slice(-4), { ...toast, id }]);
+    const ttl = toast.type === 'error' ? 7500 : 4800;
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, ttl);
+  }, []);
 
   const pushErrorToast = useCallback(
     (message: string, title = '操作失败') => {
@@ -115,6 +161,45 @@ export default function App() {
     },
     [pushToast]
   );
+
+  const fetchOverviewMetrics = useCallback(async (repoFullName: string) => {
+    try {
+      const res = await fetch(
+        `/api/overview/metrics?repo=${encodeURIComponent(repoFullName)}`
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as SevenDayOverviewMetrics & {
+        metrics?: SevenDayOverviewMetrics;
+      };
+      const resolved = data.summary ? data : data.metrics ?? null;
+      if (resolved?.summary) {
+        setOverviewMetrics(resolved);
+      }
+    } catch {
+      // non-fatal
+    }
+  }, []);
+
+  const fetchRsiState = useCallback(async (repoFullName: string) => {
+    try {
+      const res = await fetch(
+        `/api/rsi/state?repo=${encodeURIComponent(repoFullName)}`
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        testReports?: TestExecutionReport[];
+        rules?: RsiSystemRule[];
+      };
+      if (Array.isArray(data.testReports)) {
+        setRsiReports(data.testReports);
+      }
+      if (Array.isArray(data.rules)) {
+        setRsiRules(data.rules);
+      }
+    } catch {
+      // non-fatal
+    }
+  }, []);
 
   const fetchIntegrationsStatus = useCallback(async () => {
     setStatusLoading(true);
@@ -164,6 +249,7 @@ export default function App() {
         if (Array.isArray(runsData.runs)) {
           loadedRuns = runsData.runs;
           setRuns(loadedRuns);
+          setRunsHydrated(true);
           if (loadedRuns.length > 0) {
             setActiveRunId((prev) => prev ?? loadedRuns[0].id);
           }
@@ -178,7 +264,6 @@ export default function App() {
         const loadedJobs = Array.isArray(jobData.jobs) ? jobData.jobs : [];
         setAnalysisJobs(loadedJobs);
 
-        // Clean up any stale localStorage draft that already belongs to a submitted/completed requirement
         const savedLocal = loadPrdDraft();
         if (savedLocal) {
           const normTitle = savedLocal.prdTitle.trim();
@@ -186,8 +271,7 @@ export default function App() {
           const alreadySubmitted =
             loadedRuns.some(
               (r) =>
-                r.prdTitle.trim() === normTitle &&
-                r.prdContent.trim() === normContent
+                r.prdTitle.trim() === normTitle && r.prdContent.trim() === normContent
             ) ||
             loadedJobs.some(
               (j) =>
@@ -217,8 +301,6 @@ export default function App() {
             !linkedRun?.mergedRelease &&
             linkedRun?.status === 'analyzed';
 
-          // Only bind analysisJob into PRD workspace if actively running or awaiting Draft PR creation.
-          // Completed requirements (Draft PR created / approved / merged) must NOT occupy the New Requirement screen.
           if (job.status === 'running' || isAwaitingDraftPr) {
             setAnalysisJob(job);
             lastJobStatusRef.current = job.status;
@@ -253,6 +335,7 @@ export default function App() {
       const data = (await res.json()) as { runs?: PipelineRun[] };
       if (Array.isArray(data.runs)) {
         setRuns(data.runs);
+        setRunsHydrated(true);
         if (data.runs.length > 0) {
           setActiveRunId((prev) => prev ?? data.runs![0].id);
         }
@@ -267,6 +350,7 @@ export default function App() {
     setActiveRunId(null);
     setAnalysisJob(null);
     setAnalysisJobs([]);
+    setRsiReports([]);
     lastJobStatusRef.current = null;
     clearPrdDraft();
     hasRestoredLocalDraftRef.current = false;
@@ -274,7 +358,9 @@ export default function App() {
     setPrdDraft({ prdTitle: '', techStackHint: '', prdContent: '' });
     setDraftSavedAt(null);
     fetchRunsAndLatestJob();
-  }, [fetchRunsAndLatestJob]);
+    fetchOverviewMetrics(selectedRepo.fullName);
+    fetchRsiState(selectedRepo.fullName);
+  }, [fetchOverviewMetrics, fetchRsiState, fetchRunsAndLatestJob, selectedRepo.fullName]);
 
   const fetchBackgroundTasks = useCallback(
     async (detectTransitions: boolean) => {
@@ -295,6 +381,10 @@ export default function App() {
               if (task.kind === 'admin_reset') {
                 needsReset = true;
               }
+              if (task.kind === 'approve_release' && task.runId) {
+                setApprovedStampRunId(task.runId);
+                setCelebratingDeliveredRunId(task.runId);
+              }
               pushSuccessToast(
                 task.progressMessage || `${task.title} 已在后台完成`,
                 `后台完成：${task.title}`
@@ -314,6 +404,8 @@ export default function App() {
           if (needsRefresh) {
             fetchRunsAndLatestJob();
             fetchIntegrationsStatus();
+            fetchOverviewMetrics(selectedRepo.fullName);
+            fetchRsiState(selectedRepo.fullName);
             setRefreshNonce((n) => n + 1);
           }
         }
@@ -330,10 +422,13 @@ export default function App() {
     },
     [
       fetchIntegrationsStatus,
+      fetchOverviewMetrics,
+      fetchRsiState,
       fetchRunsAndLatestJob,
       handleEnvironmentReset,
       pushErrorToast,
       pushSuccessToast,
+      selectedRepo.fullName,
     ]
   );
 
@@ -346,7 +441,15 @@ export default function App() {
     fetchIntegrationsStatus();
     fetchRunsAndLatestJob();
     fetchBackgroundTasks(false);
-  }, [fetchIntegrationsStatus, fetchRunsAndLatestJob, fetchBackgroundTasks]);
+    fetchOverviewMetrics(DEFAULT_PINNED_REPO.fullName);
+    fetchRsiState(DEFAULT_PINNED_REPO.fullName);
+  }, [
+    fetchBackgroundTasks,
+    fetchIntegrationsStatus,
+    fetchOverviewMetrics,
+    fetchRsiState,
+    fetchRunsAndLatestJob,
+  ]);
 
   const hasRunningBackgroundTask = backgroundTasks.some((t) => t.status === 'running');
 
@@ -367,8 +470,20 @@ export default function App() {
   }, []);
 
   const handleRunUpdated = useCallback((updated: PipelineRun) => {
-    setRuns((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
-    // Once a Draft PR is created or the requirement is approved/merged, never keep it in PRD draft storage
+    setRuns((prev) => {
+      const existing = prev.find((r) => r.id === updated.id);
+      const wasDelivered = Boolean(existing && (existing.mergedRelease || existing.status === 'approved'));
+      const isNowDelivered = Boolean(updated.mergedRelease || updated.status === 'approved');
+      if (isNowDelivered && !wasDelivered) {
+        setCelebratingDeliveredRunId(updated.id);
+      }
+      return prev.map((r) => (r.id === updated.id ? updated : r));
+    });
+    if (updated.mergedRelease || updated.status === 'approved') {
+      setApprovedStampRunId(updated.id);
+      soundEngine.unlock();
+      soundEngine.playStampApprove();
+    }
     if (updated.draftPr || updated.mergedRelease || updated.status === 'approved') {
       clearPrdDraft();
       hasRestoredLocalDraftRef.current = false;
@@ -381,7 +496,25 @@ export default function App() {
     }
   }, []);
 
-  // Poll running server-side analysis job regardless of which room the user is viewing
+  // Detect live transitions into delivered/approved across polls (NEVER fire on initial cold load!)
+  useEffect(() => {
+    if (!runsHydrated) return;
+    const currentDelivered = runs
+      .filter((r) => Boolean(r.mergedRelease) || r.status === 'approved')
+      .map((r) => r.id);
+    if (knownDeliveredIdsRef.current === null) {
+      knownDeliveredIdsRef.current = new Set(currentDelivered);
+      return;
+    }
+    for (const id of currentDelivered) {
+      if (!knownDeliveredIdsRef.current.has(id)) {
+        knownDeliveredIdsRef.current.add(id);
+        setCelebratingDeliveredRunId(id);
+      }
+    }
+  }, [runs, runsHydrated]);
+
+  // Poll running server-side analysis job regardless of drawer state
   useEffect(() => {
     if (!analysisJob || analysisJob.status !== 'running') return;
 
@@ -405,9 +538,11 @@ export default function App() {
           } else {
             fetchRuns();
           }
+          fetchOverviewMetrics(selectedRepo.fullName);
+          fetchRsiState(selectedRepo.fullName);
           setRefreshNonce((n) => n + 1);
           pushSuccessToast(
-            `「${nextJob.prdTitle}」已完成联合架构设计与盲测集评审，支持直接修改规划方案`,
+            `「${nextJob.prdTitle}」已完成联合架构设计与 E2E 验收用例评审，支持直接修改规划方案`,
             '分析完成'
           );
         } else if (lastJobStatusRef.current === 'running' && nextJob.status === 'error') {
@@ -420,16 +555,45 @@ export default function App() {
     }, 1200);
 
     return () => clearInterval(timer);
-  }, [analysisJob, fetchRuns, handleRunCompleted, pushErrorToast, pushSuccessToast]);
+  }, [
+    analysisJob,
+    fetchOverviewMetrics,
+    fetchRsiState,
+    fetchRuns,
+    handleRunCompleted,
+    pushErrorToast,
+    pushSuccessToast,
+    selectedRepo.fullName,
+  ]);
+
+  // Smooth closed-loop auto-advance timer for Demo Simulation mode
+  useEffect(() => {
+    if (factoryMode !== 'demo' || !demoPlaying) return;
+    const current = DEMO_PIPELINE_PHASES[demoPhaseIndex] ?? DEMO_PIPELINE_PHASES[0];
+    const timer = setTimeout(() => {
+      setDemoPhaseIndex((prev) => {
+        const next = (prev + 1) % DEMO_PIPELINE_PHASES.length;
+        if (next === 0) {
+          setDemoManualStamped(false);
+        }
+        return next;
+      });
+    }, current.durationMs);
+    return () => clearTimeout(timer);
+  }, [factoryMode, demoPlaying, demoPhaseIndex]);
 
   const handleSelectRepo = (repo: SelectedTargetRepo) => {
     setSelectedRepo(repo);
+    fetchOverviewMetrics(repo.fullName);
+    fetchRsiState(repo.fullName);
   };
 
   const handleRecordDeleted = useCallback(() => {
     fetchRunsAndLatestJob();
+    fetchOverviewMetrics(selectedRepo.fullName);
+    fetchRsiState(selectedRepo.fullName);
     setRefreshNonce((n) => n + 1);
-  }, [fetchRunsAndLatestJob]);
+  }, [fetchOverviewMetrics, fetchRsiState, fetchRunsAndLatestJob, selectedRepo.fullName]);
 
   const handlePrdDraftChange = (patch: Partial<PrdDraftState>) => {
     draftDirtyRef.current = true;
@@ -441,7 +605,6 @@ export default function App() {
     setAnalysisJob(job);
     setAnalysisJobs((prev) => [job, ...prev.filter((j) => j.id !== job.id)]);
     draftDirtyRef.current = false;
-    // Submitted requirements should no longer sit in localStorage draft cache
     clearPrdDraft();
     hasRestoredLocalDraftRef.current = false;
     setDraftSavedAt(null);
@@ -467,24 +630,106 @@ export default function App() {
     setFocusedQualityTarget(null);
   }, []);
 
-  // Match activeRun either from analysisJob.runId or selected activeRunId
   const activeRun =
     (analysisJob?.runId ? runs.find((r) => r.id === analysisJob.runId) : undefined) ??
     runs.find((r) => r.id === activeRunId) ??
     runs[0] ??
     null;
 
-  const hasInProgressRun = runs.some(
-    (r) => !r.mergedRelease && r.status !== 'approved'
-  );
-  const isRequirementInProgress =
-    analysisJob?.status === 'running' || hasInProgressRun;
+  const hasInProgressRun = runs.some((r) => !r.mergedRelease && r.status !== 'approved');
+  const isRequirementInProgress = analysisJob?.status === 'running' || hasInProgressRun;
 
-  // Navigate to New Requirement (PRD): if previous job already created a Draft PR / completed / merged,
-  // clear it immediately so the user always lands on a clean blank requirement form.
-  const handleSelectSection = useCallback(
-    (section: NavSectionId) => {
-      if (section === 'prd') {
+  // Track whether GitHub Actions Coding Runner is currently executing OR finished on the in-flight PR
+  const inFlightPrRun = useMemo(() => {
+    return (
+      runs.find(
+        (r) => !r.mergedRelease && r.status !== 'approved' && Boolean(r.draftPr?.branchName)
+      ) ?? null
+    );
+  }, [runs]);
+  const inFlightPrBranch = inFlightPrRun?.draftPr?.branchName ?? null;
+  const inFlightPrCreatedAtMs = inFlightPrRun?.draftPr?.createdAt
+    ? Date.parse(inFlightPrRun.draftPr.createdAt)
+    : 0;
+
+  useEffect(() => {
+    if (!inFlightPrBranch || !selectedRepo.fullName) {
+      setActiveCodingActionRunning(false);
+      setLatestCodingActionConclusion(null);
+      prevCodingRunningRef.current = false;
+      return;
+    }
+    let cancelled = false;
+    const checkActions = async () => {
+      try {
+        const res = await fetch(
+          `/api/github/actions-runs?repo=${encodeURIComponent(selectedRepo.fullName)}&per_page=10`
+        );
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          runs?: Array<{
+            headBranch?: string;
+            status?: string;
+            conclusion?: string | null;
+            name?: string;
+            createdAt?: string;
+          }>;
+        };
+        const list = Array.isArray(data.runs) ? data.runs : [];
+        // Match coding runs: workflow_dispatch runs execute on ref `main` with name "AutoDev AGY Coding Runner",
+        // so match by coding workflow name created AFTER this PR's creation (with 60s slack) OR direct headBranch match.
+        const codingRuns = list.filter((r) => {
+          const isCodingName = /coding\s*runner|autodev-agy\.yml/i.test(r.name || '');
+          const branchMatches = r.headBranch === inFlightPrBranch;
+          if (!isCodingName && !branchMatches) return false;
+          if (branchMatches) return true;
+          const runMs = r.createdAt ? Date.parse(r.createdAt) : 0;
+          return !inFlightPrCreatedAtMs || !runMs || runMs >= inFlightPrCreatedAtMs - 60_000;
+        });
+
+        const isRunning = codingRuns.some(
+          (r) => r.status === 'in_progress' || r.status === 'queued' || r.status === 'waiting'
+        );
+        const latestCompleted = codingRuns.find((r) => r.status === 'completed');
+        const nextConclusion = latestCompleted?.conclusion ?? null;
+
+        if (!cancelled) {
+          const wasRunning = prevCodingRunningRef.current;
+          prevCodingRunningRef.current = isRunning;
+          setActiveCodingActionRunning(isRunning);
+          setLatestCodingActionConclusion(nextConclusion);
+          // Immediately sync runs & RSI reports when Coding Runner transitions from running -> completed!
+          if (wasRunning && !isRunning) {
+            fetchRunsAndLatestJob();
+            fetchRsiState(selectedRepo.fullName);
+            fetchOverviewMetrics(selectedRepo.fullName);
+            setRefreshNonce((n) => n + 1);
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    };
+    checkActions();
+    const timer = setInterval(checkActions, 12000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [
+    fetchOverviewMetrics,
+    fetchRsiState,
+    fetchRunsAndLatestJob,
+    inFlightPrBranch,
+    inFlightPrCreatedAtMs,
+    selectedRepo.fullName,
+    refreshNonce,
+  ]);
+
+  // Open a specific station's right frosted drawer (cleaning up finished PRD draft if opening ST-01)
+  const openStationDrawer = useCallback(
+    (stationId: FactoryStationId) => {
+      if (stationId === 'ST-01') {
         const linkedRun = analysisJob?.runId
           ? runs.find((r) => r.id === analysisJob.runId) ?? analysisJob.run ?? null
           : null;
@@ -505,187 +750,312 @@ export default function App() {
           setPrdDraft({ prdTitle: '', techStackHint: '', prdContent: '' });
         }
       }
-      setActiveSection(section);
+      setDrawerStationId(stationId);
     },
     [analysisJob, runs]
   );
 
-  const handleOpenNewPrd = useCallback(() => {
-    handleSelectSection('prd');
-  }, [handleSelectSection]);
+  const handleNavigateFromTasksDrawer = useCallback(
+    (section: NavSectionId) => {
+      if (section === 'studio') {
+        setDrawerStationId(null);
+      } else {
+        openStationDrawer(ROOM_TO_STATION[section]);
+      }
+    },
+    [openStationDrawer]
+  );
 
-  const activeRoomLiveState =
-    activeSection !== 'studio'
-      ? buildRoomLiveState({
-          roomId: activeSection as StudioRoomId,
-          runs,
-          analysisJob,
-          backgroundTasks,
-          status,
-        })
-      : null;
+  const handleSelectCameraPreset = useCallback((preset: CameraPresetId) => {
+    setCameraPreset(preset);
+    setCameraPresetNonce((n) => n + 1);
+  }, []);
+
+  const handleUserOrbitStart = useCallback(() => {
+    setCameraPreset(null);
+  }, []);
+
+  const handleSwitchMode = (nextMode: FactoryMode) => {
+    setFactoryMode(nextMode);
+    if (nextMode === 'demo') {
+      setDemoPhaseIndex(0);
+      setDemoManualStamped(false);
+      setDemoPlaying(true);
+      handleSelectCameraPreset('overview');
+    } else {
+      handleSelectCameraPreset('overview');
+    }
+  };
+
+  // Compute live snapshot for current factory mode
+  const factorySnapshot = useMemo(() => {
+    if (factoryMode === 'demo') {
+      return getDemoFactorySnapshot(demoPhaseIndex, {
+        manualStampTriggered: demoManualStamped,
+      });
+    }
+    return deriveRealFactorySnapshot({
+      runs,
+      analysisJob,
+      backgroundTasks,
+      status,
+      overviewMetrics,
+      rsiReports,
+      rsiRules,
+      approvedStampRunId,
+      activeCodingActionRunning,
+      latestCodingActionConclusion,
+      celebratingDeliveredRunId,
+    });
+  }, [
+    activeCodingActionRunning,
+    analysisJob,
+    approvedStampRunId,
+    backgroundTasks,
+    celebratingDeliveredRunId,
+    demoManualStamped,
+    demoPhaseIndex,
+    factoryMode,
+    latestCodingActionConclusion,
+    overviewMetrics,
+    rsiReports,
+    rsiRules,
+    runs,
+    status,
+  ]);
+
+  const runningTasksCount =
+    backgroundTasks.filter((t) => t.status === 'running').length +
+    (analysisJob?.status === 'running' ? 1 : 0);
 
   return (
-    <div className="min-h-screen bg-[#0C0F16] studio-blueprint-floor text-[#E2E8F0] flex flex-col">
-      <StudioNavigationShell
-        activeSection={activeSection}
-        onSelectSection={handleSelectSection}
-        selectedRepo={selectedRepo}
-        backgroundTasks={backgroundTasks}
-        analysisJob={analysisJob}
-        isRequirementInProgress={isRequirementInProgress}
-        onOpenNewPrd={handleOpenNewPrd}
-        onOpenTasksDrawer={() => setTasksDrawerOpen(true)}
+    <div className="relative w-screen h-screen overflow-hidden text-[#0F172A] bg-[#B6DCF6]">
+      {/* =====================================================================
+          FULL-SCREEN 3D SUNLIT MINIATURE ARCHITECTURAL AUTOMATION VILLAGE
+         ===================================================================== */}
+      <VillageViewport
+        snapshot={factorySnapshot}
+        repoFullName={selectedRepo.fullName}
+        factoryMode={factoryMode}
+        atmospherePreset={atmospherePreset}
+        cameraPreset={cameraPreset}
+        cameraPresetNonce={cameraPresetNonce}
+        runningTasksCount={runningTasksCount}
+        focusBuildingId={focusBuildingId}
+        focusBuildingNonce={focusBuildingNonce}
+        paused={Boolean(
+          drawerStationId ||
+            tasksDrawerOpen ||
+            previewZoomOpen ||
+            reportModalRequirementId
+        )}
+        onSelectStation={openStationDrawer}
+        onSelectBackgroundTasks={() => setTasksDrawerOpen(true)}
+        onSwitchMode={handleSwitchMode}
+        onUserOrbitStart={handleUserOrbitStart}
+        onCelebrationComplete={() => setCelebratingDeliveredRunId(null)}
       />
 
-      <main className="flex-1 w-full max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-8 py-6 lg:py-7">
-        {activeSection === 'studio' ? (
-          <StudioOfficeMap
-            selectedRepo={selectedRepo}
+      {/* =====================================================================
+          COLLAPSIBLE BOTTOM-CENTER CAMERA, SEASON & DEPARTMENT CONTROL DOCK
+         ===================================================================== */}
+      <VillageBottomDock
+        factoryMode={factoryMode}
+        cameraPreset={cameraPreset}
+        atmospherePreset={atmospherePreset}
+        runningTasksCount={runningTasksCount}
+        demoPhaseIndex={demoPhaseIndex}
+        demoPlaying={demoPlaying}
+        onSelectCameraPreset={handleSelectCameraPreset}
+        onSelectAtmosphere={setAtmospherePreset}
+        onOpenStation={openStationDrawer}
+        onOpenTasks={() => setTasksDrawerOpen(true)}
+        onDemoSelectPhase={(idx) => {
+          setDemoPlaying(false);
+          setDemoPhaseIndex(idx);
+          if (idx < 6) setDemoManualStamped(false);
+        }}
+        onDemoTogglePlay={() => setDemoPlaying((p) => !p)}
+        onDemoNextStep={() => {
+          setDemoPhaseIndex((prev) => {
+            const next = (prev + 1) % DEMO_PIPELINE_PHASES.length;
+            if (next === 0) setDemoManualStamped(false);
+            return next;
+          });
+        }}
+        onDemoReplay={() => {
+          setDemoPhaseIndex(0);
+          setDemoManualStamped(false);
+          setDemoPlaying(true);
+        }}
+      />
+
+      {/* =====================================================================
+          CENTERED ARCHITECTURAL PAVILION DEPARTMENT DETAIL MODAL
+         ===================================================================== */}
+      <DepartmentPavilionModal
+        stationId={drawerStationId}
+        snapshot={factorySnapshot}
+        repoFullName={selectedRepo.fullName}
+        onSelectStation={openStationDrawer}
+        onFocusBuilding={(sid) => {
+          setCameraPreset(null);
+          setFocusBuildingId(sid);
+          setFocusBuildingNonce((n) => n + 1);
+        }}
+        onClose={() => setDrawerStationId(null)}
+      >
+        {drawerStationId === 'ST-00' && (
+          <EnvironmentView
             status={status}
-            runs={runs}
-            analysisJob={analysisJob}
-            backgroundTasks={backgroundTasks}
-            isRequirementInProgress={isRequirementInProgress}
-            onEnterRoom={(roomId) => handleSelectSection(roomId)}
-            onOpenNewPrd={handleOpenNewPrd}
-            onOpenTasksDrawer={() => setTasksDrawerOpen(true)}
+            loading={statusLoading}
+            error={statusError}
+            onRefresh={fetchIntegrationsStatus}
+            selectedRepo={selectedRepo}
+            onSelectRepo={handleSelectRepo}
+            onEnvironmentReset={handleEnvironmentReset}
+            onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            refreshNonce={refreshNonce}
+            onErrorToast={pushErrorToast}
+            onSuccessToast={pushSuccessToast}
           />
-        ) : (
-          <>
-            {activeRoomLiveState && (
-              <StudioRoomBanner
-                roomId={activeSection as StudioRoomId}
-                statusSpeech={activeRoomLiveState.speech}
-                isBusy={activeRoomLiveState.isBusy}
-                onBackToFloorplan={() => handleSelectSection('studio')}
-              />
-            )}
-
-            {activeSection === 'environment' && (
-              <EnvironmentView
-                status={status}
-                loading={statusLoading}
-                error={statusError}
-                onRefresh={fetchIntegrationsStatus}
-                selectedRepo={selectedRepo}
-                onSelectRepo={handleSelectRepo}
-                onEnvironmentReset={handleEnvironmentReset}
-                onBackgroundTaskStarted={handleBackgroundTaskStarted}
-                refreshNonce={refreshNonce}
-                onErrorToast={pushErrorToast}
-                onSuccessToast={pushSuccessToast}
-              />
-            )}
-
-            {activeSection === 'prd' && (
-              <PrdWorkspaceView
-                selectedRepo={selectedRepo}
-                activeRun={analysisJob === null ? null : activeRun}
-                analysisJob={analysisJob}
-                prdDraft={prdDraft}
-                draftSavedAt={draftSavedAt}
-                onDraftSavedAtChange={setDraftSavedAt}
-                onChangePrdDraft={handlePrdDraftChange}
-                onResetWorkspace={handleResetPrdWorkspace}
-                onJobStarted={handleJobStarted}
-                onRunUpdated={handleRunUpdated}
-                onBackgroundTaskStarted={handleBackgroundTaskStarted}
-                onGoToEnvironment={() => handleSelectSection('environment')}
-                onGoToPipeline={() => handleSelectSection('pipeline')}
-                onGoToApproval={(runId) => {
-                  setActiveRunId(runId);
-                  handleSelectSection('approval');
-                }}
-                onErrorToast={pushErrorToast}
-                onSuccessToast={pushSuccessToast}
-              />
-            )}
-
-            {activeSection === 'requirements' && (
-              <RequirementsBoardView
-                repoFullName={selectedRepo.fullName}
-                isRequirementInProgress={isRequirementInProgress}
-                refreshNonce={refreshNonce}
-                onGoToNewPrd={handleOpenNewPrd}
-                onGoToPipeline={(runId) => {
-                  setActiveRunId(runId);
-                  handleSelectSection('pipeline');
-                }}
-                onGoToApproval={(runId) => {
-                  setActiveRunId(runId);
-                  handleSelectSection('approval');
-                }}
-                onRecordDeleted={handleRecordDeleted}
-                onSuccessToast={pushSuccessToast}
-                onErrorToast={pushErrorToast}
-              />
-            )}
-
-            {activeSection === 'pipeline' && (
-              <PipelineBoardView
-                runs={runs}
-                relatedJobs={analysisJobs}
-                selectedRunId={activeRunId}
-                onSelectRun={setActiveRunId}
-                cloudflareStatus={status?.cloudflare}
-                githubConnected={Boolean(status?.github.connected)}
-                isRequirementInProgress={isRequirementInProgress}
-                onGoToNewPrd={handleOpenNewPrd}
-                onGoToApproval={(runId) => {
-                  setActiveRunId(runId);
-                  handleSelectSection('approval');
-                }}
-                onErrorToast={pushErrorToast}
-                onSuccessToast={pushSuccessToast}
-              />
-            )}
-
-            {activeSection === 'approval' && (
-              <ApprovalView
-                runs={runs}
-                selectedRunId={activeRunId}
-                onSelectRun={setActiveRunId}
-                onRunUpdated={handleRunUpdated}
-                onBackgroundTaskStarted={handleBackgroundTaskStarted}
-                isRequirementInProgress={isRequirementInProgress}
-                onGoToNewPrd={handleOpenNewPrd}
-                onGoToQuality={(target) => {
-                  setFocusedQualityTarget({
-                    reportId: target?.reportId,
-                    actionsRunId: target?.actionsRunId,
-                    nonce: Date.now(),
-                  });
-                  handleSelectSection('quality');
-                }}
-                onErrorToast={pushErrorToast}
-                onSuccessToast={pushSuccessToast}
-              />
-            )}
-
-            {activeSection === 'quality' && (
-              <QualityRsiView
-                repoFullName={selectedRepo.fullName}
-                focusedTarget={focusedQualityTarget}
-                onClearFocusedTarget={handleClearFocusedQualityTarget}
-                onBackgroundTaskStarted={handleBackgroundTaskStarted}
-                refreshNonce={refreshNonce}
-                onErrorToast={pushErrorToast}
-                onSuccessToast={pushSuccessToast}
-              />
-            )}
-          </>
         )}
-      </main>
 
+        {drawerStationId === 'ST-01' && (
+          <PrdWorkspaceView
+            selectedRepo={selectedRepo}
+            activeRun={analysisJob === null ? null : activeRun}
+            analysisJob={analysisJob}
+            prdDraft={prdDraft}
+            draftSavedAt={draftSavedAt}
+            onDraftSavedAtChange={setDraftSavedAt}
+            onChangePrdDraft={handlePrdDraftChange}
+            onResetWorkspace={handleResetPrdWorkspace}
+            onJobStarted={handleJobStarted}
+            onRunUpdated={handleRunUpdated}
+            onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            onGoToEnvironment={() => openStationDrawer('ST-00')}
+            onGoToPipeline={() => openStationDrawer('ST-02')}
+            onGoToApproval={(runId) => {
+              setActiveRunId(runId);
+              openStationDrawer('ST-04');
+            }}
+            onErrorToast={pushErrorToast}
+            onSuccessToast={pushSuccessToast}
+          />
+        )}
+
+        {drawerStationId === 'ST-02' && (
+          <PipelineBoardView
+            runs={runs}
+            relatedJobs={analysisJobs}
+            selectedRunId={activeRunId}
+            onSelectRun={setActiveRunId}
+            cloudflareStatus={status?.cloudflare}
+            githubConnected={Boolean(status?.github.connected)}
+            isRequirementInProgress={isRequirementInProgress}
+            onGoToNewPrd={() => openStationDrawer('ST-01')}
+            onGoToApproval={(runId) => {
+              setActiveRunId(runId);
+              openStationDrawer('ST-04');
+            }}
+            onErrorToast={pushErrorToast}
+            onSuccessToast={pushSuccessToast}
+          />
+        )}
+
+        {drawerStationId === 'ST-03' && (
+          <QualityRsiView
+            repoFullName={selectedRepo.fullName}
+            focusedTarget={focusedQualityTarget}
+            onClearFocusedTarget={handleClearFocusedQualityTarget}
+            onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            refreshNonce={refreshNonce}
+            onErrorToast={pushErrorToast}
+            onSuccessToast={pushSuccessToast}
+          />
+        )}
+
+        {drawerStationId === 'ST-04' && (
+          <ApprovalView
+            runs={runs}
+            selectedRunId={activeRunId}
+            onSelectRun={setActiveRunId}
+            onRunUpdated={handleRunUpdated}
+            onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            isRequirementInProgress={isRequirementInProgress}
+            onGoToNewPrd={() => openStationDrawer('ST-01')}
+            onGoToQuality={(target) => {
+              setFocusedQualityTarget({
+                reportId: target?.reportId,
+                actionsRunId: target?.actionsRunId,
+                nonce: Date.now(),
+              });
+              openStationDrawer('ST-03');
+            }}
+            onErrorToast={pushErrorToast}
+            onSuccessToast={pushSuccessToast}
+          />
+        )}
+
+        {drawerStationId === 'ST-05' && (
+          <RequirementsBoardView
+            repoFullName={selectedRepo.fullName}
+            isRequirementInProgress={isRequirementInProgress}
+            refreshNonce={refreshNonce}
+            onGoToNewPrd={() => openStationDrawer('ST-01')}
+            onGoToPipeline={(runId) => {
+              setActiveRunId(runId);
+              openStationDrawer('ST-02');
+            }}
+            onGoToApproval={(runId) => {
+              setActiveRunId(runId);
+              openStationDrawer('ST-04');
+            }}
+            onRecordDeleted={handleRecordDeleted}
+            onSuccessToast={pushSuccessToast}
+            onErrorToast={pushErrorToast}
+          />
+        )}
+      </DepartmentPavilionModal>
+
+      {/* Preview Zoom Modal (ST-04) */}
+      <PreviewZoomModal
+        open={previewZoomOpen}
+        mode={factoryMode}
+        previewUrl={factorySnapshot.st04.previewUrl}
+        title={factorySnapshot.st04.previewTitle}
+        subtitle={factorySnapshot.st04.previewSubtitle}
+        prNumber={factorySnapshot.st04.prNumber}
+        onClose={() => setPreviewZoomOpen(false)}
+      />
+
+      {/* Direct Full Requirement Report Modal (ST-05 1-Click) */}
+      {reportModalRequirementId && (
+        <RequirementReportModal
+          requirementId={reportModalRequirementId}
+          onClose={() => setReportModalRequirementId(null)}
+          onSuccessToast={pushSuccessToast}
+          onErrorToast={pushErrorToast}
+        />
+      )}
+
+      {/* Detached Background Operations 3D Cleanroom Glass Modal */}
       <BackgroundTasksPanel
         open={tasksDrawerOpen}
         onClose={() => setTasksDrawerOpen(false)}
         tasks={backgroundTasks}
         runningAnalysisJob={analysisJob}
-        onNavigateToRoom={(room) => handleSelectSection(room)}
+        repoFullName={selectedRepo.fullName}
+        onFocusOpsBuilding={() => {
+          setCameraPreset(null);
+          setFocusBuildingId('BG-OPS');
+          setFocusBuildingNonce((n) => n + 1);
+        }}
+        onNavigateToRoom={handleNavigateFromTasksDrawer}
       />
 
+      {/* Cleanroom Toast Notifications */}
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>
   );

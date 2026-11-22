@@ -236,29 +236,29 @@ export function OverviewDashboard({
       aria-label="指挥大厅墙面数据大屏"
       className="studio-bigscreen-bezel rounded-2xl overflow-hidden"
     >
-      {/* Top Studio Wall Light Bar */}
+      {/* Top Precision Signal Hairline */}
       <div
         aria-hidden="true"
-        className="h-1 w-full bg-gradient-to-r from-[#F59E0B]/80 via-[#38BDF8]/50 to-[#A78BFA]/70"
+        className="h-1 w-full bg-gradient-to-r from-[#2563EB] via-[#059669] to-[#D97706]"
       />
 
-      {/* Big-Screen Bezel Header Strip */}
-      <div className="px-5 py-3.5 border-b border-[#232D40] bg-[#0B101A]/90 flex flex-wrap items-center justify-between gap-3">
+      {/* Cleanroom Big-Screen Header Strip */}
+      <div className="px-5 py-3.5 border-b border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2.5 text-[13px]">
-          <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#F59E0B]/40 bg-[#F59E0B]/12 text-[#FBBF24] shrink-0">
+          <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#BFDBFE] bg-[#EFF6FF] text-[#2563EB] shrink-0">
             <Monitor className="h-4 w-4" />
           </span>
-          <h2 className="font-display text-[15px] font-semibold text-[#F8FAFC] tracking-tight">
-            指挥大厅 · 办公室全景数据大屏
+          <h2 className="font-display text-[15px] font-bold text-[#0F172A] tracking-tight">
+            ST-00 指挥调度中心 · 精密产线数据大屏
           </h2>
-          <span aria-hidden="true" className="text-[#4B5870]">·</span>
-          <span className="text-[12px] text-[#8E9DB5]">
+          <span aria-hidden="true" className="text-[#CBD5E1]">·</span>
+          <span className="text-[12px] text-[#64748B]">
             近 7 日全局研发效能与 Token 算力实时遥测
           </span>
         </div>
         {metrics?.generatedAt && (
-          <span className="font-mono text-[11px] tabular-nums text-[#8E9DB5]">
-            大屏同步于{' '}
+          <span className="font-mono text-[11px] tabular-nums text-[#64748B]">
+            同步于{' '}
             {new Date(metrics.generatedAt).toLocaleTimeString('zh-CN', { hour12: false })}
           </span>
         )}

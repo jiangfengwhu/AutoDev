@@ -1472,6 +1472,7 @@ async function startServer() {
           : Promise.resolve({
               closedPrNumbers: [],
               deletedBranches: [],
+              cleanedIssues: [],
               remainingBranches: [],
               deletedActionRuns: 0,
               skippedActiveActionRuns: 0,
@@ -1548,7 +1549,11 @@ async function startServer() {
           if (clearState) parts.push('状态分支已清空');
           if (deleteActionRuns) parts.push(`删除 ${payload.github.deletedActionRuns} 条 Actions`);
           if (resetGithubPrsAndBranches) {
-            parts.push(`关 ${payload.github.closedPrNumbers.length} PR / 删 ${payload.github.deletedBranches.length} 分支`);
+            const issueCount = payload.github.cleanedIssues?.length ?? 0;
+            parts.push(
+              `关 ${payload.github.closedPrNumbers.length} PR / 删 ${payload.github.deletedBranches.length} 分支` +
+                (issueCount > 0 ? ` / 清 ${issueCount} 个追踪 Issue` : '')
+            );
           }
           return {
             summary: parts.join(' · ') || '测试环境重置完成',

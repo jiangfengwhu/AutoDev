@@ -209,14 +209,13 @@ test('buildPrArtifacts serializes docs/spec.json, docs/prd.md, and read-only tes
   assert.equal(parsedSpec.runId, 'run-001');
   assert.equal(parsedSpec.e2eTestPath, 'tests/e2e/run-001.spec.ts');
   assert.equal(parsedSpec.e2eVaultPath, '.autodev-e2e-vault/run-001/e2e.spec.ts');
-  assert.equal(parsedSpec.blindE2eVerification, true);
+  assert.equal(parsedSpec.blindE2eVerification, false);
   assert.equal(parsedSpec.archivedSpecPath, 'docs/iterations/run-001-spec.json');
   assert.equal(parsedSpec.tasks.length, 1);
   assert.ok(artifacts.prdMdContent.includes('退款后优惠券是否返还未定义'));
   assert.ok(artifacts.e2eTestContent.includes('AUTODEV-READONLY-TEST-CONTRACT'));
   assert.ok(artifacts.prBody.includes('TASK-1'));
-  assert.ok(artifacts.prBody.includes('盲测隔离机制'));
-  assert.ok(!artifacts.prBody.includes('tests/e2e/run-001.spec.ts'), 'PR body should not expose blind E2E test path');
+  assert.ok(artifacts.prBody.includes('tests/e2e/run-001.spec.ts'), 'PR body should transparently expose committed E2E test path');
 
   // Idempotent read-only header
   const doubleWrapped = ensureReadOnlyTestHeader(
@@ -253,7 +252,6 @@ test('buildAgyRunnerWorkflowYaml enforces direct-wait no-timeout self-push, blin
   const {
     AGY_AGENT_MODES,
     AGY_AVAILABLE_MODELS,
-    AUTODEV_E2E_VAULT_PREFIX,
     AUTODEV_LIVE_LOG_ISSUE_TITLE,
     DEFAULT_AGY_MODE,
     DEFAULT_AGY_MODEL,
@@ -291,20 +289,21 @@ test('buildAgyRunnerWorkflowYaml enforces direct-wait no-timeout self-push, blin
   assert.ok(yaml.includes('--body-file /tmp/autodev-pr-summary.md'));
   assert.ok(!yaml.includes('BODY="### AutoDev'));
 
-  // Verify embedded Direct-Wait & Blind E2E Verification JS script has valid ESM syntax and core invariants
+  // Verify embedded Direct-Wait & Transparent E2E Verification JS script has valid ESM syntax and core invariants
   const harnessMatch = yaml.match(/<<'BLIND_RUNNER_EOF'\n([\s\S]*?)\n\s*BLIND_RUNNER_EOF/);
   assert.ok(harnessMatch, 'Expected embedded AGY direct-wait runner script');
   const harnessCode = harnessMatch[1].replace(/^ {10}/gm, '');
   assert.ok(harnessCode.includes('process.cwd()'));
   assert.ok(harnessCode.includes('AUTODEV-LIVE-LOG:'));
-  assert.ok(harnessCode.includes('skip-worktree'), 'Must hide existing tests/e2e during coding stage');
-  assert.ok(harnessCode.includes('movePathSafe') && harnessCode.includes("err.code === 'EXDEV'") && harnessCode.includes('fs.cpSync'), 'Must handle cross-device EXDEV moves between workspace and /tmp');
-  assert.ok(harnessCode.includes('buildRepairFeedbackPrompt') && harnessCode.includes('while (verify && !verify.allPassed && repairRounds < maxRepairRounds)'), 'Must feed verification failures back to original AGY session for bounded auto-repair');
+  assert.ok(!harnessCode.includes('skip-worktree'), 'Must NOT hide tests/e2e with skip-worktree after removing blind isolation');
+  assert.ok(!harnessCode.includes('hydrateVaultE2eTests'), 'Must NOT hydrate blind vault tests; E2E tests live transparently in repo');
+  assert.ok(harnessCode.includes('const activeE2ePath ='), 'Must bind activeE2ePath from ACTIVE_E2E_PATH');
+  assert.ok(!harnessCode.includes('e2eTestPath'), 'Must NOT reference undefined e2eTestPath identifier');
+  assert.ok(harnessCode.includes('buildRepairFeedbackPrompt') && harnessCode.includes('while (verify && !verify.allPassed && repairRounds < maxRepairRounds)'), 'Must feed verification failures back to original AGY session for bounded root-cause auto-repair');
   assert.ok(harnessCode.includes('ev.result?.conversation_id') && yaml.includes('max_repair_rounds:'), 'Must capture nested conversation_id and expose max_repair_rounds input');
-  assert.ok(harnessCode.includes(AUTODEV_E2E_VAULT_PREFIX), 'Must hydrate blind E2E tests from Vault after coding');
+  assert.ok(harnessCode.includes('root-cause auto-repair'), 'Must guide AGY to triage application bug vs test script defect');
   assert.ok(harnessCode.includes('git push origin HEAD:'), 'Must instruct AGY to push directly and keep idempotent fallback');
   assert.ok(harnessCode.includes('detectAndResolveAgyCapabilities'), 'Must sync VPS agy models & agents');
-  assert.ok(harnessCode.includes('hydrateVaultE2eTests'), 'Must hydrate blind E2E tests after coding');
   assert.ok(harnessCode.includes("'--output-format', 'stream-json'"));
   assert.ok(yaml.includes('npm ci --no-audit --no-fund'));
   const { execFileSync } = await import('node:child_process');
@@ -1935,6 +1934,687 @@ test('backgroundTaskStore runs detached tasks, deduplicates active dedupeKey, an
 
   clearBackgroundTasksForTest();
 });
+
+test('studioWorldData: spawn point, corridor, and all 6 room interaction spots are walkable while walls & desks block movement', async () => {
+  const {
+    PLAYER_SPAWN_WORLD,
+    STUDIO_WORLD_ROOMS,
+    TILE_SIZE,
+    isWalkableWorldPoint,
+    getRoomAtWorldPoint,
+    findNearbyInteractableRoom,
+    getCorridorRouteWaypoints,
+  } = await import('../game/studioWorldData');
+
+  assert.equal(isWalkableWorldPoint(PLAYER_SPAWN_WORLD.x, PLAYER_SPAWN_WORLD.y), true);
+  assert.equal(isWalkableWorldPoint(PLAYER_SPAWN_WORLD.x + 120, PLAYER_SPAWN_WORLD.y), true);
+  assert.equal(isWalkableWorldPoint(PLAYER_SPAWN_WORLD.x - 120, PLAYER_SPAWN_WORLD.y), true);
+  assert.equal(isWalkableWorldPoint(PLAYER_SPAWN_WORLD.x, PLAYER_SPAWN_WORLD.y - 64), true);
+
+  assert.equal(isWalkableWorldPoint(8, PLAYER_SPAWN_WORLD.y), false);
+  assert.equal(isWalkableWorldPoint(12 * TILE_SIZE, 5 * TILE_SIZE), false);
+  assert.equal(isWalkableWorldPoint(24 * TILE_SIZE, 16 * TILE_SIZE), false);
+
+  assert.equal(STUDIO_WORLD_ROOMS.length, 6);
+  for (const room of STUDIO_WORLD_ROOMS) {
+    const doorX = room.doorCol * TILE_SIZE;
+    const doorY = room.doorRow * TILE_SIZE;
+    const interactX = room.interactCol * TILE_SIZE;
+    const interactY = room.interactRow * TILE_SIZE;
+
+    assert.equal(
+      isWalkableWorldPoint(doorX, doorY),
+      true,
+      `Doorway for ${room.roomCode} should be walkable`
+    );
+    assert.equal(
+      isWalkableWorldPoint(interactX, interactY),
+      true,
+      `Interaction spot for ${room.roomCode} should be walkable`
+    );
+    assert.equal(
+      isWalkableWorldPoint(room.npcCol * TILE_SIZE, room.npcRow * TILE_SIZE),
+      false,
+      `NPC desk center for ${room.roomCode} should block walking through`
+    );
+
+    const inside = getRoomAtWorldPoint(interactX, interactY);
+    assert.equal(inside?.roomId, room.roomId);
+
+    const nearby = findNearbyInteractableRoom(interactX, interactY);
+    assert.equal(nearby?.room.roomId, room.roomId);
+  }
+
+  const route = getCorridorRouteWaypoints('prd', 'approval');
+  assert.equal(route.length, 4);
+  assert.equal(route[1].y, 11 * TILE_SIZE);
+  assert.equal(route[2].y, 11 * TILE_SIZE);
+});
+
+test('studioWorldData: computeStudioProgression derives real XP, level, and active main quest from workflow state', async () => {
+  const { computeStudioProgression } = await import('../game/studioWorldData');
+
+  const fresh = computeStudioProgression({
+    runs: [],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: {
+      github: { connected: true, repos: [] },
+      cloudflare: { connected: true },
+      gemini: { configured: true },
+    } as never,
+  });
+  assert.equal(fresh.level, 1);
+  assert.equal(fresh.totalXp, 0);
+  assert.equal(fresh.activeQuest.targetRoomId, 'prd');
+
+  const disconnected = computeStudioProgression({
+    runs: [],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: {
+      github: { connected: false, repos: [] },
+      cloudflare: { connected: false },
+      gemini: { configured: false },
+    } as never,
+  });
+  assert.equal(disconnected.activeQuest.targetRoomId, 'environment');
+  assert.equal(disconnected.activeQuest.isUrgent, true);
+
+  const activeWithDelivered = computeStudioProgression({
+    runs: [
+      {
+        id: 'run-delivered',
+        createdAt: '2026-11-20T00:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '已上线需求',
+        prdContent: '内容',
+        status: 'approved',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 1, prUrl: 'https://github.com/x', branchName: 'autodev/feat-1', baseBranch: 'main', commitSha: 'abc', filesCommitted: [], createdAt: '2026-11-20T00:00:00Z' },
+        mergedRelease: { prNumber: 1, prUrl: 'https://github.com/x', mergeCommitSha: 'def', commitUrl: 'https://github.com/c', baseBranch: 'main', mergeMethod: 'squash', mergedAt: '2026-11-20T01:00:00Z' },
+      },
+      {
+        id: 'run-preview-ready',
+        createdAt: '2026-11-21T00:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '待验收需求',
+        prdContent: '内容',
+        status: 'pr_created',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 2, prUrl: 'https://github.com/x2', branchName: 'autodev/feat-2', baseBranch: 'main', commitSha: 'abc2', filesCommitted: [], createdAt: '2026-11-21T00:00:00Z' },
+        previewDeployment: { url: 'https://preview.pages.dev', workerName: 'atd-v1-pr2', branchName: 'autodev/feat-2', deployedAt: '2026-11-21T00:10:00Z' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: {
+      github: { connected: true, repos: [] },
+      cloudflare: { connected: true },
+      gemini: { configured: true },
+    } as never,
+  });
+
+  assert.equal(activeWithDelivered.deliveredCount, 1);
+  assert.ok(activeWithDelivered.totalXp >= 400);
+  assert.ok(activeWithDelivered.level >= 2);
+  assert.equal(activeWithDelivered.activeQuest.targetRoomId, 'approval');
+  assert.equal(activeWithDelivered.activeQuest.isUrgent, true);
+});
+
+test('factoryPipelineState: deriveRealFactorySnapshot maps real telemetry, rack LEDs, rework loop, approval, and delivered states', async () => {
+  const { buildRackLeds, deriveRealFactorySnapshot, FACTORY_STATIONS } = await import(
+    './factoryPipelineState'
+  );
+
+  // Verify department-only naming across all 6 departments (no person names)
+  assert.equal(FACTORY_STATIONS['ST-00'].title, '指挥调度中心');
+  assert.equal(FACTORY_STATIONS['ST-01'].title, '架构策划部');
+  assert.equal(FACTORY_STATIONS['ST-02'].title, 'Gemini 编码圣殿');
+  assert.equal(FACTORY_STATIONS['ST-03'].title, '质检进化圣殿');
+  assert.equal(FACTORY_STATIONS['ST-04'].title, '验收签批部');
+  assert.equal(FACTORY_STATIONS['ST-05'].title, '项目档案部');
+
+  // 16 staggered rack LEDs reflecting live connectivity
+  const leds = buildRackLeds(
+    {
+      github: { connected: true, repos: [] },
+      cloudflare: { connected: false },
+      gemini: { configured: true },
+    } as never,
+    1
+  );
+  assert.equal(leds.length, 16);
+  assert.equal(leds.find((l) => l.label === 'GH01')?.tone, 'emerald');
+  assert.equal(leds.find((l) => l.label === 'CFW1')?.tone, 'slate');
+  assert.equal(leds.find((l) => l.label === 'AGY1')?.tone, 'blue');
+
+  // Rework loop activation when run has changes_requested
+  const reworkSnap = deriveRealFactorySnapshot({
+    runs: [
+      {
+        id: 'run-rework',
+        createdAt: '2026-11-21T00:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '订单返工需求',
+        prdContent: '内容',
+        status: 'changes_requested',
+        architect: {
+          ambiguities: [
+            { id: 'a1', title: '并发锁范围', severity: 'high', detail: '锁粒度未明确', clarificationSuggestion: '按订单ID加锁' },
+          ],
+          architectureSummary: 'summary',
+          techDecisions: ['幂等锁'],
+          apiContracts: [],
+          tasks: [
+            { id: 'T1', title: '锁表', module: 'db', description: 'd', dependsOn: [], acceptanceCriteria: ['c1'], estimatedComplexity: 'S' },
+          ],
+        },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 77, prUrl: 'https://github.com/x/77', branchName: 'autodev/feat-77', baseBranch: 'main', commitSha: 'aaa', filesCommitted: [], createdAt: '2026-11-21T00:00:00Z' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: { github: { connected: true, repos: [] }, cloudflare: { connected: true }, gemini: { configured: true } } as never,
+    overviewMetrics: {
+      repoFullName: 'jiangfengwhu/atd-v1',
+      daily: [{ dateKey: '2026-11-21', label: '今日', total: 5, succeeded: 2, failed: 3, successRate: 40, totalTokens: 519000 }],
+      summary: { overallSuccessRate: 40, totalTokens: 519000, avgDurationMinutes: 4.5 },
+    } as never,
+    rsiReports: [],
+    rsiRules: [],
+  });
+
+  assert.equal(reworkSnap.tracks.reworkSt03ToSt02, 'rework');
+  assert.equal(reworkSnap.stationStates['ST-02'].led, 'rework');
+  assert.equal(reworkSnap.st02.isSparking, true);
+  assert.equal(reworkSnap.workpiece?.location, 'rework_3_2');
+  assert.equal(reworkSnap.st00.successRatePct, 40);
+  assert.equal(reworkSnap.st00.totalTokens, 519000);
+  assert.equal(reworkSnap.st01.p0Count, 1);
+
+  // Historical delivered runs without active celebration return cleanly to idle ST-00 with zero lingering workpiece
+  const deliveredRun = {
+    id: 'run-done',
+    createdAt: '2026-11-20T00:00:00Z',
+    repoFullName: 'jiangfengwhu/atd-v1',
+    defaultBranch: 'main',
+    prdTitle: '已归档功能',
+    prdContent: '内容',
+    status: 'approved' as const,
+    architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+    qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+    qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+    draftPr: { prNumber: 88, prUrl: 'https://github.com/x/88', branchName: 'autodev/feat-88', baseBranch: 'main', commitSha: 'bbb', filesCommitted: [], createdAt: '2026-11-20T00:00:00Z' },
+    mergedRelease: { prNumber: 88, prUrl: 'https://github.com/x/88', mergeCommitSha: 'ccc', commitUrl: 'https://github.com/c', baseBranch: 'main', mergeMethod: 'squash' as const, mergedAt: '2026-11-20T01:00:00Z' },
+  };
+  const idleAfterDeliveredSnap = deriveRealFactorySnapshot({
+    runs: [deliveredRun],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+  });
+  assert.equal(idleAfterDeliveredSnap.activeStationId, 'ST-00');
+  assert.equal(idleAfterDeliveredSnap.workpiece, null);
+  assert.equal(idleAfterDeliveredSnap.justDelivered, false);
+  assert.equal(idleAfterDeliveredSnap.st05.deliveredCount, 1);
+
+  // Live in-session delivery (celebratingDeliveredRunId set) enters ST-05 archive + triggers celebration
+  const deliveredSnap = deriveRealFactorySnapshot({
+    runs: [deliveredRun],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+    celebratingDeliveredRunId: 'run-done',
+  });
+  assert.equal(deliveredSnap.activeStationId, 'ST-05');
+  assert.equal(deliveredSnap.justDelivered, true);
+  assert.equal(deliveredSnap.st05.deliveredCount, 1);
+  assert.equal(deliveredSnap.st05.activeDrawerIndex, 0);
+  assert.equal(deliveredSnap.tracks.st04ToSt05, 'passed');
+});
+
+test('factoryPipelineState: getDemoFactorySnapshot drives all 8 closed-loop stages with sparks, rework loop, stamp, and archive drawer', async () => {
+  const { DEMO_PIPELINE_PHASES, getDemoFactorySnapshot } = await import(
+    './factoryPipelineState'
+  );
+  assert.equal(DEMO_PIPELINE_PHASES.length, 8);
+
+  // Phase 1: Coding Round 1 -> sparks active, rework dormant
+  const p1 = getDemoFactorySnapshot(1);
+  assert.equal(p1.st02.isSparking, true);
+  assert.equal(p1.tracks.reworkSt03ToSt02, 'idle');
+  assert.equal(p1.workpiece?.location, 'ST-02');
+
+  // Phase 3: REWORK LOOP -> red conduit active, workpiece rides rework_3_2
+  const p3 = getDemoFactorySnapshot(3);
+  assert.equal(p3.tracks.reworkSt03ToSt02, 'rework');
+  assert.equal(p3.workpiece?.location, 'rework_3_2');
+  assert.equal(p3.st03.cells.some((c) => c.status === 'fail'), true);
+
+  // Phase 4: Coding Round 2 -> sparks active with Round 2 diff patch
+  const p4 = getDemoFactorySnapshot(4);
+  assert.equal(p4.st02.isSparking, true);
+  assert.equal(p4.st02.repairRound, 2);
+  assert.ok(p4.st02.diffLines.some((l) => l.text.includes('idempotencyKey')));
+
+  // Phase 6: ST-04 Awaiting approval -> manual stamp slams emerald APPROVED immediately
+  const p6Waiting = getDemoFactorySnapshot(6, { manualStampTriggered: false });
+  assert.equal(p6Waiting.st04.isAwaitingApproval, true);
+  assert.equal(p6Waiting.st04.isApprovedStamped, false);
+  const p6Stamped = getDemoFactorySnapshot(6, { manualStampTriggered: true });
+  assert.equal(p6Stamped.st04.isAwaitingApproval, false);
+  assert.equal(p6Stamped.st04.isApprovedStamped, true);
+  assert.equal(p6Stamped.tracks.st04ToSt05, 'active');
+
+  // Phase 7: ST-05 Archive -> drawer 0 slides open, count increments to 13
+  const p7 = getDemoFactorySnapshot(7);
+  assert.equal(p7.st05.activeDrawerIndex, 0);
+  assert.equal(p7.st05.deliveredCount, 13);
+  assert.equal(p7.workpiece?.location, 'ST-05');
+});
+
+test('villageConfig: zero-crossing conveyors, state-driven parcel journey, 4-season cycle, and demo/real HUD derivation work cleanly', async () => {
+  const {
+    CONVEYOR_JUNCTIONS,
+    CONVEYOR_TRACKS,
+    PARCEL_ROUTE_SEGMENTS,
+    WORKSHOPS,
+    computeStageJourneyProgress,
+    createSeededRandom,
+    deriveVillageHudState,
+    evaluateAtmosphere,
+    samplePolylinePoint,
+  } = await import('../scene/villageConfig');
+  const { getDemoFactorySnapshot, deriveRealFactorySnapshot } = await import(
+    './factoryPipelineState'
+  );
+
+  // 1. 3 west cottages (SPEC/GATE/ARCHIVE) + 1 standalone NE telemetry station (BG-OPS, no conveyor) + 0 junction houses + 6 direct zero-crossing tracks
+  assert.equal(WORKSHOPS.length, 4);
+  assert.deepEqual(
+    WORKSHOPS.map((w) => w.id),
+    ['ST-01', 'ST-04', 'ST-05', 'BG-OPS']
+  );
+  assert.equal(WORKSHOPS.find((w) => w.id === 'BG-OPS')?.conveyorId, '');
+  assert.equal(CONVEYOR_JUNCTIONS.length, 0);
+  assert.equal(CONVEYOR_TRACKS.length, 6);
+  assert.deepEqual(PARCEL_ROUTE_SEGMENTS['track-st01-hub'], ['track-st01-hub']);
+  assert.deepEqual(PARCEL_ROUTE_SEGMENTS['track-st05-hub'], ['track-st05-hub']);
+  for (const tid of ['track-st01-hub', 'track-st04-hub', 'track-st05-hub']) {
+    const t = CONVEYOR_TRACKS.find((item) => item.id === tid);
+    assert.ok(t, `Missing track ${tid}`);
+    assert.equal(t.points[0].x, -12.65);
+    assert.equal(t.points[0].y, 0.62);
+  }
+
+  // 2. State-driven one-shot parcel journey eases during transit and docks cleanly at rest
+  const midTransit = computeStageJourneyProgress(1.0, 0.1, 0.9, 2.0);
+  assert.equal(midTransit.inTransit, true);
+  assert.ok(midTransit.progress > 0.45 && midTransit.progress < 0.55);
+  const docked = computeStageJourneyProgress(3.0, 0.1, 0.9, 2.0);
+  assert.equal(docked.inTransit, false);
+  assert.equal(docked.progress, 0.9);
+
+  // 3. Deterministic Mulberry32 PRNG produces identical sequences for the same seed
+  const r1 = createSeededRandom(42);
+  const r2 = createSeededRandom(42);
+  assert.equal(r1(), r2());
+  assert.equal(r1(), r2());
+
+  // 4. Curved conveyor spline point & normalized tangent
+  const track = CONVEYOR_TRACKS[0];
+  const mid = samplePolylinePoint(track.points, 0.5);
+  const tanLen = Math.hypot(mid.tangent.x, mid.tangent.y, mid.tangent.z);
+  assert.ok(Math.abs(tanLen - 1) < 1e-4);
+  assert.ok(Math.abs(mid.position.y - 0.62) < 1e-4);
+
+  // 5. 4-Season Atmosphere presets & continuous cycle interpolation
+  const day = evaluateAtmosphere('day', 0);
+  assert.equal(day.nightFactor, 0);
+  assert.equal(day.snowFactor, 0);
+  const night = evaluateAtmosphere('night', 0);
+  assert.equal(night.nightFactor, 1);
+  const snow = evaluateAtmosphere('snow', 0);
+  assert.equal(snow.snowFactor, 1);
+  const cycleLate = evaluateAtmosphere('cycle', 29);
+  assert.ok(cycleLate.snowFactor >= 0 && cycleLate.snowFactor <= 1);
+
+  // 6. Demo mode Phase 0 transits once then docks cleanly & marks ST-01 as working
+  const hudP0Moving = deriveVillageHudState(getDemoFactorySnapshot(0), 1.5, 0.8);
+  assert.equal(hudP0Moving.comicBurst.visible, true);
+  assert.equal(hudP0Moving.comicBurst.anchorBuilding, 'ST-01');
+  assert.equal(hudP0Moving.hasActiveTransit, true);
+  assert.deepEqual(hudP0Moving.workingBuildingIds, ['ST-01']);
+  assert.ok(hudP0Moving.parcels.some((p) => p.isHero && p.trackId === 'track-st01-hub' && p.inTransit));
+
+  const hudP0Docked = deriveVillageHudState(getDemoFactorySnapshot(0), 5.0, 4.0);
+  assert.equal(hudP0Docked.hasActiveTransit, false);
+  assert.ok(hudP0Docked.parcels.every((p) => !p.inTransit));
+
+  // Demo Phase 3 (rework loop): ONLY AI-CODER works on rework repair (never dual AI-CLOUD + AI-CODER)
+  const hudP3 = deriveVillageHudState(getDemoFactorySnapshot(3), 4.0, 1.0);
+  assert.equal(hudP3.reworkActive, true);
+  assert.equal(hudP3.comicBurst.visible, true);
+  assert.equal(hudP3.comicBurst.tone, 'red');
+  assert.equal(hudP3.comicBurst.anchorBuilding, 'AI-CLOUD');
+  assert.equal(hudP3.terminal.anchorBuilding, 'AI-CLOUD');
+  assert.deepEqual(hudP3.workingBuildingIds, ['AI-CODER']);
+
+  // Demo Phase 7: 2-leg transit into ST-05 vault -> parcel disappears & village celebration triggers
+  const hudP7Transit = deriveVillageHudState(getDemoFactorySnapshot(7), 9.0, 2.2);
+  assert.equal(hudP7Transit.hasActiveTransit, true);
+  assert.equal(hudP7Transit.parcels.length, 1);
+  assert.equal(hudP7Transit.parcels[0].trackId, 'track-st05-hub');
+  assert.equal(hudP7Transit.celebrationActive, false);
+
+  const hudP7Celebrate = deriveVillageHudState(getDemoFactorySnapshot(7), 12.0, 4.2);
+  assert.equal(hudP7Celebrate.activePipelinesCount, 1);
+  assert.equal(hudP7Celebrate.sanctuaryCelebrate, 'coder');
+  assert.equal(hudP7Celebrate.hasActiveTransit, false);
+  assert.equal(hudP7Celebrate.parcels.length, 0);
+  assert.equal(hudP7Celebrate.celebrationActive, true);
+  assert.deepEqual(hudP7Celebrate.workingBuildingIds, ['ST-05']);
+
+  // 7. Real production idle snapshot has ZERO phantom looping parcels & hides floating terminal card
+  const realIdleSnap = deriveRealFactorySnapshot({
+    runs: [],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+  });
+  const realIdleHud = deriveVillageHudState(realIdleSnap, 2.0, 2.0);
+  assert.equal(realIdleHud.parcels.length, 0);
+  assert.equal(realIdleHud.hasActiveTransit, false);
+  assert.equal(realIdleHud.terminal.visible, false);
+
+  // 8. Real production active run drives a single state-linked parcel & marks active working buildings
+  const realActiveSnap = deriveRealFactorySnapshot({
+    runs: [
+      {
+        id: 'run-live-1',
+        createdAt: '2026-11-21T00:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '实时状态需求',
+        prdContent: '内容',
+        status: 'changes_requested',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 91, prUrl: 'https://github.com/x/91', branchName: 'autodev/feat-91', baseBranch: 'main', commitSha: 'ddd', filesCommitted: [], createdAt: '2026-11-21T00:00:00Z' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+  });
+  const realActiveMoving = deriveVillageHudState(realActiveSnap, 1.0, 0.8);
+  assert.equal(realActiveMoving.parcels.length, 1);
+  assert.equal(realActiveMoving.parcels[0].trackId, 'track-rework-loop');
+  assert.equal(realActiveMoving.hasActiveTransit, true);
+  assert.equal(realActiveMoving.terminal.visible, false);
+  assert.deepEqual(realActiveMoving.workingBuildingIds, ['AI-CODER']);
+  assert.equal(realActiveMoving.workingStageLabel, '返工修复中');
+  assert.equal(realActiveMoving.comicBurst.visible, false);
+  const realActiveDocked = deriveVillageHudState(realActiveSnap, 5.0, 4.0);
+  assert.equal(realActiveDocked.hasActiveTransit, false);
+
+  // 9. Fresh PR with older unrelated failed RSI report must stay in normal ST-02 coding (NO false QA interception popup!)
+  const freshPrSnap = deriveRealFactorySnapshot({
+    runs: [
+      {
+        id: 'run-fresh-pr',
+        createdAt: '2026-11-22T02:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '全新需求 PR',
+        prdContent: '内容',
+        status: 'pr_created',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 92, prUrl: 'https://github.com/x/92', branchName: 'autodev/feat-92', baseBranch: 'main', commitSha: 'eee', filesCommitted: [], createdAt: '2026-11-22T02:01:00Z' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [
+      {
+        id: 'rep-old-failed',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        actionsRunId: 555,
+        workflowName: 'AutoDev AGY Coding Runner',
+        branch: 'autodev/feat-old-88',
+        prNumber: 88,
+        kind: 'e2e',
+        status: 'failed',
+        total: 10,
+        passed: 9,
+        failed: 1,
+        skipped: 0,
+        passRate: 90,
+        durationMs: 12000,
+        executedAt: '2026-11-21T23:00:00Z',
+        summary: '9/10',
+        cases: [],
+      },
+    ],
+    rsiRules: [],
+  });
+  assert.equal(freshPrSnap.activeStationId, 'ST-02');
+  assert.equal(freshPrSnap.tracks.reworkSt03ToSt02, 'idle');
+  const freshPrHud = deriveVillageHudState(freshPrSnap, 1.0, 0.8);
+  assert.deepEqual(freshPrHud.workingBuildingIds, ['AI-CODER']);
+  assert.equal(freshPrHud.workingStageLabel, '编码开发中');
+  assert.equal(freshPrHud.reworkActive, false);
+  assert.equal(freshPrHud.comicBurst.visible, false);
+
+  // 10. Running create_draft_pr background task displays "创建 PR 中" instead of "架构规划中"
+  const creatingPrSnap = deriveRealFactorySnapshot({
+    runs: [
+      {
+        id: 'run-planned-1',
+        createdAt: '2026-11-22T03:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '待建 PR 需求',
+        prdContent: '内容',
+        status: 'analyzed',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [
+      {
+        id: 'bg-pr-1',
+        kind: 'create_draft_pr',
+        title: '创建 Draft PR',
+        roomId: 'prd',
+        status: 'running',
+        progressMessage: '正在提交文档并创建 Draft PR…',
+        startedAt: '2026-11-22T03:01:00Z',
+        updatedAt: '2026-11-22T03:01:02Z',
+      },
+    ],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+  });
+  assert.equal(creatingPrSnap.activeStationId, 'ST-01');
+  assert.equal(creatingPrSnap.stationStates['ST-01'].statusText, '创建 PR 中');
+  const creatingPrHud = deriveVillageHudState(creatingPrSnap, 1.0, 0.5);
+  assert.deepEqual(creatingPrHud.workingBuildingIds, ['ST-01']);
+  assert.equal(creatingPrHud.workingStageLabel, '创建 PR 中');
+
+  // 11. After QA interception, when coding runner resumes (activeCodingActionRunning=true), ONLY AI-CODER works
+  const reworkCodingSnap = deriveRealFactorySnapshot({
+    runs: [
+      {
+        id: 'run-rework-active',
+        createdAt: '2026-11-22T04:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '返工再编码需求',
+        prdContent: '内容',
+        status: 'pr_created',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 95, prUrl: 'https://github.com/x/95', branchName: 'autodev/feat-95', baseBranch: 'main', commitSha: 'fff', filesCommitted: [], createdAt: '2026-11-22T04:01:00Z' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [
+      {
+        id: 'rep-95-fail',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        actionsRunId: 595,
+        workflowName: 'AutoDev AGY Coding Runner',
+        branch: 'autodev/feat-95',
+        prNumber: 95,
+        kind: 'e2e',
+        status: 'failed',
+        total: 10,
+        passed: 9,
+        failed: 1,
+        skipped: 0,
+        passRate: 90,
+        durationMs: 15000,
+        executedAt: '2026-11-22T04:05:00Z',
+        summary: '9/10',
+        cases: [],
+      },
+    ],
+    rsiRules: [],
+    activeCodingActionRunning: true,
+  });
+  assert.equal(reworkCodingSnap.activeStationId, 'ST-02');
+  assert.equal(reworkCodingSnap.stationStates['ST-03'].led, 'idle');
+  const reworkCodingHud = deriveVillageHudState(reworkCodingSnap, 1.0, 0.5);
+  assert.deepEqual(reworkCodingHud.workingBuildingIds, ['AI-CODER']);
+  assert.equal(reworkCodingHud.comicBurst.visible, false);
+
+  // 12. AutoDev Plan Pipeline workflow commits channel JSON files sequentially & enforces PM/QA non-technical acceptance criteria
+  const { buildAgyPlanWorkflowYaml } = await import('./workflowBuilder');
+  const planYaml = buildAgyPlanWorkflowYaml('jiangfengwhu');
+  assert.ok(!planYaml.includes('Promise.all([\n          postStageOutput'));
+  assert.ok(planYaml.includes("await postStageOutput('architect'"));
+  assert.ok(planYaml.includes("await postStageOutput('qa_spec'"));
+  assert.ok(planYaml.includes("await postStageOutput('qa_critic'"));
+  assert.ok(planYaml.includes('ACCEPTANCE CRITERIA RULE'));
+
+  // 13. Coding Runner success (without previewDeployment) auto-transitions to ST-04 with 2-leg conveyor animation
+  const codingDoneSnap = deriveRealFactorySnapshot({
+    runs: [
+      {
+        id: 'run-coding-done',
+        createdAt: '2026-11-22T05:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '编码完成自动签批',
+        prdContent: '内容',
+        status: 'pr_created',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 99, prUrl: 'https://github.com/x/99', branchName: 'autodev/feat-99', baseBranch: 'main', commitSha: '999', filesCommitted: [], createdAt: '2026-11-22T05:01:00Z' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+    activeCodingActionRunning: false,
+    latestCodingActionConclusion: 'success',
+  });
+  assert.equal(codingDoneSnap.activeStationId, 'ST-04');
+  assert.equal(codingDoneSnap.st04.isAwaitingApproval, true);
+  const st04Leg1 = deriveVillageHudState(codingDoneSnap, 1.0, 0.5);
+  assert.equal(st04Leg1.hasActiveTransit, true);
+  assert.equal(st04Leg1.parcels[0].trackId, 'track-hub-coder');
+  const st04Leg2 = deriveVillageHudState(codingDoneSnap, 2.5, 2.2);
+  assert.equal(st04Leg2.hasActiveTransit, true);
+  assert.equal(st04Leg2.parcels[0].trackId, 'track-st04-hub');
+  const st04Docked = deriveVillageHudState(codingDoneSnap, 6.0, 4.0);
+  assert.equal(st04Docked.hasActiveTransit, false);
+  assert.deepEqual(st04Docked.workingBuildingIds, ['ST-04']);
+
+  // 14. Live in-session launch animates ST-04 -> ST-00 -> ST-05 vault -> hides parcel -> celebrates -> completes cleanly
+  const liveLaunchSnap = deriveRealFactorySnapshot({
+    runs: [
+      {
+        id: 'run-live-launch',
+        createdAt: '2026-11-22T06:00:00Z',
+        repoFullName: 'jiangfengwhu/atd-v1',
+        defaultBranch: 'main',
+        prdTitle: '上线庆祝需求',
+        prdContent: '内容',
+        status: 'approved',
+        architect: { ambiguities: [], architectureSummary: '', techDecisions: [], apiContracts: [], tasks: [] },
+        qaSpec: { apiTestChecklist: [], e2eTestCode: '', coverageNotes: [] },
+        qaCritic: { reviewSummary: '', findings: [], finalApiTestChecklist: [], finalE2eTestCode: '' },
+        draftPr: { prNumber: 100, prUrl: 'https://github.com/x/100', branchName: 'autodev/feat-100', baseBranch: 'main', commitSha: '100', filesCommitted: [], createdAt: '2026-11-22T06:01:00Z' },
+        mergedRelease: { prNumber: 100, prUrl: 'https://github.com/x/100', mergeCommitSha: '101', commitUrl: 'https://github.com/101', baseBranch: 'main', mergeMethod: 'squash', mergedAt: '2026-11-22T06:10:00Z' },
+      },
+    ],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+    celebratingDeliveredRunId: 'run-live-launch',
+  });
+  const launchLeg1 = deriveVillageHudState(liveLaunchSnap, 1.0, 0.5);
+  assert.equal(launchLeg1.hasActiveTransit, true);
+  assert.equal(launchLeg1.parcels[0].trackId, 'track-st04-hub');
+  assert.equal(launchLeg1.celebrationActive, false);
+  const launchLeg2 = deriveVillageHudState(liveLaunchSnap, 2.5, 2.2);
+  assert.equal(launchLeg2.hasActiveTransit, true);
+  assert.equal(launchLeg2.parcels[0].trackId, 'track-st05-hub');
+  const launchCelebrate = deriveVillageHudState(liveLaunchSnap, 5.0, 4.5);
+  assert.equal(launchCelebrate.hasActiveTransit, false);
+  assert.equal(launchCelebrate.parcels.length, 0);
+  assert.equal(launchCelebrate.celebrationActive, true);
+  assert.equal(launchCelebrate.celebrationDone, false);
+  const launchFinished = deriveVillageHudState(liveLaunchSnap, 11.0, 9.5);
+  assert.equal(launchFinished.celebrationActive, false);
+  assert.equal(launchFinished.celebrationDone, true);
+  assert.equal(launchFinished.parcels.length, 0);
+});
+
 
 
 

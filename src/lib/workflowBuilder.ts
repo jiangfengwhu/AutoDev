@@ -76,7 +76,6 @@ export const AUTODEV_PLAN_CHANNEL_BRANCH = 'autodev-plan-channel';
 export const AUTODEV_E2E_VAULT_PREFIX = '.autodev-e2e-vault';
 export const AUTODEV_VPS_CAPS_PATH = '.autodev-vps-capabilities.json';
 export const AUTODEV_LIVE_LOG_ISSUE_TITLE = '[AutoDev] Live AGY Execution Stream';
-export const AUTODEV_PLAN_ISSUE_TITLE = '[AutoDev] AGY Plan Artifacts';
 
 export function buildAgyRunnerWorkflowYaml(allowedActor: string = 'jiangfengwhu'): string {
   return `name: AutoDev AGY Coding Runner
@@ -252,13 +251,12 @@ jobs:
           const resumeSessionId = (process.env.RESUME_SESSION_ID || '').trim();
           const maxRepairRounds = Math.max(0, Math.min(5, Number(process.env.MAX_REPAIR_ROUNDS ?? 3) || 3));
           const channelBranch = process.env.REPORT_CHANNEL_BRANCH || '${AUTODEV_PLAN_CHANNEL_BRANCH}';
-          const vaultPrefix = process.env.E2E_VAULT_PREFIX || '${AUTODEV_E2E_VAULT_PREFIX}';
+          const activeE2ePath = (process.env.ACTIVE_E2E_PATH || '').trim();
           const capsPath = process.env.VPS_CAPS_PATH || '${AUTODEV_VPS_CAPS_PATH}';
           const logFile = process.env.LOG_FILE || '/tmp/autodev-agy.log';
           const issueTitle = '${AUTODEV_LIVE_LOG_ISSUE_TITLE}';
           const marker = '<!-- AUTODEV-LIVE-LOG:' + actionsRunId + ' -->';
           const startedAt = Date.now();
-          const blindStashDir = '/tmp/autodev-blind-e2e-' + actionsRunId;
 
           let issueNumber = null;
           let issueCommentCount = 0;
@@ -518,106 +516,6 @@ jobs:
             };
           }
 
-          function movePathSafe(src, dest) {
-            fs.mkdirSync(path.dirname(dest), { recursive: true });
-            try {
-              fs.renameSync(src, dest);
-            } catch (err) {
-              if (err && err.code === 'EXDEV') {
-                fs.cpSync(src, dest, { recursive: true, force: true });
-                fs.rmSync(src, { recursive: true, force: true });
-              } else {
-                throw err;
-              }
-            }
-          }
-
-          // Blind Isolation: hide ALL existing E2E tests from workspace BEFORE AGY runs so AGY cannot cheat!
-          function stashExistingE2eTests() {
-            const stashed = [];
-            const skipWorktreeFiles = [];
-            const candidates = ['tests/e2e', 'tests/e2e.spec.ts', 'e2e'];
-
-            fs.rmSync(blindStashDir, { recursive: true, force: true });
-            fs.mkdirSync(blindStashDir, { recursive: true });
-
-            for (const rel of candidates) {
-              if (!fs.existsSync(rel)) continue;
-              // Record tracked files under this path so git update-index --skip-worktree prevents AGY git add -A from staging deletions
-              try {
-                const tracked = execSync('git ls-files -- "' + rel + '"', { encoding: 'utf8' })
-                  .split('\\n')
-                  .map((s) => s.trim())
-                  .filter(Boolean);
-                for (const tf of tracked) {
-                  spawnSync('git', ['update-index', '--skip-worktree', tf], { stdio: 'ignore' });
-                  skipWorktreeFiles.push(tf);
-                }
-              } catch {}
-
-              const dest = path.join(blindStashDir, rel);
-              movePathSafe(rel, dest);
-              stashed.push(rel);
-            }
-            appendLog('[Blind E2E] Isolated ' + stashed.length + ' existing E2E path(s) from coding workspace (' + skipWorktreeFiles.length + ' tracked files shielded via skip-worktree).');
-            return { stashed, skipWorktreeFiles };
-          }
-
-          function restoreExistingE2eTests(stashState) {
-            if (!stashState) return;
-            for (const rel of stashState.stashed) {
-              const src = path.join(blindStashDir, rel);
-              if (fs.existsSync(src)) {
-                if (fs.existsSync(rel)) {
-                  fs.rmSync(rel, { recursive: true, force: true });
-                }
-                movePathSafe(src, rel);
-              }
-            }
-            for (const tf of stashState.skipWorktreeFiles) {
-              spawnSync('git', ['update-index', '--no-skip-worktree', tf], { stdio: 'ignore' });
-            }
-            fs.rmSync(blindStashDir, { recursive: true, force: true });
-            appendLog('[Blind E2E] Restored baseline E2E files for post-coding verification.');
-          }
-
-          async function hydrateVaultE2eTests() {
-            const writtenFiles = [];
-            if (!token || !repo) return writtenFiles;
-            const entries = await gh(
-              '/repos/' + repo + '/contents/' + encodeRepoPath(vaultPrefix) + '?ref=' + encodeURIComponent(channelBranch)
-            );
-            if (!Array.isArray(entries)) {
-              appendLog('[Blind E2E] No vault directory found at ' + vaultPrefix + ' on ' + channelBranch + '.');
-              return writtenFiles;
-            }
-            fs.mkdirSync('tests/e2e', { recursive: true });
-            for (const dirEntry of entries) {
-              if (dirEntry.type !== 'dir') continue;
-              const slug = dirEntry.name;
-              const specFileRes = await gh(
-                '/repos/' + repo + '/contents/' + encodeRepoPath(vaultPrefix + '/' + slug + '/e2e.spec.ts') + '?ref=' + encodeURIComponent(channelBranch)
-              );
-              if (!specFileRes || !specFileRes.content) continue;
-              const decoded = specFileRes.encoding === 'base64'
-                ? Buffer.from(String(specFileRes.content).replace(/\\n/g, ''), 'base64').toString('utf8')
-                : String(specFileRes.content);
-              const targetLocalPath = path.join('tests', 'e2e', slug + '.spec.ts');
-              fs.writeFileSync(targetLocalPath, decoded, 'utf8');
-              writtenFiles.push(targetLocalPath);
-            }
-            appendLog('[Blind E2E] Hydrated ' + writtenFiles.length + ' blind E2E test file(s) from vault: ' + writtenFiles.join(', '));
-            return writtenFiles;
-          }
-
-          function cleanupHydratedVaultTests(writtenFiles) {
-            for (const f of writtenFiles) {
-              try {
-                if (fs.existsSync(f)) fs.rmSync(f, { force: true });
-              } catch {}
-            }
-          }
-
           function buildCodingPrompt() {
             const hasRev = fs.existsSync('docs/revision-feedback.md') || Boolean(revisionNote);
             const revBlock = hasRev
@@ -627,14 +525,14 @@ jobs:
             return [
               'You are the autonomous full-stack coding agent executing inside AutoDev Studio on branch \`' + branch + '\`.',
               'Current working directory is the root of this repository.',
-              'Read docs/prd.md, docs/spec.json, docs/rsi-guidelines.md (if present), and docs/revision-feedback.md (if present) thoroughly.',
+              'Read docs/prd.md, docs/spec.json, docs/rsi-guidelines.md (if present), docs/revision-feedback.md (if present), and the repository E2E test files under tests/ (e.g. ' + (activeE2ePath || 'tests/e2e/*.spec.ts') + ') thoroughly.',
               revBlock,
               '',
               'Engineering Requirements:',
               '1. INCREMENTAL ITERATION RULE: Inspect the existing codebase first. Preserve all previously working features, existing API contracts, and existing database migrations. Do NOT rewrite unrelated working modules from scratch.',
               '2. RSI GUARDRAILS: If docs/rsi-guidelines.md exists, strictly obey every engineering guardrail inside it.',
               '3. Implement ALL atomic tasks, UI flows, edge-case states (empty states, error states, loading states), and API contracts defined in docs/spec.json in clean, modular, production-ready code.',
-              '4. BLIND VERIFICATION DISCIPLINE: Independent E2E acceptance tests are held externally and will run after you push. Implement the real feature cleanly from docs/prd.md and docs/spec.json — never hardcode test shortcuts.',
+              '4. TRANSPARENT E2E VERIFICATION & ROOT-CAUSE DISCIPLINE: E2E test files under tests/ are directly visible in this repository. Implement the real feature cleanly from docs/prd.md and docs/spec.json — never hardcode test shortcuts or weaken real functional coverage. If you run tests and encounter a failure, ALWAYS analyze the root cause first to distinguish whether it is an application logic/UI bug OR a test script defect (such as Playwright strict-mode multi-element locator collision, unreasonable single-test timeout, outdated selector, or race condition), and fix the right side accordingly.',
               '5. Cloudflare Deployment & D1 Migration Standard (when targeting Cloudflare Workers): maintain valid wrangler.toml with Static Assets, Hono TypeScript API entry, and append-only idempotent D1 SQL migrations (CREATE TABLE IF NOT EXISTS).',
               '6. STATIC VERIFICATION BEFORE PUSH: Before committing, run finite foreground checks such as \`npx tsc --noEmit\` and \`npm run build\` (if scripts exist) and fix all errors. NEVER leave background dev servers or watch processes running.',
               '7. MANDATORY FINAL STEP — COMMIT AND PUSH CODE:',
@@ -663,21 +561,25 @@ jobs:
               : '';
 
             return [
-              'AUTOMATED BLIND VERIFICATION FEEDBACK — AUTO-REPAIR ROUND ' + round + '/' + maxRounds + ' (branch \`' + branch + '\`).',
-              'Your previous push was evaluated by the isolated verification suite and did NOT fully pass:',
+              'AUTOMATED E2E VERIFICATION FEEDBACK — AUTO-REPAIR ROUND ' + round + '/' + maxRounds + ' (branch \`' + branch + '\`).',
+              'Your previous push was evaluated by the verification suite and did NOT fully pass:',
               '- Summary: ' + (verify?.passed ?? 0) + ' passed / ' + (verify?.failed ?? 0) + ' failed / ' + (verify?.skipped ?? 0) + ' skipped (total ' + (verify?.total ?? 0) + ').',
               '',
               'Failed checks & exact error diagnostics:',
               detailBlocks.join('\\n\\n') + extraNotice,
               rawFallback,
               '',
-              'Repair Instructions:',
-              '1. Diagnose and fix the root cause of EVERY failure above in application code (frontend UI/DOM/accessibility/CSS, backend API, or database logic) while preserving all ' + (verify?.passed ?? 0) + ' already-passing tests.',
-              '2. Pay close attention to Playwright strict-mode locator collisions reported above (e.g., if a generic button/text/role locator matched multiple elements, refine the application DOM/semantics/copy so the intended target element is uniquely matched without breaking features).',
-              '3. BLIND DISCIPLINE: E2E test files remain strictly isolated outside the coding workspace. Do NOT search for or attempt to modify test contracts — fix the real application code.',
-              '4. Run finite static verification (\`npx tsc --noEmit\`, \`npm run build\` if present) and ensure zero errors. NEVER leave background servers running.',
-              '5. MANDATORY FINAL STEP — COMMIT AND PUSH YOUR FIX:',
-              '   \`git add -A && git commit -m "fix(autodev): resolve blind verification failures (round ' + round + ')" && git push origin HEAD:' + branch + '\`',
+              'Repair Instructions (Root-Cause First — App Logic vs Test Script):',
+              '1. MANDATORY ROOT-CAUSE TRIAGE: For EVERY failed case above, open and inspect BOTH the failing test file in \`tests/\` AND the relevant application code (frontend UI, API route, database logic). Explicitly determine whether the failure is:',
+              '   (a) an APPLICATION LOGIC / UI / API BUG (missing behavior, broken interaction, wrong state/persistence, slow or hanging endpoint), OR',
+              '   (b) a TEST SCRIPT DEFECT (e.g., Playwright strict-mode locator matching multiple elements, over-packed single test hitting the default 30s timeout, wrong selector/copy assumption, or missing wait for network/navigation).',
+              '2. FIX THE TRUE ROOT CAUSE:',
+              '   - If it is an application bug, fix the application code cleanly while preserving all ' + (verify?.passed ?? 0) + ' already-passing tests.',
+              '   - If it is a test script defect, fix the test script directly (e.g., scope ambiguous locators accurately, split or increase timeout for long multi-step flows, fix brittle selectors) WITHOUT deleting or watering down the real functional assertions required by docs/prd.md and docs/spec.json.',
+              '   - In your final summary reply, clearly state for each failure whether the root cause was in application code or in the test script, and what you changed.',
+              '3. Run finite static verification (\`npx tsc --noEmit\`, \`npm run build\` if present) and verify the failing test passes locally. NEVER leave background servers running.',
+              '4. MANDATORY FINAL STEP — COMMIT AND PUSH YOUR FIX:',
+              '   \`git add -A && git commit -m "fix(autodev): resolve E2E verification failures (round ' + round + ')" && git push origin HEAD:' + branch + '\`',
               '   Verify \`git status\` is clean and push succeeded before ending your turn.',
             ].filter(Boolean).join('\\n');
           }
@@ -1000,7 +902,7 @@ jobs:
                 env: { ...process.env, CI: 'true', PLAYWRIGHT_HTML_OPEN: 'never' },
               });
               const durationMs = Date.now() - t0;
-              rawLog += '\\n=== Playwright Blind E2E ===\\n' + ((pw.stderr || '') + '\\n' + (pw.stdout || '')).slice(-2500);
+              rawLog += '\\n=== Playwright E2E Verification ===\\n' + ((pw.stderr || '') + '\\n' + (pw.stdout || '')).slice(-2500);
               let parsedPw = null;
               try {
                 const firstBrace = (pw.stdout || '').indexOf('{');
@@ -1028,7 +930,7 @@ jobs:
               } else {
                 cases.push({
                   id: 'pw-suite',
-                  title: 'Playwright 独立盲测套件',
+                  title: 'Playwright E2E 验收测试套件',
                   status: pw.status === 0 ? 'passed' : 'failed',
                   durationMs,
                   ...(pw.status === 0 ? {} : { error: ((pw.stderr || '') + (pw.stdout || '')).slice(-600) }),
@@ -1089,7 +991,7 @@ jobs:
               durationMs: effectiveVerify.durationMs,
               executedAt: new Date().toISOString(),
               summary:
-                '独立盲测验证（' + resolvedModel + ' / ' + requestedMode +
+                '自动化 E2E 验收（' + resolvedModel + ' / ' + requestedMode +
                 (meta.repairRounds > 0 ? ' · 自动返工 ' + meta.repairRounds + ' 轮' : '') + '）：' +
                 effectiveVerify.passed + ' 通过 / ' + effectiveVerify.failed + ' 失败 / ' + effectiveVerify.skipped + ' 跳过',
               cases: effectiveVerify.cases,
@@ -1104,7 +1006,7 @@ jobs:
             await upsertChannelJson(
               '.autodev-test-reports/' + actionsRunId + '.json',
               report,
-              'chore(autodev-test): publish blind E2E report & coding output for run ' + actionsRunId
+              'chore(autodev-test): publish E2E verification report & coding output for run ' + actionsRunId
             );
           }
 
@@ -1119,8 +1021,6 @@ jobs:
               syncLiveComment(currentPhaseLabel).catch(() => {});
             }, 8000);
 
-            let stashState = null;
-            let hydratedVaultFiles = [];
             let agyRes = { exitCode: 1, elapsedMs: 0, capturedSessionId: undefined, finalResponse: '', tokenUsage: undefined };
             let pushInfo = { changed: false, commitSha: initialHeadSha.slice(0, 7) };
             let verify = null;
@@ -1186,36 +1086,30 @@ jobs:
             };
 
             const runVerificationCycle = async (labelSuffix) => {
-              currentPhaseLabel = 'BLIND E2E VERIFICATION' + (labelSuffix ? ' (' + labelSuffix + ')' : '');
+              currentPhaseLabel = 'E2E VERIFICATION' + (labelSuffix ? ' (' + labelSuffix + ')' : '');
               await syncLiveComment(currentPhaseLabel);
-              restoreExistingE2eTests(stashState);
-              stashState = null;
-              hydratedVaultFiles = await hydrateVaultE2eTests();
               const v = runBlindVerification();
               appendLog(
-                '[AutoDev] Blind Verification' + (labelSuffix ? ' [' + labelSuffix + ']' : '') + ' finished: ' +
+                '[AutoDev] E2E Verification' + (labelSuffix ? ' [' + labelSuffix + ']' : '') + ' finished: ' +
                 v.passed + ' passed / ' + v.failed + ' failed / ' + v.skipped + ' skipped'
               );
               return v;
             };
 
             try {
-              // 1. Hide all E2E test code before AGY starts so coding stage is strictly blind
-              stashState = stashExistingE2eTests();
-
-              // 2. Initial AGY coding turn (NO timeout; AGY commits & pushes directly)
+              // 1. Initial AGY coding turn (NO blind hiding; repo E2E tests are directly visible to Coding Agent)
               currentPhaseLabel = 'CODING (' + resolvedModel + ' · ' + requestedMode + (activeSessionId ? ' · resume ' + activeSessionId.slice(0, 8) : '') + ')';
               await syncLiveComment(currentPhaseLabel);
               agyRes = await executeAgyTurn(buildCodingPrompt(), activeSessionId, 'initial coding');
               appendLog('[AutoDev] AGY initial turn completed (exit=' + agyRes.exitCode + ', elapsed=' + Math.round(agyRes.elapsedMs / 1000) + 's, session=' + (activeSessionId || 'none') + ').');
 
-              // 3. Ensure all AGY edits are committed & pushed while E2E tests are still isolated
+              // 2. Ensure all AGY edits are committed & pushed
               pushInfo = ensureChangesCommittedAndPushed(initialHeadSha);
 
-              // 4. Restore baseline E2E + hydrate Blind Vault E2E & run independent verification
+              // 3. Run repository Playwright E2E + static/unit verification directly
               verify = await runVerificationCycle('initial');
 
-              // 5. Auto-Repair Feedback Loop: if verification failed, feed exact diagnostics back to the SAME AGY session!
+              // 4. Auto-Repair Feedback Loop: feed diagnostics back to the SAME AGY session to triage app bug vs test script defect!
               while (verify && !verify.allPassed && repairRounds < maxRepairRounds) {
                 repairRounds += 1;
                 const targetSession = caps.supportsConversation ? activeSessionId : undefined;
@@ -1226,13 +1120,8 @@ jobs:
                   '[AutoDev] Verification failed (' + verify.passed + ' passed / ' + verify.failed +
                   ' failed). Feeding error diagnostics back to ' +
                   (targetSession ? 'original AGY session ' + targetSession : 'fresh AGY session') +
-                  ' for auto-repair round ' + repairRounds + '/' + maxRepairRounds + '...'
+                  ' for root-cause auto-repair round ' + repairRounds + '/' + maxRepairRounds + '...'
                 );
-
-                // Re-isolate ALL E2E test files before resuming AGY so blind discipline is never violated
-                cleanupHydratedVaultTests(hydratedVaultFiles);
-                hydratedVaultFiles = [];
-                stashState = stashExistingE2eTests();
 
                 currentPhaseLabel =
                   'AUTO-REPAIRING (' + repairRounds + '/' + maxRepairRounds +
@@ -1252,10 +1141,6 @@ jobs:
               }
             } finally {
               clearInterval(ticker);
-              if (stashState) {
-                restoreExistingE2eTests(stashState);
-              }
-              cleanupHydratedVaultTests(hydratedVaultFiles);
             }
 
             // Surface ONLY the final round's assistant chat window reply to the user (not multi-round runner logs)
@@ -1297,7 +1182,7 @@ jobs:
 
             const verifiedOk = Boolean(verify && verify.allPassed && agyRes.exitCode === 0);
             const finalStatus = verifiedOk
-              ? 'COMPLETED (blind verified ' + verify.passed + '/' + verify.total +
+              ? 'COMPLETED (E2E verified ' + verify.passed + '/' + verify.total +
                 (repairRounds > 0 ? ', auto-repaired in ' + repairRounds + ' round(s)' : '') +
                 ', commit ' + pushInfo.commitSha + ')'
               : 'FAILED (agyExit=' + agyRes.exitCode + ', repairRounds=' + repairRounds + ', verify=' + (verify ? verify.passed + '/' + verify.total + ', ' + verify.failed + ' failed' : 'skipped') + ')';
@@ -1343,19 +1228,19 @@ jobs:
         run: |
           if [ "\${{ steps.agy.outputs.verified_complete }}" = "true" ]; then
             cat > /tmp/autodev-pr-summary.md <<'COMMENT_EOF'
-          ### AutoDev VPS AGY 编码完成 · 独立盲测验证通过
+          ### AutoDev VPS AGY 编码完成 · 自动化 E2E 验收通过
           - Model: \`\${{ steps.agy.outputs.resolved_model || steps.target.outputs.model }}\` · Mode: \`\${{ steps.target.outputs.mode }}\`
           - Commit: \`\${{ steps.agy.outputs.commit_sha }}\` · 自动修复返工轮次：\${{ steps.agy.outputs.repair_rounds || 0 }}
-          - 独立盲测校验：\${{ steps.agy.outputs.passed_count }} 项通过 / \${{ steps.agy.outputs.failed_count }} 项失败（编码与自动修复阶段对 E2E 测试集全程盲测隔离）
-          - 请前往 AutoDev Studio「5. 验收与上线审批」进行人工验收与一键发布。
+          - E2E 验收校验：\${{ steps.agy.outputs.passed_count }} 项通过 / \${{ steps.agy.outputs.failed_count }} 项失败
+          - 请前往 AutoDev Studio「验收签批部」进行人工验收与一键发布。
           COMMENT_EOF
           else
             cat > /tmp/autodev-pr-summary.md <<'COMMENT_EOF'
-          ### AutoDev VPS AGY 执行结束 · 盲测校验仍有待修复项
+          ### AutoDev VPS AGY 执行结束 · E2E 校验仍有待修复项
           - Model: \`\${{ steps.agy.outputs.resolved_model || steps.target.outputs.model }}\` · Mode: \`\${{ steps.target.outputs.mode }}\`
           - Commit: \`\${{ steps.agy.outputs.commit_sha }}\` · AGY Exit: \`\${{ steps.agy.outputs.agy_exit }}\` · 已自动返工修复：\${{ steps.agy.outputs.repair_rounds || 0 }} 轮
-          - 独立盲测校验：\${{ steps.agy.outputs.passed_count }} 项通过 / \${{ steps.agy.outputs.failed_count }} 项失败
-          - 完整结构化测试报告已同步至 AutoDev Studio「6. 质量与自进化 (RSI)」。
+          - E2E 验收校验：\${{ steps.agy.outputs.passed_count }} 项通过 / \${{ steps.agy.outputs.failed_count }} 项失败
+          - 完整结构化测试报告已同步至 AutoDev Studio「质检进化圣殿 (RSI)」。
           COMMENT_EOF
           fi
           gh pr comment "\${{ steps.target.outputs.pr_number }}" --body-file /tmp/autodev-pr-summary.md || true
@@ -1724,8 +1609,9 @@ jobs:
             const contentB64 = Buffer.from(JSON.stringify(data, null, 2), 'utf8').toString('base64');
 
             let sha = knownSha;
-            for (let attempt = 1; attempt <= 2; attempt++) {
-              if (!sha && attempt === 2) {
+            const maxAttempts = 5;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              if (!sha) {
                 try {
                   const existing = await gh(
                     '/repos/' + repo + '/contents/' + encoded + '?ref=' + encodeURIComponent(channelBranch)
@@ -1746,8 +1632,11 @@ jobs:
                 });
                 return updated?.content?.sha || sha;
               } catch (err) {
-                if ((err.status === 409 || err.status === 422) && attempt === 1) {
+                if ((err.status === 409 || err.status === 422) && attempt < maxAttempts) {
                   sha = undefined;
+                  const waitMs = 450 * attempt + Math.floor(Math.random() * 250);
+                  console.warn('[writeChannelFile retry ' + attempt + '/' + maxAttempts + '] HTTP ' + err.status + ' on ' + filePath + ', waiting ' + waitMs + 'ms');
+                  await sleep(waitMs);
                   continue;
                 }
                 throw err;
@@ -2135,11 +2024,10 @@ jobs:
                 const criticCheck = validateStage('qa_critic', parsedBundle.qa_critic);
 
                 if (archCheck.ok && specCheck.ok && criticCheck.ok) {
-                  const [archFile, specFile, criticFile] = await Promise.all([
-                    postStageOutput('architect', archCheck.data),
-                    postStageOutput('qa_spec', specCheck.data),
-                    postStageOutput('qa_critic', criticCheck.data),
-                  ]);
+                  // Commit sequentially to autodev-plan-channel to avoid GitHub Contents API 409 HEAD races
+                  const archFile = await postStageOutput('architect', archCheck.data);
+                  const specFile = await postStageOutput('qa_spec', specCheck.data);
+                  const criticFile = await postStageOutput('qa_critic', criticCheck.data);
 
                   const completedIso = new Date().toISOString();
                   const durationMs = Date.now() - startedMs;
@@ -2248,6 +2136,7 @@ jobs:
               '- NEVER write bare \`locatorA.or(locatorB)\` without appending \`.first()\` (ALWAYS write \`locatorA.or(locatorB).first()\`) to prevent Playwright strict mode violations!',
               '- Self-critique your draft \`qa_spec\` inside \`qa_critic\`: identify boundary/invalid_input/ui_interaction/security/concurrency gaps in \`findings\`, and produce the hardened \`finalApiTestChecklist\` and \`finalE2eTestCode\`.',
               'LANGUAGE: All Chinese text fields (titles, descriptions, summaries, ambiguity details, acceptanceCriteria, reviewSummary, findings, scenarios) MUST be written in concise, professional Simplified Chinese.',
+              'ACCEPTANCE CRITERIA RULE (CRITICAL - FOR PRODUCT MANAGERS & QA TESTERS): Every item in architect.tasks[].acceptanceCriteria is displayed directly to non-technical Product Managers and Manual QA Testers on the Acceptance Gate checklist. Write each item purely in plain-language user/business functional terms ("用户在XX页面执行XX操作后，页面展示/实现XX效果"). STRICTLY FORBID mentioning HTTP status codes, API paths, SQL/database tables, JWT/cookies, CSS classes, file paths, Playwright, or any code/engineering jargon in acceptanceCriteria!',
               ...(rsiBlocks ? ['', rsiBlocks] : []),
               '',
               'Repository Digest:',
@@ -2266,7 +2155,7 @@ jobs:
               '    "architectureSummary": "Concise Chinese technical architecture summary grounded in the real codebase",',
               '    "techDecisions": ["Decision 1", "Decision 2"],',
               '    "apiContracts": [{ "id": "API-1", "method": "GET|POST|PUT|PATCH|DELETE", "path": "/api/...", "summary": "...", "requestSchema": "...", "responseSchema": "...", "errorCodes": ["400", "404"] }],',
-              '    "tasks": [{ "id": "T-01", "title": "...", "module": "...", "description": "...", "dependsOn": [], "acceptanceCriteria": ["..."], "estimatedComplexity": "S|M|L" }]',
+              '    "tasks": [{ "id": "T-01", "title": "...", "module": "...", "description": "...", "dependsOn": [], "acceptanceCriteria": ["面向产品/测试人员的纯功能业务验收描述，不含技术术语"], "estimatedComplexity": "S|M|L" }]',
               '  },',
               '  "qa_spec": {',
               '    "apiTestChecklist": [{ "id": "TC-01", "endpoint": "/api/...", "method": "GET|POST|...", "scenario": "...", "expectedStatus": 200, "assertion": "..." }],',

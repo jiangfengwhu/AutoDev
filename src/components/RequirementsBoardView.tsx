@@ -42,7 +42,6 @@ import {
   type RequirementStatusBucket,
 } from '../lib/requirementsBoard';
 import { formatTokenCount } from '../lib/overviewMetrics';
-import { STUDIO_IMAGES } from '../lib/studioTheme';
 import { RequirementReportModal } from './RequirementReportModal';
 
 interface RequirementsBoardViewProps {
@@ -983,14 +982,8 @@ export function RequirementsBoardView({
                                     <div className="rounded-lg border border-[#2A3548] bg-[#111723] p-3.5 space-y-2.5">
                                       <div className="flex flex-wrap items-center justify-between gap-2">
                                         <span className="inline-flex items-center gap-2 text-[12px] font-semibold text-[#F8FAFC]">
-                                          <img
-                                            src={STUDIO_IMAGES.coder}
-                                            alt="陈汐"
-                                            referrerPolicy="no-referrer"
-                                            className="h-5 w-5 rounded-md object-cover border border-[#34D399]/40"
-                                          />
                                           <MessageSquare className="h-3.5 w-3.5 text-[#34D399]" />
-                                          <span>陈汐 · Coding Agent 聊天窗口最终回复</span>
+                                          <span>Gemini 编码圣殿 · Coding Agent 聊天窗口最终回复</span>
                                           {item.latestCodingCommitSha && (
                                             <span className="font-mono font-normal text-[11px] text-[#38BDF8]">
                                               · {item.latestCodingCommitSha.slice(0, 7)}

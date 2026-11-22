@@ -148,6 +148,7 @@ export function PrdWorkspaceView({
   // Post-planning inline editing state
   const [editingPlan, setEditingPlan] = useState(false);
   const [savingPlan, setSavingPlan] = useState(false);
+  const [showNewPrdForm, setShowNewPrdForm] = useState(false);
   const [planDraft, setPlanDraft] = useState<{
     architect: ArchitectOutput;
     qaSpec: QaSpecOutput;
@@ -333,6 +334,21 @@ export function PrdWorkspaceView({
     editingPlan && planDraft ? planDraft.architect : architectData;
   const effectiveQaSpec =
     editingPlan && planDraft ? planDraft.qaSpec : qaSpecData;
+
+  const hasCompletedPlanFocus = Boolean(
+    !isAnalyzing &&
+      !hasLockedIteration &&
+      currentScopedRun &&
+      (architectData || qaSpecData || qaCriticData)
+  );
+  const shouldHideCreateForm =
+    isRequirementInProgress || (hasCompletedPlanFocus && !showNewPrdForm);
+
+  useEffect(() => {
+    if (currentScopedRun?.id) {
+      setShowNewPrdForm(false);
+    }
+  }, [currentScopedRun?.id]);
   const effectiveQaCritic =
     editingPlan && planDraft ? planDraft.qaCritic : qaCriticData;
 
@@ -568,14 +584,22 @@ export function PrdWorkspaceView({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-[#30363D]">
         <div>
           <h1 className="text-[20px] font-semibold tracking-tight text-[#F0F6FC] text-balance">
-            {isRequirementInProgress ? '需求迭代进行中' : '新建需求 (PRD)'}
+            {isRequirementInProgress
+              ? '需求迭代进行中'
+              : hasCompletedPlanFocus && !showNewPrdForm
+                ? currentScopedRun?.draftPr
+                  ? `规划方案 · Draft PR #${currentScopedRun.draftPr.prNumber}`
+                  : '架构规划已完成 · 待创建 Draft PR'
+                : '新建需求 (PRD)'}
           </h1>
           <p className="mt-1 text-[13px] text-[#8B949E]">
             {isAnalyzing
-              ? '正在 Instabox VPS AGY 单对话中联合完成架构拆解、盲测规格与 Critic 评审，当前界面保持专注无干扰。'
+              ? '正在 Instabox VPS AGY 单对话中联合完成架构拆解、E2E 验收规格与 Critic 评审，当前界面保持专注无干扰。'
               : hasLockedIteration
                 ? '当前已有活跃迭代推进中，已自动隐藏新建迭代入口与上轮遗留数据，避免误操作。'
-                : '单次 AGY 对话联合输出架构任务树与盲测用例，规划完成后支持在线编辑修改再创建 Draft PR。'}
+                : hasCompletedPlanFocus && !showNewPrdForm
+                  ? `当前需求「${currentScopedRun?.prdTitle}」已完成架构分析与规格编译，已聚焦规划方案与 Draft PR 确认面板。`
+                  : '单次 AGY 对话联合输出架构任务树与 E2E 验收用例，规划完成后支持在线编辑修改再创建 Draft PR。'}
           </p>
         </div>
 
@@ -586,6 +610,7 @@ export function PrdWorkspaceView({
               onClick={() => {
                 setFieldErrors({});
                 setPrError(null);
+                setShowNewPrdForm(true);
                 onResetWorkspace();
               }}
               className="inline-flex items-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-3 py-1.5 text-[12px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] transition-colors whitespace-nowrap self-start sm:self-auto"
@@ -697,8 +722,8 @@ export function PrdWorkspaceView({
         </section>
       )}
 
-      {/* PRD Input Form (Shown ONLY when no requirement is currently in progress) */}
-      {!isRequirementInProgress && (
+      {/* PRD Input Form (Hidden while analyzing, locked, or when an analyzed plan is ready for Draft PR focus) */}
+      {!shouldHideCreateForm && (
         <section
           aria-label="PRD 输入表单"
           className="rounded-md border border-[#30363D] bg-[#161B22] p-5 space-y-5"
@@ -777,7 +802,7 @@ export function PrdWorkspaceView({
 
           <form onSubmit={handleStartAnalysis} className="space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-              <div className="md:col-span-4">
+              <div className="md:col-span-6">
                 <label
                   htmlFor="prd-title-input"
                   className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
@@ -804,7 +829,7 @@ export function PrdWorkspaceView({
                 )}
               </div>
 
-              <div className="md:col-span-3">
+              <div className="md:col-span-6">
                 <label
                   htmlFor="prd-stack-input"
                   className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
@@ -821,7 +846,7 @@ export function PrdWorkspaceView({
                 />
               </div>
 
-              <div className="md:col-span-3">
+              <div className="md:col-span-6">
                 <label
                   htmlFor="prd-agy-model-select"
                   className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
@@ -842,7 +867,7 @@ export function PrdWorkspaceView({
                 </select>
               </div>
 
-              <div className="md:col-span-2">
+              <div className="md:col-span-6">
                 <label
                   htmlFor="prd-agy-mode-select"
                   className="block text-[12px] font-medium text-[#F0F6FC] mb-1.5"
@@ -1190,7 +1215,7 @@ export function PrdWorkspaceView({
             {editingPlan && (
               <div className="rounded-md border border-[#58A6FF]/40 bg-[#1F6FEB]/10 px-4 py-2.5 text-[12px] text-[#C9D1D9] flex items-center justify-between gap-3">
                 <span>
-                  当前处于规划编辑模式：可在下方「需求歧义」「架构与任务树」「测试对比」标签中直接修改方案、任务验收标准与盲测脚本，点击「保存规划修改」后生效。
+                  当前处于规划编辑模式：可在下方「需求歧义」「架构与任务树」「测试对比」标签中直接修改方案、任务验收标准与 E2E 测试脚本，点击「保存规划修改」后生效。
                 </span>
               </div>
             )}
@@ -2023,10 +2048,10 @@ export function PrdWorkspaceView({
                   <div className="space-y-2.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <h3 className="text-[15px] font-semibold text-[#F0F6FC]">
-                        {editingPlan ? '编辑终版 Playwright E2E 盲测脚本' : 'Playwright E2E 测试脚本对比'}
+                        {editingPlan ? '编辑终版 Playwright E2E 验收脚本' : 'Playwright E2E 测试脚本对比'}
                       </h3>
                       <span className="text-[12px] text-[#8B949E]">
-                        {editingPlan ? '保存后将写入 Vault 隔离盲测库' : 'QA Spec 初版 → QA Critic 终版'}
+                        {editingPlan ? '保存后将直接提交至 PR 仓库的 tests/e2e/' : 'QA Spec 初版 → QA Critic 终版'}
                       </span>
                     </div>
                     {editingPlan && planDraft ? (
@@ -2123,8 +2148,8 @@ export function PrdWorkspaceView({
                 },
                 {
                   key: 'e2e',
-                  path: prArtifacts.e2eVaultPath || prArtifacts.e2eTestPath,
-                  archiveNote: '隔离盲测用例（存放在 Vault，编码阶段 AGY 不可见，防作弊）',
+                  path: prArtifacts.e2eTestPath,
+                  archiveNote: '透明 E2E 验收用例（直接提交至 PR 仓库，AGY 失败时可检查用例与代码并归因修复）',
                   content: prArtifacts.e2eTestContent,
                 },
               ].map((file) => (
