@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
+  Bot,
   Cloud,
   Cpu,
   ExternalLink,
@@ -20,6 +21,7 @@ import type {
   SelectedTargetRepo,
 } from '../types/autodev';
 import { FIXED_TARGET_REPO } from '../lib/workflowBuilder';
+import { apiFetch } from '../lib/editAuthClient';
 import { OverviewDashboard } from './OverviewDashboard';
 
 interface EnvironmentViewProps {
@@ -186,7 +188,7 @@ export function EnvironmentView({
   const handleManualStateSync = async () => {
     setSyncingState(true);
     try {
-      const res = await fetch('/api/admin/state/sync', {
+      const res = await apiFetch('/api/admin/state/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ direction: 'push', async: true }),
@@ -232,7 +234,7 @@ export function EnvironmentView({
     }
     setResetting(true);
     try {
-      const res = await fetch('/api/admin/reset-all', {
+      const res = await apiFetch('/api/admin/reset-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -329,6 +331,7 @@ export function EnvironmentView({
   const runnerOk = onlineRunners.length > 0;
   const cloudflareOk = Boolean(status?.cloudflare.connected);
   const geminiOk = Boolean(status?.gemini.configured);
+  const feishuOk = Boolean(status?.feishu?.configured);
 
   return (
     <div className="space-y-5">
@@ -472,6 +475,34 @@ export function EnvironmentView({
             <span className="font-semibold text-[#F0F6FC]">Gemini</span>
             <span className={`font-mono ${geminiOk ? 'text-[#3FB950]' : 'text-[#F85149]'}`}>
               {loading && !status ? '检测中' : geminiOk ? 'OK' : '未配置'}
+            </span>
+          </span>
+
+          {/* Feishu Bot */}
+          <span
+            data-testid="env-feishu-status"
+            title={
+              status?.feishu?.lastPushError
+                ? `最近推送失败：${status.feishu.lastPushError}`
+                : `事件回调：${status?.feishu?.eventsCallbackPath || '/api/feishu/events'} · 卡片回调：${status?.feishu?.cardCallbackPath || '/api/feishu/card-action'}${status?.feishu?.hasActiveChat ? ' · 已绑定活跃群' : ' · 待绑定群聊'}`
+            }
+            className="inline-flex items-center gap-1.5 rounded-full border border-[#30363D] bg-[#161B22] px-2.5 py-1"
+          >
+            <span
+              className={`h-2 w-2 rounded-full shrink-0 ${
+                loading && !status
+                  ? 'bg-[#8B949E]'
+                  : feishuOk
+                    ? status?.feishu?.lastPushOk === false
+                      ? 'bg-[#D29922]'
+                      : 'bg-[#3FB950]'
+                    : 'bg-[#6E7681]'
+              }`}
+            />
+            <Bot className="h-3 w-3 text-[#58A6FF] shrink-0" />
+            <span className="font-semibold text-[#F0F6FC]">飞书机器人</span>
+            <span className={`font-mono ${feishuOk ? 'text-[#3FB950]' : 'text-[#8B949E]'}`}>
+              {loading && !status ? '检测中' : feishuOk ? '已接入' : '未配置'}
             </span>
           </span>
         </div>

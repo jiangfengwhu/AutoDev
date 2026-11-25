@@ -25,6 +25,7 @@ import {
   FIXED_TARGET_REPO,
 } from '../lib/workflowBuilder';
 import { filterActionRunsForPipelineRun } from '../lib/iterationContext';
+import { apiFetch } from '../lib/editAuthClient';
 
 interface PipelineBoardViewProps {
   runs: PipelineRun[];
@@ -347,7 +348,7 @@ export function PipelineBoardView({
     setDispatching(true);
     setDispatchFeedback(null);
     try {
-      const res = await fetch('/api/github/dispatch-agy', {
+      const res = await apiFetch('/api/github/dispatch-agy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -390,7 +391,7 @@ export function PipelineBoardView({
   const handleCancelRun = async (runId: number) => {
     setCancellingRunId(runId);
     try {
-      const res = await fetch(`/api/github/actions-runs/${runId}/cancel`, {
+      const res = await apiFetch(`/api/github/actions-runs/${runId}/cancel`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repoFullName: targetRepo }),

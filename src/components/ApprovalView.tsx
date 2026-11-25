@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   ArrowRight,
   CheckCircle2,
   Cloud,
@@ -11,11 +12,13 @@ import {
   Globe,
   Loader2,
   Plus,
+  RefreshCw,
   RotateCcw,
   ShieldCheck,
 } from 'lucide-react';
 import type { BackgroundTask, PipelineRun } from '../types/autodev';
 import type { TestExecutionReport } from '../lib/rsiEngine';
+import { apiFetch } from '../lib/editAuthClient';
 
 interface ApprovalViewProps {
   runs: PipelineRun[];
@@ -56,6 +59,7 @@ export function ApprovalView({
     activeRun?.draftPr?.branchName || activeRun?.defaultBranch || 'main'
   );
   const [deployingPreview, setDeployingPreview] = useState(false);
+  const [deployingProduction, setDeployingProduction] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [latestTestReport, setLatestTestReport] = useState<TestExecutionReport | null>(null);
 
@@ -122,7 +126,7 @@ export function ApprovalView({
     onRunUpdated({ ...activeRun, checkedCriteriaIds: nextIds });
 
     try {
-      const res = await fetch(`/api/runs/${encodeURIComponent(activeRun.id)}/review`, {
+      const res = await apiFetch(`/api/runs/${encodeURIComponent(activeRun.id)}/review`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ checkedCriteriaIds: nextIds }),
@@ -146,7 +150,7 @@ export function ApprovalView({
     setFeedback(null);
 
     try {
-      const res = await fetch(`/api/runs/${encodeURIComponent(activeRun.id)}/review`, {
+      const res = await apiFetch(`/api/runs/${encodeURIComponent(activeRun.id)}/review`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -249,7 +253,7 @@ export function ApprovalView({
     try {
       const targetBranch =
         deployBranch.trim() || activeRun.draftPr?.branchName || activeRun.defaultBranch || 'main';
-      const res = await fetch('/api/cloudflare/deploy-preview', {
+      const res = await apiFetch('/api/cloudflare/deploy-preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -286,6 +290,52 @@ export function ApprovalView({
       onErrorToast(msg, '预览部署失败');
     } finally {
       setDeployingPreview(false);
+    }
+  };
+
+  const handleRedeployProduction = async () => {
+    if (!activeRun) return;
+    setDeployingProduction(true);
+    setFeedback(null);
+    try {
+      const targetBranch = activeRun.mergedRelease?.baseBranch || activeRun.defaultBranch || 'main';
+      const res = await apiFetch('/api/cloudflare/deploy-production', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          async: true,
+          runId: activeRun.id,
+          repoFullName: activeRun.repoFullName,
+          branchName: targetBranch,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 202 && data.task) {
+        onBackgroundTaskStarted?.(data.task as BackgroundTask);
+        const msg = `主分支 ${targetBranch} 的生产环境重新部署已转入后台执行，完成后将自动通知。`;
+        setFeedback({ type: 'success', text: msg });
+        onSuccessToast(msg, '生产重新部署已启动');
+        return;
+      }
+      if (!res.ok) {
+        throw new Error(data.error || `生产部署失败 (${res.status})`);
+      }
+      if (data.run) {
+        onRunUpdated(data.run);
+      } else if (data.deployment) {
+        onRunUpdated({ ...activeRun, productionDeployment: data.deployment });
+      }
+      const msg = data.deployment?.url
+        ? `生产环境已重新部署上线：${data.deployment.url}`
+        : '生产环境已重新部署上线';
+      setFeedback({ type: 'success', text: msg });
+      onSuccessToast(msg, '生产部署完成');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Cloudflare 生产环境重新部署失败';
+      setFeedback({ type: 'error', text: msg });
+      onErrorToast(msg, '生产部署失败');
+    } finally {
+      setDeployingProduction(false);
     }
   };
 
@@ -331,6 +381,7 @@ export function ApprovalView({
           </label>
           <select
             id="approval-run-select"
+            data-readonly-safe="true"
             value={activeRun.id}
             onChange={(e) => {
               onSelectRun(e.target.value);
@@ -656,25 +707,75 @@ export function ApprovalView({
             </div>
           )}
 
-          {activeRun.productionDeployment && (
-            <div className="rounded-md border border-[#3FB950]/40 bg-[#2EA043]/10 px-3.5 py-2.5 text-[12px] text-[#AFF5B4] flex items-center justify-between gap-2">
+          {activeRun.productionDeployment ? (
+            <div className="rounded-md border border-[#3FB950]/40 bg-[#2EA043]/10 px-3.5 py-2.5 text-[12px] text-[#AFF5B4] flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 min-w-0">
                 <Globe className="h-3.5 w-3.5 shrink-0 text-[#3FB950]" />
                 <span className="truncate font-mono">
-                  生产环境已自动部署 · {activeRun.productionDeployment.workerName}
+                  生产环境已部署 · {activeRun.productionDeployment.workerName}
                 </span>
               </div>
-              <a
-                href={activeRun.productionDeployment.url}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 underline shrink-0"
-              >
-                <span>打开生产站</span>
-                <ExternalLink className="h-3 w-3" />
-              </a>
+              <div className="flex items-center gap-2.5 shrink-0">
+                <a
+                  href={activeRun.productionDeployment.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 underline"
+                >
+                  <span>打开生产站</span>
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+                {activeRun.productionDeployment.buildLogsUrl && (
+                  <a
+                    href={activeRun.productionDeployment.buildLogsUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 underline text-[#8B949E] hover:text-[#F0F6FC]"
+                  >
+                    <span>构建日志</span>
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                )}
+                <button
+                  type="button"
+                  data-testid="btn-redeploy-production"
+                  disabled={deployingProduction}
+                  onClick={handleRedeployProduction}
+                  className="inline-flex items-center gap-1 rounded border border-[#3FB950]/40 bg-[#0D1117]/60 px-2 py-0.5 text-[11px] font-medium text-[#AFF5B4] hover:bg-[#2EA043]/30 disabled:opacity-50 transition-colors cursor-pointer"
+                >
+                  {deployingProduction ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3 w-3" />
+                  )}
+                  <span>{deployingProduction ? '部署中…' : '重新部署生产'}</span>
+                </button>
+              </div>
             </div>
-          )}
+          ) : activeRun.mergedRelease || activeRun.status === 'approved' ? (
+            <div className="rounded-md border border-[#D29922]/50 bg-[#D29922]/10 px-3.5 py-2.5 text-[12px] text-[#F2CC60] flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[#D29922]" />
+                <span>
+                  代码已合入主分支，但生产环境尚未部署成功，可随时重试线上发布。
+                </span>
+              </div>
+              <button
+                type="button"
+                data-testid="btn-redeploy-production"
+                disabled={deployingProduction}
+                onClick={handleRedeployProduction}
+                className="inline-flex items-center gap-1.5 rounded-md bg-[#238636] border border-[#3FB950]/40 px-3 py-1 text-[12px] font-medium text-[#F0F6FC] hover:bg-[#2EA043] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                {deployingProduction ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Cloud className="h-3.5 w-3.5" />
+                )}
+                <span>{deployingProduction ? '正在部署生产…' : '重新部署生产环境'}</span>
+              </button>
+            </div>
+          ) : null}
 
           {activeRun.lastRework && !activeRun.mergedRelease && (
             <div className="rounded-md border border-[#D29922]/40 bg-[#D29922]/10 px-3.5 py-2.5 text-[12px] text-[#F2CC60] flex items-center justify-between gap-2">

@@ -46,6 +46,7 @@ import { formatRsiPromptBlock } from '../src/lib/rsiEngine.ts';
 import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore.ts';
 import { captureAndReflectIncident } from './rsiService.ts';
 import { scheduleGitHubStateSync } from './githubStateStore.ts';
+import { notifyFeishuStageEvent } from './feishuService.ts';
 
 const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const JOBS_FILE = path.join(DATA_DIR, 'jobs-v1.json');
@@ -473,6 +474,13 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
       errorSummary: errMsg,
       rawEvidence: `Job ID: ${jobId}\nExecution Mode: vps_agy\nModel: ${agyModel}\nError: ${errMsg}`,
     });
+    void notifyFeishuStageEvent({
+      kind: 'plan_failed',
+      prdTitle: initialJob.prdTitle,
+      repoFullName: initialJob.repoFullName,
+      jobId,
+      error: errMsg,
+    });
   }
 }
 
@@ -600,6 +608,14 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
               relatedActionsRunId: remote.actionsRunId,
               relatedActionsUrl: remote.actionsUrl,
             });
+            void notifyFeishuStageEvent({
+              kind: 'plan_failed',
+              prdTitle: current.prdTitle,
+              repoFullName: current.repoFullName,
+              jobId,
+              actionsUrl: remote.actionsUrl ?? current.planActionsUrl,
+              error: failMsg,
+            });
             return;
           }
 
@@ -642,6 +658,17 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
               run,
               steps: mergedSteps,
             }));
+            await notifyFeishuStageEvent({
+              kind: 'plan_completed',
+              prdTitle: current.prdTitle,
+              repoFullName: current.repoFullName,
+              runId: run.id,
+              jobId,
+              tasksCount: nextArchitect.tasks.length,
+              ambiguitiesCount: nextArchitect.ambiguities.length,
+              actionsUrl: remote.actionsUrl ?? current.planActionsUrl,
+              summary: nextArchitect.architectureSummary?.slice(0, 200),
+            });
             return;
           }
 
@@ -693,6 +720,14 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
                   s.status === 'running' ? { ...s, status: 'error', message: failReason } : s
                 ),
               }));
+              await notifyFeishuStageEvent({
+                kind: 'plan_failed',
+                prdTitle: current.prdTitle,
+                repoFullName: current.repoFullName,
+                jobId,
+                actionsUrl: actionRun.htmlUrl,
+                error: failReason,
+              });
               return;
             }
           }
@@ -844,6 +879,16 @@ async function executeGeminiJobInBackground(initialJob: AnalysisJob): Promise<vo
           : s
       ),
     }));
+    await notifyFeishuStageEvent({
+      kind: 'plan_completed',
+      prdTitle: initialJob.prdTitle,
+      repoFullName: initialJob.repoFullName,
+      runId: run.id,
+      jobId,
+      tasksCount: architect.tasks.length,
+      ambiguitiesCount: architect.ambiguities.length,
+      summary: architect.architectureSummary?.slice(0, 200),
+    });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : '多智能体执行失败';
     updateJob(jobId, (j) => ({
@@ -862,6 +907,13 @@ async function executeGeminiJobInBackground(initialJob: AnalysisJob): Promise<vo
       title: `Gemini 规划阶段异常 (${currentStep})：${initialJob.prdTitle}`,
       errorSummary: errMsg,
       rawEvidence: `Job ID: ${jobId}\nStage: ${currentStep}\nError: ${errMsg}`,
+    });
+    void notifyFeishuStageEvent({
+      kind: 'plan_failed',
+      prdTitle: initialJob.prdTitle,
+      repoFullName: initialJob.repoFullName,
+      jobId,
+      error: errMsg,
     });
   }
 }

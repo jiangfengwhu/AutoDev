@@ -98,6 +98,19 @@ import {
   getBackgroundTaskById,
   listBackgroundTasks,
 } from './server/backgroundTaskStore.ts';
+import {
+  changeEditPassword,
+  checkUnlockRateLimit,
+  clearUnlockFailures,
+  extractBearerToken,
+  getEditAuthMeta,
+  issueEditSessionToken,
+  recordUnlockFailure,
+  reloadEditAuthFromDisk,
+  revokeEditSessionToken,
+  verifyEditPassword,
+  verifyEditSessionToken,
+} from './server/editAuthService.ts';
 import { sanitizeCodingChatOutput } from './src/lib/codingChatOutput.ts';
 import { parseRepoFullName, validatePrdInput } from './src/lib/taskGraph.ts';
 import { buildPrArtifacts } from './src/lib/specBuilder.ts';
@@ -132,6 +145,25 @@ import {
   AGY_AVAILABLE_MODELS,
   FIXED_TARGET_REPO,
 } from './src/lib/workflowBuilder.ts';
+import {
+  getFeishuAppBaseUrl,
+  getFeishuIntegrationStatus,
+  isDuplicateFeishuEvent,
+  isFeishuChatAllowed,
+  notifyFeishuStageEvent,
+  reloadFeishuStateFromDisk,
+  rememberFeishuActiveChat,
+  replyFeishuCardMessage,
+  sendFeishuCardMessage,
+  verifyAndDecodeFeishuWebhook,
+} from './server/feishuService.ts';
+import {
+  buildFeishuPrdFormCard,
+  buildFeishuReworkFormCard,
+  buildFeishuStageCard,
+  parseFeishuCardCallbackBody,
+  parseFeishuEventBody,
+} from './src/lib/feishuProtocol.ts';
 import type {
   AnalysisSseEvent,
   IntegrationsStatusResponse,
@@ -140,11 +172,127 @@ import type {
   ReworkDispatchResult,
 } from './src/types/autodev.ts';
 
+type RequestWithRawBody = express.Request & { rawBody?: string };
+
 const PORT = Number(process.env.PORT || 3000);
+const activeAgyCodingWatchers = new Set<string>();
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '4mb' }));
+  app.use(
+    express.json({
+      limit: '4mb',
+      verify: (req, _res, buf) => {
+        (req as RequestWithRawBody).rawBody = buf.toString('utf-8');
+      },
+    })
+  );
+
+  // =========================================================================
+  // Edit Permission & Write-Guard Middleware (read-only by default until unlocked)
+  // =========================================================================
+  app.get('/api/auth/status', (req, res) => {
+    const token = extractBearerToken(req.headers.authorization);
+    const verified = verifyEditSessionToken(token);
+    res.json({
+      unlocked: verified.valid,
+      expiresAt: verified.expiresAt ?? null,
+      meta: getEditAuthMeta(),
+    });
+  });
+
+  app.post('/api/auth/unlock', (req, res) => {
+    const clientKey =
+      (typeof req.headers['x-forwarded-for'] === 'string'
+        ? req.headers['x-forwarded-for'].split(',')[0]?.trim()
+        : undefined) ||
+      req.ip ||
+      'unknown';
+
+    const limit = checkUnlockRateLimit(clientKey);
+    if (!limit.allowed) {
+      res.status(429).json({
+        error: `密码尝试次数过多，请 ${limit.retryAfterSec} 秒后重试`,
+        code: 'RATE_LIMITED',
+        retryAfterSec: limit.retryAfterSec,
+      });
+      return;
+    }
+
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!password) {
+      res.status(400).json({ error: '请输入编辑解锁密码', code: 'EMPTY_PASSWORD' });
+      return;
+    }
+
+    if (!verifyEditPassword(password)) {
+      recordUnlockFailure(clientKey);
+      res.status(401).json({ error: '密码错误，无法解锁编辑权限', code: 'INVALID_PASSWORD' });
+      return;
+    }
+
+    clearUnlockFailures(clientKey);
+    const session = issueEditSessionToken();
+    res.json({
+      unlocked: true,
+      token: session.token,
+      expiresAt: session.expiresAt,
+      meta: getEditAuthMeta(),
+    });
+  });
+
+  app.post('/api/auth/lock', (req, res) => {
+    const token = extractBearerToken(req.headers.authorization);
+    revokeEditSessionToken(token);
+    res.json({
+      unlocked: false,
+      meta: getEditAuthMeta(),
+    });
+  });
+
+  // Enforce server-side write authentication on ALL non-GET /api/* mutation routes
+  app.use('/api', (req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+      next();
+      return;
+    }
+    if (
+      req.path === '/auth/unlock' ||
+      req.path === '/auth/lock' ||
+      req.path === '/feishu/events' ||
+      req.path === '/feishu/card-action'
+    ) {
+      next();
+      return;
+    }
+    const token = extractBearerToken(req.headers.authorization);
+    const verified = verifyEditSessionToken(token);
+    if (!verified.valid) {
+      res.status(403).json({
+        error: '当前处于只读锁定状态，请先点击解锁按钮输入编辑密码',
+        code: 'EDIT_LOCKED',
+      });
+      return;
+    }
+    next();
+  });
+
+  app.post('/api/auth/change-password', (req, res) => {
+    const currentPassword =
+      typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+    const nextPassword = typeof req.body?.nextPassword === 'string' ? req.body.nextPassword : '';
+    const result = changeEditPassword(currentPassword, nextPassword);
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+    res.json({
+      unlocked: true,
+      token: result.token,
+      expiresAt: result.expiresAt,
+      meta: result.meta,
+    });
+  });
 
   // Module 1: Environment connectivity status
   app.get('/api/integrations/status', async (_req, res) => {
@@ -161,9 +309,15 @@ async function startServer() {
         model: GEMINI_AGENT_MODEL,
         checkedAt: new Date().toISOString(),
       },
+      feishu: getFeishuIntegrationStatus(),
     };
 
     res.json(payload);
+  });
+
+  // Feishu Bot integration status & callback paths (no secrets exposed)
+  app.get('/api/feishu/status', (_req, res) => {
+    res.json({ feishu: getFeishuIntegrationStatus() });
   });
 
   // List stored pipeline runs
@@ -174,6 +328,38 @@ async function startServer() {
   // Global detached server-side background tasks (survives page switches / refresh / disconnect)
   app.get('/api/tasks', (_req, res) => {
     res.json({ tasks: listBackgroundTasks(30) });
+  });
+
+  // Lightweight SSE keepalive held open by active browsers while background deploy/build tasks run.
+  // Keeps an active HTTP request open on Cloud Run so request-based CPU allocation stays at 100%.
+  app.get('/api/tasks/keepalive', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    res.write(': connected\n\n');
+
+    const startedAt = Date.now();
+    const maxDurationMs = 4 * 60 * 1000;
+    const heartbeat = setInterval(() => {
+      const stillRunning = listBackgroundTasks(25).some((t) => t.status === 'running');
+      if (!stillRunning || Date.now() - startedAt >= maxDurationMs) {
+        clearInterval(heartbeat);
+        if (!res.writableEnded) {
+          res.write('event: idle\ndata: done\n\n');
+          res.end();
+        }
+        return;
+      }
+      if (!res.writableEnded) {
+        res.write(`: ping ${Date.now()}\n\n`);
+      }
+    }, 4000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+    });
   });
 
   app.get('/api/tasks/:id', (req, res) => {
@@ -1159,6 +1345,17 @@ async function startServer() {
           detail: `创建规格 Draft PR #${draftPr.prNumber}（特性分支 ${draftPr.branchName}，提交 ${draftPr.commitSha.slice(0, 7)}）`,
         });
 
+        void notifyFeishuStageEvent({
+          kind: 'draft_pr_created',
+          prdTitle: targetRun.prdTitle,
+          repoFullName: targetRun.repoFullName,
+          runId: targetRun.id,
+          branchName: draftPr.branchName,
+          prNumber: draftPr.prNumber,
+          prUrl: draftPr.prUrl,
+          summary: `特性分支 ${draftPr.branchName} 与隔离盲测用例已提交。`,
+        });
+
         return { draftPr, run: updatedRun };
       };
 
@@ -1318,6 +1515,8 @@ async function startServer() {
             reloadJobsFromDisk();
             reloadAuditLogsFromDisk();
             reloadRsiStateFromDisk();
+            reloadEditAuthFromDisk();
+            reloadFeishuStateFromDisk();
           },
         });
         return {
@@ -1737,6 +1936,18 @@ async function startServer() {
         detail: `派发 VPS AGY 在分支 ${cleanBranch} 执行编码（模型：${result.model} · 模式：${result.mode}）`,
       });
 
+      void watchAgyCodingRunAndNotifyFeishu({
+        owner: parsed.owner,
+        repo: parsed.name,
+        repoFullName: parsed.fullName,
+        prBranch: cleanBranch,
+        prNumber: prNumber ? Number(prNumber) : linkedRun?.draftPr?.prNumber,
+        prUrl: linkedRun?.draftPr?.prUrl,
+        runId: linkedRun?.id || (runId ? String(runId) : undefined),
+        prdTitle: linkedRun?.prdTitle || cleanBranch,
+        dispatchedAtMs: Date.now(),
+      });
+
       res.json({
         ...result,
         sessionMode: sessionPolicy.mode,
@@ -1829,13 +2040,26 @@ async function startServer() {
 
         appendAuditLog({
           category: 'execution',
-          action: 'preview_deployed',
+          action: deployMode === 'production' ? 'production_deployed' : 'preview_deployed',
           repoFullName: parsed.fullName,
           runId: existingRun?.id,
           prdTitle: existingRun?.prdTitle,
           branch: resolvedBranch,
           prNumber: resolvedPrNumber,
           detail: `部署${deployment.isIsolatedPreview ? '隔离预览' : '生产'} Worker ${deployment.workerName} (${deployment.url})`,
+        });
+
+        await notifyFeishuStageEvent({
+          kind: deployMode === 'production' ? 'production_deployed' : 'preview_deployed',
+          prdTitle: existingRun?.prdTitle || resolvedBranch,
+          repoFullName: parsed.fullName,
+          runId: existingRun?.id,
+          branchName: resolvedBranch,
+          prNumber: resolvedPrNumber,
+          prUrl: existingRun?.draftPr?.prUrl,
+          previewUrl: deployMode === 'preview' ? deployment.url : undefined,
+          productionUrl: deployMode === 'production' ? deployment.url : undefined,
+          summary: `Worker ${deployment.workerName} 已部署上线。`,
         });
 
         return {
@@ -1855,6 +2079,16 @@ async function startServer() {
           relatedRunId: existingRun?.id,
           branch: resolvedBranch,
         }).catch(() => {});
+        await notifyFeishuStageEvent({
+          kind: deployMode === 'production' ? 'production_failed' : 'preview_failed',
+          prdTitle: existingRun?.prdTitle || resolvedBranch,
+          repoFullName: parsed.fullName,
+          runId: existingRun?.id,
+          branchName: resolvedBranch,
+          prNumber: resolvedPrNumber,
+          prUrl: existingRun?.draftPr?.prUrl,
+          error: errMsg,
+        });
         throw new Error(errMsg);
       }
     };
@@ -1886,6 +2120,175 @@ async function startServer() {
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : 'Cloudflare Workers 预览部署失败',
+      });
+    }
+  });
+
+  // Shared helper: Deploy or re-deploy production Cloudflare Workers from merged main branch
+  async function executeProductionDeploy(params: {
+    runId?: string;
+    repoFullName?: string;
+    branchName?: string;
+    workerName?: string;
+    actor?: string;
+    chatId?: string;
+  }) {
+    const existingRun = params.runId ? getRunById(String(params.runId)) : undefined;
+    const resolvedRepo = String(
+      params.repoFullName || existingRun?.repoFullName || FIXED_TARGET_REPO.fullName
+    );
+    const parsed = parseRepoFullName(resolvedRepo);
+    if (!parsed) {
+      throw new Error('无效的目标仓库标识（owner/repo）');
+    }
+
+    const resolvedBranch = String(
+      params.branchName ||
+        existingRun?.mergedRelease?.baseBranch ||
+        existingRun?.defaultBranch ||
+        'main'
+    ).trim();
+
+    try {
+      const { deployment, deployLogTail } = await deployBranchPreviewToCloudflare({
+        owner: parsed.owner,
+        repo: parsed.name,
+        branchName: resolvedBranch,
+        workerNameOverride: params.workerName ? String(params.workerName) : undefined,
+        prNumber: existingRun?.draftPr?.prNumber,
+        mode: 'production',
+      });
+
+      const updatedRun = existingRun
+        ? updateRunReview(existingRun.id, { productionDeployment: deployment })
+        : undefined;
+
+      appendAuditLog({
+        category: 'execution',
+        action: 'production_deployed',
+        actor: params.actor || '控制面操作员',
+        repoFullName: parsed.fullName,
+        runId: existingRun?.id,
+        prdTitle: existingRun?.prdTitle,
+        branch: resolvedBranch,
+        prNumber: existingRun?.draftPr?.prNumber,
+        detail: `部署正式生产环境 Worker ${deployment.workerName}（${deployment.url}）`,
+      });
+
+      await notifyFeishuStageEvent({
+        kind: 'production_deployed',
+        prdTitle: existingRun?.prdTitle || `${parsed.fullName}@${resolvedBranch}`,
+        repoFullName: parsed.fullName,
+        runId: existingRun?.id,
+        branchName: resolvedBranch,
+        prNumber: existingRun?.draftPr?.prNumber,
+        prUrl: existingRun?.draftPr?.prUrl,
+        productionUrl: deployment.url,
+        summary: `生产 Worker ${deployment.workerName} 已重新发布上线。`,
+        chatId: params.chatId,
+      });
+
+      return { deployment, deployLogTail, run: updatedRun };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Cloudflare 生产环境部署失败';
+      appendAuditLog({
+        category: 'execution',
+        action: 'production_deployed',
+        actor: params.actor || '控制面操作员',
+        repoFullName: parsed.fullName,
+        runId: existingRun?.id,
+        prdTitle: existingRun?.prdTitle,
+        branch: resolvedBranch,
+        prNumber: existingRun?.draftPr?.prNumber,
+        status: 'failed',
+        detail: `重新部署生产环境失败：${errMsg}`,
+      });
+      void captureAndReflectIncident({
+        sourceRefKey: `deploy-production:${resolvedBranch}:${Date.now()}`,
+        source: 'deploy_error',
+        repoFullName: parsed.fullName,
+        title: `Cloudflare 生产部署失败（${resolvedBranch}）`,
+        errorSummary: errMsg,
+        rawEvidence: errMsg,
+        relatedRunId: existingRun?.id,
+        branch: resolvedBranch,
+      }).catch(() => {});
+      await notifyFeishuStageEvent({
+        kind: 'production_failed',
+        prdTitle: existingRun?.prdTitle || `${parsed.fullName}@${resolvedBranch}`,
+        repoFullName: parsed.fullName,
+        runId: existingRun?.id,
+        branchName: resolvedBranch,
+        prNumber: existingRun?.draftPr?.prNumber,
+        prUrl: existingRun?.draftPr?.prUrl,
+        error: errMsg,
+        chatId: params.chatId,
+      });
+      throw new Error(errMsg);
+    }
+  }
+
+  // Module 4: Dedicated Production Cloudflare Workers Deploy / Redeploy endpoint
+  app.post('/api/cloudflare/deploy-production', async (req, res) => {
+    const { runId, repoFullName, branchName, workerName } = req.body ?? {};
+    const existingRun = runId ? getRunById(String(runId)) : undefined;
+    const resolvedRepo = String(
+      repoFullName || existingRun?.repoFullName || FIXED_TARGET_REPO.fullName
+    );
+    const parsed = parseRepoFullName(resolvedRepo);
+    if (!parsed) {
+      res.status(400).json({ error: '无效的目标仓库标识（owner/repo）' });
+      return;
+    }
+
+    const resolvedBranch = String(
+      branchName ||
+        existingRun?.mergedRelease?.baseBranch ||
+        existingRun?.defaultBranch ||
+        'main'
+    ).trim();
+
+    if (req.body?.async === true) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'deploy_production',
+        title: `部署生产环境（${existingRun?.prdTitle?.slice(0, 22) || resolvedBranch}）`,
+        roomId: 'approval',
+        runId: existingRun?.id,
+        repoFullName: parsed.fullName,
+        dedupeKey: `deploy_production:${parsed.fullName}:${resolvedBranch}`,
+        initialMessage: `正在后台构建主分支 ${resolvedBranch} 并发布至 Cloudflare 生产环境…`,
+        executor: async () => {
+          const payload = await executeProductionDeploy({
+            runId: existingRun?.id,
+            repoFullName: parsed.fullName,
+            branchName: resolvedBranch,
+            workerName: workerName ? String(workerName) : undefined,
+          });
+          return {
+            summary: `生产环境已上线：${payload.deployment.url}`,
+            result: {
+              url: payload.deployment.url,
+              workerName: payload.deployment.workerName,
+              runId: existingRun?.id,
+            },
+          };
+        },
+      });
+      res.status(202).json({ async: true, deduplicated, task });
+      return;
+    }
+
+    try {
+      const payload = await executeProductionDeploy({
+        runId: existingRun?.id,
+        repoFullName: parsed.fullName,
+        branchName: resolvedBranch,
+        workerName: workerName ? String(workerName) : undefined,
+      });
+      res.json(payload);
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Cloudflare 生产环境部署失败',
       });
     }
   });
@@ -2232,6 +2635,72 @@ async function startServer() {
         }
       }
 
+      if (updated) {
+        if (decision === 'approved') {
+          if (productionDeployResult?.deployed && productionDeployResult.deployment) {
+            await notifyFeishuStageEvent({
+              kind: 'production_deployed',
+              prdTitle: updated.prdTitle,
+              repoFullName: updated.repoFullName,
+              runId: updated.id,
+              branchName: mergeResult?.baseBranch || updated.defaultBranch,
+              prNumber: updated.draftPr?.prNumber,
+              prUrl: updated.draftPr?.prUrl,
+              productionUrl: productionDeployResult.deployment.url,
+              summary: `PR 已合入 ${mergeResult?.baseBranch || 'main'} 并自动发布生产环境。`,
+            });
+          } else if (productionDeployResult && !productionDeployResult.deployed) {
+            await notifyFeishuStageEvent({
+              kind: 'production_failed',
+              prdTitle: updated.prdTitle,
+              repoFullName: updated.repoFullName,
+              runId: updated.id,
+              branchName: mergeResult?.baseBranch || updated.defaultBranch,
+              prNumber: updated.draftPr?.prNumber,
+              prUrl: updated.draftPr?.prUrl,
+              error: productionDeployResult.error || '自动部署生产环境失败',
+            });
+          } else if (mergeResult && !mergeResult.merged) {
+            await notifyFeishuStageEvent({
+              kind: 'production_failed',
+              prdTitle: updated.prdTitle,
+              repoFullName: updated.repoFullName,
+              runId: updated.id,
+              branchName: updated.draftPr?.branchName || updated.defaultBranch,
+              prNumber: updated.draftPr?.prNumber,
+              prUrl: updated.draftPr?.prUrl,
+              error: `PR 合并失败：${mergeResult.error || '请检查冲突'}`,
+            });
+          }
+        } else if (decision === 'changes_requested' && reworkResult?.dispatched) {
+          const parsedReworkRepo = parseRepoFullName(updated.repoFullName);
+          await notifyFeishuStageEvent({
+            kind: 'rework_dispatched',
+            prdTitle: updated.prdTitle,
+            repoFullName: updated.repoFullName,
+            runId: updated.id,
+            branchName: reworkResult.branchName,
+            prNumber: updated.draftPr?.prNumber,
+            prUrl: updated.draftPr?.prUrl,
+            actionsUrl: reworkResult.actionsUrl,
+            summary: reworkResult.note || '已按人工修订意见启动自动返工。',
+          });
+          if (parsedReworkRepo) {
+            void watchAgyCodingRunAndNotifyFeishu({
+              owner: parsedReworkRepo.owner,
+              repo: parsedReworkRepo.name,
+              repoFullName: parsedReworkRepo.fullName,
+              prBranch: reworkResult.branchName,
+              prNumber: updated.draftPr?.prNumber,
+              prUrl: updated.draftPr?.prUrl,
+              runId: updated.id,
+              prdTitle: updated.prdTitle,
+              dispatchedAtMs: Date.now(),
+            });
+          }
+        }
+      }
+
       return {
         run: updated,
         githubSync,
@@ -2288,6 +2757,877 @@ async function startServer() {
     res.json(payload);
   });
 
+  // =========================================================================
+  // Feishu (Lark) Bot Integration: Coding Completion Watcher + Webhook Routes
+  // =========================================================================
+  async function watchAgyCodingRunAndNotifyFeishu(params: {
+    owner: string;
+    repo: string;
+    repoFullName: string;
+    prBranch: string;
+    prNumber?: number;
+    prUrl?: string;
+    runId?: string;
+    prdTitle: string;
+    dispatchedAtMs: number;
+    chatId?: string;
+  }): Promise<void> {
+    if (!getFeishuIntegrationStatus().configured) return;
+    const key = `${params.owner}/${params.repo}:${params.prBranch}`;
+    if (activeAgyCodingWatchers.has(key)) return;
+    activeAgyCodingWatchers.add(key);
+
+    const maxWaitMs = 185 * 60 * 1000;
+    const pollIntervalMs = 20_000;
+    const startedAt = Date.now();
+    let trackedActionRunId: number | null = null;
+
+    try {
+      while (Date.now() - startedAt < maxWaitMs) {
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        try {
+          const listRes = await listGitHubActionRuns(params.owner, params.repo, 15);
+          type RunEntry = (typeof listRes.runs)[number];
+          const matchedById: RunEntry | undefined =
+            trackedActionRunId !== null
+              ? listRes.runs.find((r) => r.id === trackedActionRunId)
+              : undefined;
+          const candidate: RunEntry | undefined =
+            matchedById ??
+            listRes.runs.find((r) => {
+              const nameLower = (r.name || '').toLowerCase();
+              const isPlan = nameLower.includes('plan');
+              const isCoding = !isPlan && (nameLower.includes('agy') || nameLower.includes('coding'));
+              const createdMs = Date.parse(r.createdAt);
+              return isCoding && Number.isFinite(createdMs) && createdMs >= params.dispatchedAtMs - 15_000;
+            });
+
+          if (!candidate) continue;
+          trackedActionRunId = candidate.id;
+
+          if (candidate.status === 'completed') {
+            await syncRepoTestReportsAndFailures(params.owner, params.repo, {
+              autoAnalyzeLimit: 2,
+            }).catch(() => null);
+
+            const reports = getRsiState().testReports.filter(
+              (rep) =>
+                rep.actionsRunId === candidate.id ||
+                (params.runId && rep.pipelineRunId === params.runId) ||
+                rep.branch === params.prBranch
+            );
+            const latestRep = reports[0];
+            const succeeded = candidate.conclusion === 'success';
+
+            await notifyFeishuStageEvent({
+              kind: succeeded ? 'coding_completed' : 'coding_failed',
+              prdTitle: params.prdTitle,
+              repoFullName: params.repoFullName,
+              runId: params.runId,
+              branchName: params.prBranch,
+              prNumber: params.prNumber,
+              prUrl: params.prUrl,
+              actionsUrl: candidate.htmlUrl,
+              passedTests: latestRep?.passed,
+              failedTests: latestRep?.failed,
+              summary:
+                latestRep?.summary ||
+                (succeeded
+                  ? 'VPS AGY 已完成代码实现并推送到 PR 分支。'
+                  : `GitHub Actions 结束状态：${candidate.conclusion || 'failure'}`),
+              error: succeeded
+                ? undefined
+                : `Actions #${candidate.id} 结束状态：${candidate.conclusion || 'failure'}`,
+              chatId: params.chatId,
+            });
+            return;
+          }
+        } catch {
+          // Ignore transient GitHub polling errors
+        }
+      }
+    } finally {
+      activeAgyCodingWatchers.delete(key);
+    }
+  }
+
+  // Helper: execute Draft PR creation for a run (shared with Feishu card callback)
+  async function executeFeishuDraftPrCreation(runId: string, chatId?: string) {
+    const targetRun = getRunById(runId);
+    if (!targetRun) throw new Error('未找到对应的需求规划记录');
+    if (targetRun.draftPr) {
+      return { draftPr: targetRun.draftPr, run: targetRun };
+    }
+    const parsedRepo = parseRepoFullName(targetRun.repoFullName);
+    if (!parsedRepo) throw new Error(`无效的目标仓库格式：${targetRun.repoFullName}`);
+
+    const artifacts = buildPrArtifacts(targetRun);
+    const draftPr = await createSpecDraftPr({
+      owner: parsedRepo.owner,
+      repo: parsedRepo.name,
+      baseBranch: targetRun.defaultBranch,
+      artifacts,
+    });
+
+    const rsiGuidelinesMd = buildRsiGuidelinesMarkdown(listAllRsiRules());
+    if (rsiGuidelinesMd) {
+      try {
+        await commitRsiGuidelinesToBranch({
+          owner: parsedRepo.owner,
+          repo: parsedRepo.name,
+          branchName: draftPr.branchName,
+          markdownContent: rsiGuidelinesMd,
+        });
+        recordRulesAppliedForStage('coding');
+      } catch {
+        // non-fatal
+      }
+    }
+
+    const updatedRun = attachDraftPrToRun(targetRun.id, draftPr) || {
+      ...targetRun,
+      status: 'pr_created' as const,
+      draftPr,
+    };
+
+    appendAuditLog({
+      category: 'planning',
+      action: 'draft_pr_created',
+      actor: '飞书机器人',
+      repoFullName: targetRun.repoFullName,
+      runId: targetRun.id,
+      prdTitle: targetRun.prdTitle,
+      branch: draftPr.branchName,
+      prNumber: draftPr.prNumber,
+      detail: `通过飞书卡片创建 Draft PR #${draftPr.prNumber}（分支 ${draftPr.branchName}）`,
+    });
+
+    await notifyFeishuStageEvent({
+      kind: 'draft_pr_created',
+      prdTitle: targetRun.prdTitle,
+      repoFullName: targetRun.repoFullName,
+      runId: targetRun.id,
+      branchName: draftPr.branchName,
+      prNumber: draftPr.prNumber,
+      prUrl: draftPr.prUrl,
+      summary: `特性分支 ${draftPr.branchName} 与隔离盲测用例已提交。`,
+      chatId,
+    });
+
+    return { draftPr, run: updatedRun };
+  }
+
+  // Feishu Event Subscription Webhook (URL Verification + @Bot im.message.receive_v1)
+  app.post('/api/feishu/events', (req, res) => {
+    const rawBody = (req as RequestWithRawBody).rawBody ?? JSON.stringify(req.body ?? {});
+    const verified = verifyAndDecodeFeishuWebhook({
+      rawBody,
+      body: req.body,
+      headers: req.headers,
+    });
+    if (!verified.ok) {
+      res.status(verified.statusCode).json({ error: verified.error, code: verified.code });
+      return;
+    }
+
+    const parsed = parseFeishuEventBody(verified.payload);
+    if (parsed.kind === 'url_verification' && parsed.challenge) {
+      res.json({ challenge: parsed.challenge });
+      return;
+    }
+
+    if (isDuplicateFeishuEvent(parsed.eventId)) {
+      res.json({ code: 0 });
+      return;
+    }
+
+    // Respond immediately (<300ms) so Feishu does not retry due to 3s webhook timeout
+    res.json({ code: 0 });
+
+    if (parsed.kind !== 'im_message' || !parsed.message || !parsed.message.mentionsBot) {
+      return;
+    }
+
+    const msg = parsed.message;
+    if (!isFeishuChatAllowed(msg.chatId)) {
+      return;
+    }
+    rememberFeishuActiveChat(msg.chatId);
+
+    void (async () => {
+      const clean = msg.cleanText.trim();
+      const appBaseUrl = getFeishuAppBaseUrl() || undefined;
+      const askingStatus = /^(\/status|状态|进度|当前状态)$/i.test(clean);
+
+      if (askingStatus) {
+        const runningJob = getRunningAnalysisJob();
+        const latestRun = listRuns()[0];
+        if (runningJob) {
+          const card = buildFeishuStageCard({
+            kind: 'rework_dispatched',
+            prdTitle: `架构规划进行中 · ${runningJob.prdTitle}`,
+            repoFullName: runningJob.repoFullName,
+            jobId: runningJob.id,
+            actionsUrl: runningJob.planActionsUrl,
+            summary: '当前正在执行多智能体架构与盲测规划，完成后会自动推送操作卡片。',
+            appBaseUrl,
+            chatId: msg.chatId,
+          });
+          await replyFeishuCardMessage(msg.messageId, card).catch(() =>
+            sendFeishuCardMessage(msg.chatId, card)
+          );
+          return;
+        }
+        if (latestRun) {
+          const stageKind = latestRun.productionDeployment
+            ? 'production_deployed'
+            : latestRun.mergedRelease
+              ? 'production_failed'
+              : latestRun.previewDeployment
+                ? 'preview_deployed'
+                : latestRun.draftPr
+                  ? 'draft_pr_created'
+                  : 'plan_completed';
+          const card = buildFeishuStageCard({
+            kind: stageKind,
+            prdTitle: latestRun.prdTitle,
+            repoFullName: latestRun.repoFullName,
+            runId: latestRun.id,
+            branchName: latestRun.draftPr?.branchName,
+            prNumber: latestRun.draftPr?.prNumber,
+            prUrl: latestRun.draftPr?.prUrl,
+            previewUrl: latestRun.previewDeployment?.url,
+            productionUrl: latestRun.productionDeployment?.url,
+            appBaseUrl,
+            chatId: msg.chatId,
+          });
+          await replyFeishuCardMessage(msg.messageId, card).catch(() =>
+            sendFeishuCardMessage(msg.chatId, card)
+          );
+          return;
+        }
+      }
+
+      // Derive optional prefill from message text after @bot
+      let prefillTitle = '';
+      let prefillContent = '';
+      if (clean && !/^(启动需求|发起需求|新建需求|新需求|需求|start|new)$/i.test(clean)) {
+        const lines = clean.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+        if (lines.length >= 2) {
+          prefillTitle = lines[0].slice(0, 60);
+          prefillContent = lines.slice(1).join('\n');
+        } else if (clean.length <= 36) {
+          prefillTitle = clean;
+        } else {
+          prefillTitle = clean.slice(0, 30);
+          prefillContent = clean;
+        }
+      }
+
+      const formCard = buildFeishuPrdFormCard({
+        repoFullName: FIXED_TARGET_REPO.fullName,
+        chatId: msg.chatId,
+        prefillTitle,
+        prefillContent,
+        appBaseUrl,
+      });
+
+      const replyRes = await replyFeishuCardMessage(msg.messageId, formCard);
+      if (!replyRes.ok) {
+        await sendFeishuCardMessage(msg.chatId, formCard);
+      }
+    })();
+  });
+
+  // Feishu Interactive Card Action Callback (Form Submission & Next-Stage Buttons)
+  app.post('/api/feishu/card-action', (req, res) => {
+    const rawBody = (req as RequestWithRawBody).rawBody ?? JSON.stringify(req.body ?? {});
+    const verified = verifyAndDecodeFeishuWebhook({
+      rawBody,
+      body: req.body,
+      headers: req.headers,
+    });
+    if (!verified.ok) {
+      res.status(verified.statusCode).json({ error: verified.error, code: verified.code });
+      return;
+    }
+
+    const parsed = parseFeishuCardCallbackBody(verified.payload);
+    if (parsed.kind === 'url_verification' && parsed.challenge) {
+      res.json({ challenge: parsed.challenge });
+      return;
+    }
+
+    if (parsed.kind !== 'card_action' || !parsed.actionType) {
+      res.json({ toast: { type: 'info', content: '已收到卡片回调' } });
+      return;
+    }
+
+    const chatId = parsed.chatId || '';
+    if (chatId && !isFeishuChatAllowed(chatId)) {
+      res.json({ toast: { type: 'error', content: '当前会话未在允许列表中，操作已拒绝' } });
+      return;
+    }
+    if (chatId) {
+      rememberFeishuActiveChat(chatId);
+    }
+
+    if (parsed.eventId && isDuplicateFeishuEvent(parsed.eventId)) {
+      res.json({ toast: { type: 'info', content: '该操作已受理，请勿重复点击' } });
+      return;
+    }
+
+    const action = parsed.actionType;
+    const val = parsed.actionValue;
+    const form = parsed.formValue;
+    const appBaseUrl = getFeishuAppBaseUrl() || undefined;
+
+    if (action === 'open_prd_form') {
+      res.json({ toast: { type: 'info', content: '正在发送需求收集表单卡片…' } });
+      if (chatId) {
+        void sendFeishuCardMessage(
+          chatId,
+          buildFeishuPrdFormCard({
+            repoFullName: FIXED_TARGET_REPO.fullName,
+            chatId,
+            appBaseUrl,
+          })
+        );
+      }
+      return;
+    }
+
+    if (action === 'submit_prd_form') {
+      const prdTitle = (form.prd_title || '').trim();
+      const prdContent = (form.prd_content || '').trim();
+      const techStackHint = (form.tech_stack_hint || '').trim() || undefined;
+      const agyModel = (form.agy_model || '').trim() || undefined;
+      const repoFullName = (val.repo || FIXED_TARGET_REPO.fullName).trim();
+
+      const check = validatePrdInput({ repoFullName, prdTitle, prdContent });
+      if (!check.valid) {
+        const firstErr = Object.values(check.errors)[0] || '请完整填写需求标题与 PRD 详情';
+        res.json({ toast: { type: 'error', content: firstErr } });
+        return;
+      }
+
+      const running = getRunningAnalysisJob();
+      if (running) {
+        res.json({
+          toast: {
+            type: 'warning',
+            content: `已有规划任务「${running.prdTitle}」正在执行，请等待完成后再发起`,
+          },
+        });
+        return;
+      }
+
+      try {
+        const job = createAndStartAnalysisJob({
+          repoFullName,
+          defaultBranch: FIXED_TARGET_REPO.defaultBranch,
+          prdTitle,
+          prdContent,
+          techStackHint,
+          agyModel,
+          executionMode: 'vps_agy',
+        });
+        appendAuditLog({
+          category: 'planning',
+          action: 'prd_analysis_started',
+          actor: '飞书机器人',
+          repoFullName: job.repoFullName,
+          jobId: job.id,
+          prdTitle: job.prdTitle,
+          branch: job.defaultBranch,
+          detail: `通过飞书卡片发起需求规划（${job.agyModel || '默认模型'}）`,
+        });
+        res.json({
+          toast: {
+            type: 'success',
+            content: `已启动「${prdTitle}」架构规划，完成后将自动推送下一步卡片！`,
+          },
+        });
+      } catch (err) {
+        res.json({
+          toast: {
+            type: 'error',
+            content: err instanceof Error ? err.message : '启动架构规划失败',
+          },
+        });
+      }
+      return;
+    }
+
+    if (action === 'create_draft_pr') {
+      const runId = (val.run_id || '').trim();
+      const run = runId ? getRunById(runId) : undefined;
+      if (!run) {
+        res.json({ toast: { type: 'error', content: '未找到对应的需求规划记录' } });
+        return;
+      }
+      if (run.draftPr) {
+        res.json({
+          toast: { type: 'info', content: `Draft PR #${run.draftPr.prNumber} 已创建，无需重复操作` },
+        });
+        return;
+      }
+      enqueueBackgroundTask({
+        kind: 'create_draft_pr',
+        title: `[飞书] 创建 Draft PR：${run.prdTitle.slice(0, 24)}`,
+        roomId: 'prd',
+        runId: run.id,
+        repoFullName: run.repoFullName,
+        dedupeKey: `create_draft_pr:${run.id}`,
+        initialMessage: '正在后台创建 GitHub Draft PR 并提交规格契约…',
+        executor: async () => {
+          const outcome = await executeFeishuDraftPrCreation(run.id, chatId);
+          return {
+            summary: `Draft PR #${outcome.draftPr.prNumber} 已创建`,
+            result: { prNumber: outcome.draftPr.prNumber, prUrl: outcome.draftPr.prUrl },
+          };
+        },
+      });
+      res.json({
+        toast: { type: 'success', content: '已受理创建 Draft PR，完成后将在本群推送编码卡片' },
+      });
+      return;
+    }
+
+    if (action === 'dispatch_agy') {
+      const runId = (val.run_id || '').trim();
+      const run = runId ? getRunById(runId) : undefined;
+      const branch = (val.branch || run?.draftPr?.branchName || '').trim();
+      const prNumber = Number(val.pr_number || run?.draftPr?.prNumber || 0) || undefined;
+      const parsedRepo = parseRepoFullName(run?.repoFullName || FIXED_TARGET_REPO.fullName);
+
+      if (!parsedRepo || !branch) {
+        res.json({ toast: { type: 'error', content: '缺少目标 PR 分支信息，无法派发 AGY 编码' } });
+        return;
+      }
+
+      res.json({
+        toast: { type: 'success', content: `正在向分支 ${branch} 派发 AGY 自动编码，完成后自动通知` },
+      });
+
+      void (async () => {
+        try {
+          const rsiGuidelinesMd = buildRsiGuidelinesMarkdown(listAllRsiRules());
+          if (rsiGuidelinesMd && branch !== 'main' && branch !== 'master') {
+            await commitRsiGuidelinesToBranch({
+              owner: parsedRepo.owner,
+              repo: parsedRepo.name,
+              branchName: branch,
+              markdownContent: rsiGuidelinesMd,
+            }).catch(() => {});
+            recordRulesAppliedForStage('coding');
+          }
+          const sessionPolicy = decideAgySessionPolicy({
+            targetBranch: branch,
+            lastAgySession: run?.lastAgySession,
+          });
+          const dispatchRes = await dispatchAgyWorkflow({
+            owner: parsedRepo.owner,
+            repo: parsedRepo.name,
+            prBranch: branch,
+            prNumber,
+            runId: run?.id,
+            e2eTestPath: run?.draftPr?.e2eTestPath,
+            baseBranch: run?.defaultBranch || 'main',
+            sessionMode: sessionPolicy.mode,
+            resumeSessionId: sessionPolicy.resumeSessionId,
+          });
+          appendAuditLog({
+            category: 'execution',
+            action: 'agy_coding_dispatched',
+            actor: '飞书机器人',
+            repoFullName: parsedRepo.fullName,
+            runId: run?.id,
+            prdTitle: run?.prdTitle,
+            branch,
+            prNumber,
+            detail: `通过飞书卡片派发 VPS AGY 编码（模型：${dispatchRes.model}）`,
+          });
+          void watchAgyCodingRunAndNotifyFeishu({
+            owner: parsedRepo.owner,
+            repo: parsedRepo.name,
+            repoFullName: parsedRepo.fullName,
+            prBranch: branch,
+            prNumber,
+            prUrl: run?.draftPr?.prUrl,
+            runId: run?.id,
+            prdTitle: run?.prdTitle || branch,
+            dispatchedAtMs: Date.now(),
+            chatId,
+          });
+        } catch (err) {
+          await notifyFeishuStageEvent({
+            kind: 'coding_failed',
+            prdTitle: run?.prdTitle || branch,
+            repoFullName: parsedRepo.fullName,
+            runId: run?.id,
+            branchName: branch,
+            prNumber,
+            prUrl: run?.draftPr?.prUrl,
+            error: err instanceof Error ? err.message : '派发 AGY 编码流水线失败',
+            chatId,
+          });
+        }
+      })();
+      return;
+    }
+
+    if (action === 'deploy_preview') {
+      const runId = (val.run_id || '').trim();
+      const run = runId ? getRunById(runId) : undefined;
+      const branch = (val.branch || run?.draftPr?.branchName || '').trim();
+      const prNumber = Number(val.pr_number || run?.draftPr?.prNumber || 0) || undefined;
+      const parsedRepo = parseRepoFullName(run?.repoFullName || FIXED_TARGET_REPO.fullName);
+
+      if (!parsedRepo || !branch) {
+        res.json({ toast: { type: 'error', content: '缺少目标分支信息，无法部署隔离预览' } });
+        return;
+      }
+
+      enqueueBackgroundTask({
+        kind: 'deploy_preview',
+        title: `[飞书] 部署隔离预览（${branch}）`,
+        roomId: 'approval',
+        runId: run?.id,
+        repoFullName: parsedRepo.fullName,
+        dedupeKey: `deploy_preview:${parsedRepo.fullName}:${branch}`,
+        initialMessage: `正在后台部署分支 ${branch} 到隔离 Cloudflare Preview…`,
+        executor: async () => {
+          try {
+            const { deployment } = await deployBranchPreviewToCloudflare({
+              owner: parsedRepo.owner,
+              repo: parsedRepo.name,
+              branchName: branch,
+              prNumber,
+              mode: 'preview',
+            });
+            if (run) attachPreviewDeploymentToRun(run.id, deployment);
+            appendAuditLog({
+              category: 'execution',
+              action: 'preview_deployed',
+              actor: '飞书机器人',
+              repoFullName: parsedRepo.fullName,
+              runId: run?.id,
+              prdTitle: run?.prdTitle,
+              branch,
+              prNumber,
+              detail: `通过飞书卡片部署隔离预览 Worker ${deployment.workerName} (${deployment.url})`,
+            });
+            await notifyFeishuStageEvent({
+              kind: 'preview_deployed',
+              prdTitle: run?.prdTitle || branch,
+              repoFullName: parsedRepo.fullName,
+              runId: run?.id,
+              branchName: branch,
+              prNumber,
+              prUrl: run?.draftPr?.prUrl,
+              previewUrl: deployment.url,
+              summary: `预览 Worker ${deployment.workerName} 已就绪。`,
+              chatId,
+            });
+            return {
+              summary: `预览环境已就绪：${deployment.url}`,
+              result: { url: deployment.url, workerName: deployment.workerName },
+            };
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : '预览环境部署失败';
+            await notifyFeishuStageEvent({
+              kind: 'preview_failed',
+              prdTitle: run?.prdTitle || branch,
+              repoFullName: parsedRepo.fullName,
+              runId: run?.id,
+              branchName: branch,
+              prNumber,
+              prUrl: run?.draftPr?.prUrl,
+              error: errMsg,
+              chatId,
+            });
+            throw new Error(errMsg);
+          }
+        },
+      });
+
+      res.json({
+        toast: { type: 'success', content: '正在后台部署隔离预览环境，完成后将推送预览链接' },
+      });
+      return;
+    }
+
+    if (action === 'approve_release') {
+      const runId = (val.run_id || '').trim();
+      const run = runId ? getRunById(runId) : undefined;
+      if (!run || !run.draftPr) {
+        res.json({ toast: { type: 'error', content: '未找到可合并上线的 Draft PR 记录' } });
+        return;
+      }
+      const parsedRepo = parseRepoFullName(run.repoFullName);
+      if (!parsedRepo) {
+        res.json({ toast: { type: 'error', content: '目标仓库格式无效' } });
+        return;
+      }
+
+      enqueueBackgroundTask({
+        kind: 'approve_release',
+        title: `[飞书] 批准上线并发布：${run.prdTitle.slice(0, 22)}`,
+        roomId: 'approval',
+        runId: run.id,
+        repoFullName: run.repoFullName,
+        dedupeKey: `review:${run.id}:approved`,
+        initialMessage: '正在后台合并 PR 并部署生产环境…',
+        executor: async ({ setProgress }) => {
+          updateRunReview(run.id, {
+            status: 'approved',
+            approvalNote: '通过飞书卡片批准上线',
+            approvedAt: new Date().toISOString(),
+          });
+          setProgress?.(`正在合并 PR #${run.draftPr!.prNumber} 到主分支…`);
+          const resMerge = await mergeDraftPrToMain({
+            owner: parsedRepo.owner,
+            repo: parsedRepo.name,
+            prNumber: run.draftPr!.prNumber,
+            commitTitle: `feat(autodev): ${run.prdTitle} (#${run.draftPr!.prNumber})`,
+            commitMessage: 'Approved and merged via Feishu Bot',
+            mergeMethod: 'squash',
+          });
+          if (!resMerge.merged || !resMerge.release) {
+            const errMsg = resMerge.error || 'PR 合并失败';
+            await notifyFeishuStageEvent({
+              kind: 'production_failed',
+              prdTitle: run.prdTitle,
+              repoFullName: run.repoFullName,
+              runId: run.id,
+              branchName: run.draftPr!.branchName,
+              prNumber: run.draftPr!.prNumber,
+              prUrl: run.draftPr!.prUrl,
+              error: `PR 合并失败：${errMsg}`,
+              chatId,
+            });
+            throw new Error(errMsg);
+          }
+
+          updateRunReview(run.id, { mergedRelease: resMerge.release });
+          appendAuditLog({
+            category: 'approval',
+            action: 'release_approved',
+            actor: '飞书审批人',
+            repoFullName: run.repoFullName,
+            runId: run.id,
+            prdTitle: run.prdTitle,
+            branch: resMerge.release.baseBranch,
+            prNumber: run.draftPr!.prNumber,
+            detail: `通过飞书卡片验收通过并合入 ${resMerge.release.baseBranch}`,
+          });
+
+          setProgress?.(`已合入 ${resMerge.release.baseBranch}，正在自动部署生产环境…`);
+          const prodRes = await executeProductionDeploy({
+            runId: run.id,
+            repoFullName: run.repoFullName,
+            branchName: resMerge.release.baseBranch || run.defaultBranch || 'main',
+            actor: '飞书审批人',
+            chatId,
+          });
+          return {
+            summary: `已合入主分支并上线生产：${prodRes.deployment.url}`,
+            result: { runId: run.id, url: prodRes.deployment.url },
+          };
+        },
+      });
+
+      res.json({
+        toast: { type: 'success', content: '已批准上线，正在后台合并 PR 并部署 Cloudflare 生产环境' },
+      });
+      return;
+    }
+
+    if (action === 'open_rework_form') {
+      const runId = (val.run_id || '').trim();
+      const run = runId ? getRunById(runId) : undefined;
+      if (!run) {
+        res.json({ toast: { type: 'error', content: '未找到对应的需求记录' } });
+        return;
+      }
+      res.json({ toast: { type: 'info', content: '已发送退回修订表单，请填写修改意见' } });
+      if (chatId) {
+        void sendFeishuCardMessage(
+          chatId,
+          buildFeishuReworkFormCard({
+            runId: run.id,
+            prdTitle: run.prdTitle,
+            prNumber: run.draftPr?.prNumber,
+            chatId,
+          })
+        );
+      }
+      return;
+    }
+
+    if (action === 'submit_rework_form') {
+      const runId = (val.run_id || '').trim();
+      const note = (form.revision_note || '').trim();
+      const run = runId ? getRunById(runId) : undefined;
+      if (!run || !run.draftPr) {
+        res.json({ toast: { type: 'error', content: '未找到对应的 Draft PR 分支' } });
+        return;
+      }
+      if (!note) {
+        res.json({ toast: { type: 'error', content: '请填写具体的修改意见后再提交' } });
+        return;
+      }
+      const parsedRepo = parseRepoFullName(run.repoFullName);
+      if (!parsedRepo) {
+        res.json({ toast: { type: 'error', content: '目标仓库格式无效' } });
+        return;
+      }
+
+      enqueueBackgroundTask({
+        kind: 'request_rework',
+        title: `[飞书] 退回修订并返工：${run.prdTitle.slice(0, 22)}`,
+        roomId: 'approval',
+        runId: run.id,
+        repoFullName: run.repoFullName,
+        dedupeKey: `review:${run.id}:changes_requested`,
+        initialMessage: '正在写入修订意见并派发 AGY 原分支返工…',
+        executor: async () => {
+          const draftBranch = run.draftPr!.branchName;
+          const draftPrNum = run.draftPr!.prNumber;
+          const feedbackMd = buildRevisionFeedbackMarkdown({
+            runId: run.id,
+            prdTitle: run.prdTitle,
+            prNumber: draftPrNum,
+            approvalNote: note,
+            uncheckedCriteria: [],
+          });
+          const commitRes = await commitRevisionFeedbackToBranch({
+            owner: parsedRepo.owner,
+            repo: parsedRepo.name,
+            branchName: draftBranch,
+            markdownContent: feedbackMd,
+            prNumber: draftPrNum,
+          });
+          const sessionPolicy = decideAgySessionPolicy({
+            targetBranch: draftBranch,
+            lastAgySession: run.lastAgySession,
+          });
+          const dispatchRes = await dispatchAgyWorkflow({
+            owner: parsedRepo.owner,
+            repo: parsedRepo.name,
+            prBranch: draftBranch,
+            prNumber: draftPrNum,
+            runId: run.id,
+            e2eTestPath: run.draftPr!.e2eTestPath,
+            revisionNote: note,
+            baseBranch: run.defaultBranch || 'main',
+            sessionMode: sessionPolicy.mode,
+            resumeSessionId: sessionPolicy.resumeSessionId,
+          });
+          updateRunReview(run.id, {
+            status: 'changes_requested',
+            approvalNote: note,
+            approvedAt: new Date().toISOString(),
+            lastRework: {
+              dispatched: true,
+              branchName: draftBranch,
+              feedbackFilePath: commitRes.path,
+              feedbackCommitSha: commitRes.commitSha,
+              actionsUrl: dispatchRes.actionsUrl,
+              dispatchedAt: new Date().toISOString(),
+              note,
+              sessionMode: sessionPolicy.mode,
+              resumeSessionId: sessionPolicy.resumeSessionId,
+              sessionReason: sessionPolicy.reason,
+            },
+          });
+          appendAuditLog({
+            category: 'approval',
+            action: 'revision_requested',
+            actor: '飞书审批人',
+            repoFullName: run.repoFullName,
+            runId: run.id,
+            prdTitle: run.prdTitle,
+            branch: draftBranch,
+            prNumber: draftPrNum,
+            detail: `通过飞书退回修订并派发 AGY 原分支返工：${note}`,
+          });
+          await notifyFeishuStageEvent({
+            kind: 'rework_dispatched',
+            prdTitle: run.prdTitle,
+            repoFullName: run.repoFullName,
+            runId: run.id,
+            branchName: draftBranch,
+            prNumber: draftPrNum,
+            prUrl: run.draftPr!.prUrl,
+            actionsUrl: dispatchRes.actionsUrl,
+            summary: note,
+            chatId,
+          });
+          void watchAgyCodingRunAndNotifyFeishu({
+            owner: parsedRepo.owner,
+            repo: parsedRepo.name,
+            repoFullName: parsedRepo.fullName,
+            prBranch: draftBranch,
+            prNumber: draftPrNum,
+            prUrl: run.draftPr!.prUrl,
+            runId: run.id,
+            prdTitle: run.prdTitle,
+            dispatchedAtMs: Date.now(),
+            chatId,
+          });
+          return {
+            summary: `已派发 AGY 在分支 ${draftBranch} 依据飞书修订意见修复`,
+            result: { runId: run.id },
+          };
+        },
+      });
+
+      res.json({
+        toast: { type: 'success', content: '已提交修订意见并派发 AGY 返工，完成后将推送新卡片' },
+      });
+      return;
+    }
+
+    if (action === 'redeploy_production') {
+      const runId = (val.run_id || '').trim();
+      const run = runId ? getRunById(runId) : undefined;
+      const branch = run?.mergedRelease?.baseBranch || run?.defaultBranch || 'main';
+      const repoFullName = run?.repoFullName || FIXED_TARGET_REPO.fullName;
+
+      enqueueBackgroundTask({
+        kind: 'deploy_production',
+        title: `[飞书] 重新部署生产环境（${run?.prdTitle?.slice(0, 20) || branch}）`,
+        roomId: 'approval',
+        runId: run?.id,
+        repoFullName,
+        dedupeKey: `deploy_production:${repoFullName}:${branch}`,
+        initialMessage: `正在后台重新构建并发布主分支 ${branch} 至 Cloudflare 生产环境…`,
+        executor: async () => {
+          const payload = await executeProductionDeploy({
+            runId: run?.id,
+            repoFullName,
+            branchName: branch,
+            actor: '飞书操作员',
+            chatId,
+          });
+          return {
+            summary: `生产环境已重新上线：${payload.deployment.url}`,
+            result: { url: payload.deployment.url, runId: run?.id },
+          };
+        },
+      });
+
+      res.json({
+        toast: { type: 'success', content: '正在后台重新部署 Cloudflare 生产环境，完成后将推送通知' },
+      });
+      return;
+    }
+
+    res.json({ toast: { type: 'info', content: '未识别的卡片操作类型' } });
+  });
+
   // Vite middleware in dev (lazy-loaded so production startup never imports Vite), static build in production
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -2318,6 +3658,8 @@ async function startServer() {
               reloadJobsFromDisk();
               reloadAuditLogsFromDisk();
               reloadRsiStateFromDisk();
+              reloadEditAuthFromDisk();
+              reloadFeishuStateFromDisk();
             },
           }).then((res) => {
             if (res.hydrated) {

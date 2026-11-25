@@ -12,6 +12,7 @@ export type AuditActionType =
   | 'agy_coding_dispatched'
   | 'actions_run_cancelled'
   | 'preview_deployed'
+  | 'production_deployed'
   | 'cf_actions_deploy_dispatched'
   | 'acceptance_checklist_updated'
   | 'release_approved'
@@ -62,6 +63,7 @@ export interface RequirementBoardItem {
   prNumber?: number;
   prUrl?: string;
   previewUrl?: string;
+  productionUrl?: string;
   mergedCommitSha?: string;
   mergedCommitUrl?: string;
   mergedBaseBranch?: string;
@@ -146,6 +148,7 @@ export const AUDIT_ACTION_LABELS: Record<AuditActionType, string> = {
   agy_coding_dispatched: '派发 AGY 编码执行',
   actions_run_cancelled: '取消 Actions 任务',
   preview_deployed: '部署隔离预览环境',
+  production_deployed: '部署正式生产环境',
   cf_actions_deploy_dispatched: '派发 Cloudflare 部署',
   acceptance_checklist_updated: '更新验收清单勾选',
   release_approved: '验收通过并批准上线',
@@ -443,6 +446,7 @@ export function buildRequirementsBoardData(params: {
       prNumber: run.draftPr?.prNumber,
       prUrl: run.draftPr?.prUrl,
       previewUrl: run.previewDeployment?.url,
+      productionUrl: run.productionDeployment?.url,
       mergedCommitSha: run.mergedRelease?.mergeCommitSha,
       mergedCommitUrl: run.mergedRelease?.commitUrl,
       mergedBaseBranch: run.mergedRelease?.baseBranch,

@@ -7,7 +7,7 @@ import { githubRequest } from './githubService.ts';
 
 export const AUTODEV_STATE_BRANCH = 'autodev-state';
 
-export type PersistedStateKey = 'runs' | 'jobs' | 'auditLogs' | 'rsi';
+export type PersistedStateKey = 'runs' | 'jobs' | 'auditLogs' | 'rsi' | 'auth' | 'feishu';
 
 const STATE_FILE_MAP: Record<
   PersistedStateKey,
@@ -28,6 +28,14 @@ const STATE_FILE_MAP: Record<
   rsi: {
     localFile: 'rsi-state-v1.json',
     remotePath: '.autodev-state/rsi-state-v1.json',
+  },
+  auth: {
+    localFile: 'edit-auth-v1.json',
+    remotePath: '.autodev-state/edit-auth-v1.json',
+  },
+  feishu: {
+    localFile: 'feishu-state-v1.json',
+    remotePath: '.autodev-state/feishu-state-v1.json',
   },
 };
 
@@ -469,11 +477,12 @@ export async function flushGitHubStateNow(reason = 'manual'): Promise<GitHubStat
  * Force snapshot all 4 local files and push them to `autodev-state` immediately.
  */
 export async function forcePushAllLocalStateToGitHub(
-  snapshots: Record<PersistedStateKey, unknown>,
+  snapshots: Partial<Record<PersistedStateKey, unknown>>,
   reason = 'force-sync'
 ): Promise<GitHubStatePersistenceStatus> {
   const keys = Object.keys(snapshots) as PersistedStateKey[];
   for (const key of keys) {
+    if (snapshots[key] === undefined) continue;
     pendingPayloads.set(key, JSON.stringify(snapshots[key], null, 2));
     // Clear cached hash so even empty reset snapshots are guaranteed written if branch has old data
     lastCommittedHashes.delete(key);

@@ -5,15 +5,73 @@ import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type { PreviewDeployment } from '../src/types/autodev.ts';
+import { buildPreviewResourceNames } from '../src/lib/iterationContext.ts';
+import {
+  buildTargetRepoNpmEnv,
+  formatDeployCommandError,
+  stripAnsi,
+  type TargetRepoExecPhase,
+} from '../src/lib/deploySanitizer.ts';
 import { postGitHubPrComment } from './githubService.ts';
 
 const execFileAsync = promisify(execFile);
 const CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4';
+const TMP_PREFIX = 'autodev-cf-preview-';
 
 interface CfEnvelope<T> {
   success: boolean;
   errors?: Array<{ code: number; message: string }>;
   result?: T;
+}
+
+/**
+ * Reads actual container memory limit from Linux cgroup v2/v1 (Cloud Run uses cgroups,
+ * while os.totalmem() may report the underlying host VM RAM).
+ */
+function detectContainerMemoryBytes(): number {
+  const candidates = [
+    '/sys/fs/cgroup/memory.max',
+    '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, 'utf-8').trim();
+      if (!raw || raw === 'max') continue;
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && parsed > 64 * 1024 * 1024 && parsed < 1024 * 1024 * 1024 * 1024) {
+        return parsed;
+      }
+    } catch {
+      // ignore non-Linux or restricted procfs
+    }
+  }
+  return os.totalmem();
+}
+
+/**
+ * Cleans up any stale temp directories left behind by a previously OOM-killed deploy
+ * so Cloud Run's in-memory /tmp tmpfs does not accumulate leaked node_modules.
+ */
+function pruneStaleTmpDirs(): void {
+  try {
+    const tmpRoot = os.tmpdir();
+    const now = Date.now();
+    for (const entry of fs.readdirSync(tmpRoot)) {
+      if (!entry.startsWith(TMP_PREFIX)) continue;
+      const fullPath = path.join(tmpRoot, entry);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (now - stat.mtimeMs > 10 * 60 * 1000) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore concurrent deletion
+      }
+    }
+  } catch {
+    // non-fatal
+  }
 }
 
 async function cfApi<T>(
@@ -99,19 +157,21 @@ async function runCmd(
   args: string[],
   cwd: string,
   extraEnv: Record<string, string> = {},
-  timeoutMs = 240_000
+  timeoutMs = 300_000,
+  phase: TargetRepoExecPhase = 'wrangler',
+  options?: { containerMemoryBytes?: number; npmCacheDir?: string }
 ): Promise<{ stdout: string; stderr: string }> {
-  const { stdout, stderr } = await execFileAsync(cmd, args, {
-    cwd,
-    timeout: timeoutMs,
-    maxBuffer: 12 * 1024 * 1024,
-    env: {
-      ...process.env,
-      CI: 'true',
-      ...extraEnv,
-    },
-  });
-  return { stdout: stdout ?? '', stderr: stderr ?? '' };
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, {
+      cwd,
+      timeout: timeoutMs,
+      maxBuffer: 12 * 1024 * 1024,
+      env: buildTargetRepoNpmEnv(process.env, phase, extraEnv, options),
+    });
+    return { stdout: stripAnsi(stdout ?? ''), stderr: stripAnsi(stderr ?? '') };
+  } catch (err) {
+    throw new Error(formatDeployCommandError(err, `命令执行失败：${cmd} ${args.join(' ')}`));
+  }
 }
 
 export async function deployBranchPreviewToCloudflare(params: {
@@ -122,7 +182,6 @@ export async function deployBranchPreviewToCloudflare(params: {
   prNumber?: number;
   mode?: 'preview' | 'production';
 }): Promise<{ deployment: PreviewDeployment; deployLogTail: string }> {
-  const { buildPreviewResourceNames } = await import('../src/lib/iterationContext');
   const cfToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
   const cfAccountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
   const ghToken = process.env.GITHUB_TOKEN?.trim();
@@ -137,13 +196,17 @@ export async function deployBranchPreviewToCloudflare(params: {
   const isIsolatedPreview =
     params.mode ? params.mode === 'preview' : branchName !== 'main' && branchName !== 'master';
 
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'autodev-cf-preview-'));
+  pruneStaleTmpDirs();
+
+  const containerMemoryBytes = detectContainerMemoryBytes();
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), TMP_PREFIX));
   const tarballPath = path.join(tmpBase, 'repo.tar.gz');
+  const npmCacheDir = path.join(tmpBase, 'npm-cache');
   const workDir = path.join(tmpBase, 'src');
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    // 1. Download GitHub branch tarball
+    // 1. Download GitHub branch tarball and immediately delete archive after extracting to save tmpfs RAM
     const tarUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
       repo
     )}/tarball/${encodeURIComponent(branchName)}`;
@@ -163,6 +226,7 @@ export async function deployBranchPreviewToCloudflare(params: {
     fs.writeFileSync(tarballPath, tarBuf);
 
     await runCmd('tar', ['-xzf', tarballPath, '-C', workDir, '--strip-components=1'], tmpBase);
+    fs.rmSync(tarballPath, { force: true });
 
     // 2. Inspect wrangler.toml
     const wranglerTomlPath = path.join(workDir, 'wrangler.toml');
@@ -243,47 +307,95 @@ export async function deployBranchPreviewToCloudflare(params: {
 
     fs.writeFileSync(wranglerTomlPath, toml, 'utf-8');
 
-    // 3. Install dependencies & build frontend assets
+    // 3. Install dependencies & build frontend assets with aggressive tmpfs RAM cleanup
     const cfEnv = {
       CLOUDFLARE_API_TOKEN: cfToken,
       CLOUDFLARE_ACCOUNT_ID: cfAccountId,
       WRANGLER_SEND_METRICS: 'false',
     };
 
+    const execOpts = { containerMemoryBytes, npmCacheDir };
+
     if (fs.existsSync(path.join(workDir, 'package.json'))) {
+      const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'package.json'), 'utf-8')) as {
+        scripts?: Record<string, string>;
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
       const hasLock = fs.existsSync(path.join(workDir, 'package-lock.json'));
+      const runCleanInstall = async () => {
+        fs.rmSync(path.join(workDir, 'package-lock.json'), { force: true });
+        fs.rmSync(path.join(workDir, 'node_modules'), { recursive: true, force: true });
+        fs.rmSync(npmCacheDir, { recursive: true, force: true });
+        await runCmd(
+          'npm',
+          ['install', '--include=dev', '--no-audit', '--no-fund', '--progress=false', '--loglevel=error'],
+          workDir,
+          cfEnv,
+          300_000,
+          'install',
+          execOpts
+        );
+      };
+
       try {
         await runCmd(
           'npm',
           hasLock
-            ? ['ci', '--no-audit', '--no-fund']
-            : ['install', '--no-audit', '--no-fund'],
+            ? ['ci', '--include=dev', '--no-audit', '--no-fund', '--progress=false', '--loglevel=error']
+            : ['install', '--include=dev', '--no-audit', '--no-fund', '--progress=false', '--loglevel=error'],
           workDir,
           cfEnv,
-          240_000
+          300_000,
+          'install',
+          execOpts
         );
-      } catch {
+      } catch (installErr) {
+        const msg = installErr instanceof Error ? installErr.message : '';
+        // Do not retry blindly if killed by OOM (SIGKILL) — fail fast with clear OOM diagnostics
+        if (msg.includes('SIGKILL') || msg.includes('137')) {
+          throw installErr;
+        }
         // Fallback: clear package-lock if lockfile misses platform optional deps
-        fs.rmSync(path.join(workDir, 'package-lock.json'), { force: true });
-        fs.rmSync(path.join(workDir, 'node_modules'), { recursive: true, force: true });
-        await runCmd('npm', ['install', '--no-audit', '--no-fund'], workDir, cfEnv, 240_000);
+        await runCleanInstall();
       }
 
-      const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'package.json'), 'utf-8'));
-      if (pkg?.scripts?.['build:client']) {
-        await runCmd('npm', ['run', 'build:client'], workDir, cfEnv, 180_000);
-      } else if (pkg?.scripts?.build) {
-        await runCmd('npm', ['run', 'build'], workDir, cfEnv, 180_000);
+      // Sanity check: ensure devDependencies (e.g. vite) were actually installed
+      const declaredVite = Boolean(pkg?.devDependencies?.vite || pkg?.dependencies?.vite);
+      if (declaredVite && !fs.existsSync(path.join(workDir, 'node_modules', 'vite', 'package.json'))) {
+        await runCleanInstall();
       }
+
+      // Immediately purge npm cache directory from /tmp tmpfs BEFORE starting Vite build!
+      // Reclaims ~100-250 MiB of RAM on Cloud Run containers.
+      fs.rmSync(npmCacheDir, { recursive: true, force: true });
+
+      if (pkg?.scripts?.['build:client']) {
+        await runCmd('npm', ['run', 'build:client'], workDir, cfEnv, 240_000, 'build', {
+          containerMemoryBytes,
+        });
+      } else if (pkg?.scripts?.build) {
+        await runCmd('npm', ['run', 'build'], workDir, cfEnv, 240_000, 'build', {
+          containerMemoryBytes,
+        });
+      }
+
+      // Free any build cache before wrangler bundles & uploads Worker
+      fs.rmSync(path.join(workDir, 'node_modules', '.vite'), { recursive: true, force: true });
+      fs.rmSync(path.join(workDir, 'node_modules', '.cache'), { recursive: true, force: true });
     }
 
     // Resolve wrangler CLI (prefer local node_modules/.bin/wrangler)
     const localWrangler = path.join(workDir, 'node_modules', '.bin', 'wrangler');
     const runWrangler = async (args: string[]) => {
       if (fs.existsSync(localWrangler)) {
-        return runCmd(localWrangler, args, workDir, cfEnv, 180_000);
+        return runCmd(localWrangler, args, workDir, cfEnv, 240_000, 'wrangler', {
+          containerMemoryBytes,
+        });
       }
-      return runCmd('npx', ['--yes', 'wrangler', ...args], workDir, cfEnv, 180_000);
+      return runCmd('npx', ['--yes', 'wrangler', ...args], workDir, cfEnv, 240_000, 'wrangler', {
+        containerMemoryBytes,
+      });
     };
 
     // 4. Apply D1 migrations remotely if migrations/ directory exists
@@ -360,4 +472,3 @@ export async function deployBranchPreviewToCloudflare(params: {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 }
-

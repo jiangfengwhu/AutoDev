@@ -81,10 +81,26 @@ export interface GeminiIntegrationStatus {
   checkedAt: string;
 }
 
+export interface FeishuIntegrationStatus {
+  configured: boolean;
+  hasAppCredentials: boolean;
+  hasVerificationToken: boolean;
+  hasEncryptKey: boolean;
+  hasDefaultChatId: boolean;
+  hasActiveChat: boolean;
+  eventsCallbackPath: string;
+  cardCallbackPath: string;
+  lastPushOk?: boolean;
+  lastPushError?: string;
+  lastPushAt?: string;
+  checkedAt: string;
+}
+
 export interface IntegrationsStatusResponse {
   github: GitHubIntegrationStatus;
   cloudflare: CloudflareIntegrationStatus;
   gemini: GeminiIntegrationStatus;
+  feishu?: FeishuIntegrationStatus;
 }
 
 export interface SelectedTargetRepo {
@@ -289,6 +305,8 @@ export interface PreviewDeployment {
   migrationsApplied?: boolean;
   commitSha?: string;
   isIsolatedPreview?: boolean;
+  buildLogsUrl?: string;
+  provider?: 'cloudflare_workers_builds' | 'direct_wrangler';
 }
 
 export interface MergedReleaseResult {
@@ -431,6 +449,7 @@ export type AnalysisSseEvent =
 export type BackgroundTaskKind =
   | 'create_draft_pr'
   | 'deploy_preview'
+  | 'deploy_production'
   | 'approve_release'
   | 'request_rework'
   | 'rsi_sync'

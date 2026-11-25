@@ -41,6 +41,8 @@ import { buildTaskLayers, validatePrdInput } from '../lib/taskGraph';
 import { buildPrArtifacts } from '../lib/specBuilder';
 import { hasPrdDraftContent, savePrdDraft } from '../lib/prdDraftStorage';
 import { formatTokenCount } from '../lib/overviewMetrics';
+import { apiFetch } from '../lib/editAuthClient';
+import { PrArtifactsPreview } from './PrArtifactsPreview';
 import {
   AGY_AGENT_MODES,
   AGY_AVAILABLE_MODELS,
@@ -397,7 +399,7 @@ export function PrdWorkspaceView({
     if (!currentScopedRun || !planDraft) return;
     setSavingPlan(true);
     try {
-      const res = await fetch(`/api/runs/${encodeURIComponent(currentScopedRun.id)}/plan`, {
+      const res = await apiFetch(`/api/runs/${encodeURIComponent(currentScopedRun.id)}/plan`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -450,7 +452,7 @@ export function PrdWorkspaceView({
     setStartingJob(true);
 
     try {
-      const response = await fetch('/api/agents/jobs', {
+      const response = await apiFetch('/api/agents/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -490,7 +492,7 @@ export function PrdWorkspaceView({
     if (!analysisJob || analysisJob.status !== 'running') return;
     setCancellingJob(true);
     try {
-      const res = await fetch(`/api/agents/jobs/${encodeURIComponent(analysisJob.id)}/cancel`, {
+      const res = await apiFetch(`/api/agents/jobs/${encodeURIComponent(analysisJob.id)}/cancel`, {
         method: 'POST',
       });
       const data = await res.json().catch(() => ({}));
@@ -519,7 +521,7 @@ export function PrdWorkspaceView({
     setPrError(null);
 
     try {
-      const response = await fetch('/api/github/create-draft-pr', {
+      const response = await apiFetch('/api/github/create-draft-pr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1280,7 +1282,7 @@ export function PrdWorkspaceView({
                 },
                 {
                   id: 'artifacts',
-                  label: 'PR 制品预览 (3)',
+                  label: 'PR 制品预览 (2)',
                 },
               ] as const
             ).map((tab) => {
@@ -2130,65 +2132,13 @@ export function PrdWorkspaceView({
             </div>
           )}
 
-          {/* Tab 4: PR Artifacts Preview */}
+          {/* Tab 4: PR Artifacts Preview (docs/spec.json structured UI + docs/prd.md Markdown preview) */}
           {resultTab === 'artifacts' && prArtifacts && (
-            <div className="space-y-4">
-              {[
-                {
-                  key: 'spec',
-                  path: prArtifacts.specJsonPath,
-                  archiveNote: `同步归档至 ${prArtifacts.archivedSpecPath}`,
-                  content: prArtifacts.specJsonContent,
-                },
-                {
-                  key: 'prd',
-                  path: prArtifacts.prdMdPath,
-                  archiveNote: `同步归档至 ${prArtifacts.archivedPrdPath}`,
-                  content: prArtifacts.prdMdContent,
-                },
-                {
-                  key: 'e2e',
-                  path: prArtifacts.e2eTestPath,
-                  archiveNote: '透明 E2E 验收用例（直接提交至 PR 仓库，AGY 失败时可检查用例与代码并归因修复）',
-                  content: prArtifacts.e2eTestContent,
-                },
-              ].map((file) => (
-                <div
-                  key={file.key}
-                  className="rounded-md border border-[#30363D] bg-[#010409] overflow-hidden"
-                >
-                  <div className="px-4 py-2.5 border-b border-[#30363D] bg-[#161B22] flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2 font-mono text-[12px] text-[#F0F6FC]">
-                      <FileCode2 className="h-3.5 w-3.5 text-[#58A6FF] shrink-0" />
-                      <span>{file.path}</span>
-                      <span className="text-[11px] font-sans text-[#8B949E]">
-                        · {file.archiveNote}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => handleCopyArtifact(file.key, file.content)}
-                      className="inline-flex items-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-2.5 py-1 text-[11px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] transition-colors"
-                    >
-                      {copiedArtifact === file.key ? (
-                        <>
-                          <Check className="h-3 w-3 text-[#3FB950]" />
-                          <span>已复制</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="h-3 w-3" />
-                          <span>复制</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                  <pre className="p-4 max-h-[260px] overflow-auto font-mono text-[12px] leading-relaxed text-[#C9D1D9]">
-                    {file.content}
-                  </pre>
-                </div>
-              ))}
-            </div>
+            <PrArtifactsPreview
+              artifacts={prArtifacts}
+              copiedArtifact={copiedArtifact}
+              onCopyArtifact={handleCopyArtifact}
+            />
           )}
         </section>
       )}

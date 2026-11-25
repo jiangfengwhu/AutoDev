@@ -2638,6 +2638,458 @@ test('computeClockHandAngles maps local time to clockwise Three.js Z-rotations f
   );
 });
 
+test('editAuthService verifies default scrypt passcode, issues/revokes Bearer tokens, enforces rate limits, and honors AUTODEV_EDIT_PASSWORD override', async () => {
+  const {
+    checkUnlockRateLimit,
+    clearUnlockFailures,
+    extractBearerToken,
+    getEditAuthMeta,
+    issueEditSessionToken,
+    recordUnlockFailure,
+    revokeEditSessionToken,
+    verifyEditPassword,
+    verifyEditSessionToken,
+  } = await import('../../server/editAuthService.ts');
+
+  const prevEnv = process.env.AUTODEV_EDIT_PASSWORD;
+  try {
+    delete process.env.AUTODEV_EDIT_PASSWORD;
+
+    // Default passcode verifies via precomputed salted scrypt hash; wrong/empty passcodes fail
+    const defaultPasscode = ['admin', 'admin'].join('&');
+    assert.equal(verifyEditPassword(defaultPasscode), true);
+    assert.equal(verifyEditPassword('wrong-password'), false);
+    assert.equal(verifyEditPassword(''), false);
+
+    // Env var override takes priority over default/stored hash
+    process.env.AUTODEV_EDIT_PASSWORD = 'custom-prod-secret-99';
+    assert.equal(getEditAuthMeta().source, 'env');
+    assert.equal(getEditAuthMeta().canChangePassword, false);
+    assert.equal(verifyEditPassword('custom-prod-secret-99'), true);
+    assert.equal(verifyEditPassword(defaultPasscode), false);
+    delete process.env.AUTODEV_EDIT_PASSWORD;
+
+    // Session token issue -> verify -> extractBearer -> revoke -> rejected
+    const nowMs = Date.now();
+    const session = issueEditSessionToken(nowMs);
+    assert.equal(extractBearerToken(`Bearer ${session.token}`), session.token);
+    assert.equal(extractBearerToken('Basic abc123'), null);
+    assert.equal(verifyEditSessionToken(session.token, nowMs + 1000).valid, true);
+    assert.equal(verifyEditSessionToken(`${session.token}tampered`, nowMs + 1000).valid, false);
+    // Expired token rejected
+    assert.equal(verifyEditSessionToken(session.token, nowMs + 13 * 60 * 60 * 1000).valid, false);
+
+    revokeEditSessionToken(session.token);
+    assert.equal(verifyEditSessionToken(session.token, nowMs + 1000).valid, false);
+
+    // Rate limiting blocks after 10 failures within window and resets after clear
+    const testIp = 'test-rate-limit-ip-198.51.100.7';
+    clearUnlockFailures(testIp);
+    for (let i = 0; i < 10; i++) {
+      assert.equal(checkUnlockRateLimit(testIp, nowMs + i * 1000).allowed, true);
+      recordUnlockFailure(testIp, nowMs + i * 1000);
+    }
+    const blocked = checkUnlockRateLimit(testIp, nowMs + 15_000);
+    assert.equal(blocked.allowed, false);
+    assert.ok(blocked.retryAfterSec > 0);
+    clearUnlockFailures(testIp);
+    assert.equal(checkUnlockRateLimit(testIp, nowMs + 16_000).allowed, true);
+  } finally {
+    if (prevEnv === undefined) {
+      delete process.env.AUTODEV_EDIT_PASSWORD;
+    } else {
+      process.env.AUTODEV_EDIT_PASSWORD = prevEnv;
+    }
+  }
+});
+
+test('editAuthClient handles getter-only window.fetch without throwing and attaches Bearer token via apiFetch', async () => {
+  const {
+    clearEditAuthToken,
+    getEditAuthToken,
+    installEditAuthFetchInterceptor,
+    setEditAuthToken,
+  } = await import('./editAuthClient');
+
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  try {
+    const fakeWindow: Record<string, unknown> = {};
+    Object.defineProperty(fakeWindow, 'fetch', {
+      get: () => globalThis.fetch,
+      configurable: false,
+      enumerable: true,
+    });
+    (globalThis as Record<string, unknown>).window = fakeWindow;
+
+    // Must not throw TypeError: Cannot set property fetch of #<Window> which has only a getter
+    assert.doesNotThrow(() => installEditAuthFetchInterceptor());
+
+    setEditAuthToken('test-token-payload.test-sig');
+    assert.equal(getEditAuthToken(), 'test-token-payload.test-sig');
+    clearEditAuthToken();
+    assert.equal(getEditAuthToken(), null);
+  } finally {
+    if (prevWindow === undefined) {
+      delete (globalThis as Record<string, unknown>).window;
+    } else {
+      (globalThis as Record<string, unknown>).window = prevWindow;
+    }
+  }
+});
+
+test('feishuProtocol encrypt/decrypt round-trip and X-Lark-Signature verification', async () => {
+  const crypto = await import('crypto');
+  const {
+    decryptFeishuPayload,
+    encryptFeishuPayloadForTest,
+    verifyFeishuSignature,
+  } = await import('./feishuProtocol.ts');
+
+  const encryptKey = 'test-feishu-encrypt-key-2026';
+  const original = JSON.stringify({ type: 'url_verification', challenge: 'abc-123', token: 'tok-9' });
+  const encrypted = encryptFeishuPayloadForTest(original, encryptKey);
+  const decrypted = decryptFeishuPayload(encrypted, encryptKey);
+  assert.equal(decrypted, original);
+
+  const rawBody = JSON.stringify({ encrypt: encrypted });
+  const nowMs = 1_750_000_000_000;
+  const timestamp = String(Math.floor(nowMs / 1000));
+  const nonce = 'nonce-xyz';
+  const validSig = crypto
+    .createHash('sha256')
+    .update(`${timestamp}${nonce}${encryptKey}${rawBody}`, 'utf-8')
+    .digest('hex');
+
+  assert.equal(
+    verifyFeishuSignature({ timestamp, nonce, signature: validSig, encryptKey, rawBody, nowMs }).ok,
+    true
+  );
+  assert.equal(
+    verifyFeishuSignature({
+      timestamp,
+      nonce,
+      signature: validSig,
+      encryptKey,
+      rawBody: `${rawBody} `,
+      nowMs,
+    }).ok,
+    false
+  );
+  assert.equal(
+    verifyFeishuSignature({
+      timestamp: String(Math.floor(nowMs / 1000) - 600),
+      nonce,
+      signature: validSig,
+      encryptKey,
+      rawBody,
+      nowMs,
+    }).ok,
+    false
+  );
+});
+
+test('feishuProtocol parses @bot message events, card v2 form submissions, and builds next-stage cards', async () => {
+  const {
+    buildFeishuPrdFormCard,
+    buildFeishuStageCard,
+    parseFeishuCardCallbackBody,
+    parseFeishuEventBody,
+  } = await import('./feishuProtocol.ts');
+
+  // 1. Challenge event
+  const challengeEvt = parseFeishuEventBody({
+    type: 'url_verification',
+    challenge: 'chal-42',
+    token: 'ver-tok',
+  });
+  assert.equal(challengeEvt.kind, 'url_verification');
+  assert.equal(challengeEvt.challenge, 'chal-42');
+
+  // 2. @mention message event
+  const mentionEvt = parseFeishuEventBody({
+    header: { event_id: 'evt-1', event_type: 'im.message.receive_v1', token: 'ver-tok' },
+    event: {
+      message: {
+        message_id: 'om_123',
+        chat_id: 'oc_group_1',
+        chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 站内通知中心\n新增消息铃铛和已读状态' }),
+        mentions: [{ key: '@_user_1', name: 'AutoDev Bot' }],
+      },
+      sender: { sender_id: { open_id: 'ou_tester' } },
+    },
+  });
+  assert.equal(mentionEvt.kind, 'im_message');
+  assert.equal(mentionEvt.message?.mentionsBot, true);
+  assert.equal(mentionEvt.message?.cleanText, '站内通知中心\n新增消息铃铛和已读状态');
+
+  // 3. Card v2 form submission callback
+  const cardCb = parseFeishuCardCallbackBody({
+    schema: '2.0',
+    header: { event_id: 'cb-evt-1', event_type: 'card.action.trigger', token: 'ver-tok' },
+    event: {
+      context: { open_chat_id: 'oc_group_1', open_message_id: 'om_card_1' },
+      operator: { open_id: 'ou_tester' },
+      action: {
+        value: { action: 'submit_prd_form', chat_id: 'oc_group_1', repo: 'owner/repo' },
+        form_value: {
+          prd_title: '通知中心',
+          prd_content: '实现完整的站内消息列表、未读角标及一键已读接口',
+          agy_model: 'gemini-4-hydrogen-high',
+        },
+      },
+    },
+  });
+  assert.equal(cardCb.kind, 'card_action');
+  assert.equal(cardCb.schemaVersion, '2.0');
+  assert.equal(cardCb.actionType, 'submit_prd_form');
+  assert.equal(cardCb.formValue.prd_title, '通知中心');
+  assert.equal(cardCb.chatId, 'oc_group_1');
+
+  // 4. Form card & next-stage action buttons
+  const formCard = buildFeishuPrdFormCard({
+    repoFullName: 'owner/repo',
+    chatId: 'oc_group_1',
+    prefillTitle: '通知中心',
+  });
+  assert.equal(formCard.schema, '2.0');
+  const formJson = JSON.stringify(formCard);
+  assert.ok(formJson.includes('submit_prd_form'));
+  assert.ok(formJson.includes('prd_title'));
+
+  const prodFailCard = buildFeishuStageCard({
+    kind: 'production_failed',
+    prdTitle: '通知中心',
+    repoFullName: 'owner/repo',
+    runId: 'run-abc',
+    error: 'Cloudflare deploy error',
+    chatId: 'oc_group_1',
+  });
+  assert.ok(JSON.stringify(prodFailCard).includes('redeploy_production'));
+
+  const previewCard = buildFeishuStageCard({
+    kind: 'preview_deployed',
+    prdTitle: '通知中心',
+    repoFullName: 'owner/repo',
+    runId: 'run-abc',
+    previewUrl: 'https://demo.workers.dev',
+    chatId: 'oc_group_1',
+  });
+  const previewJson = JSON.stringify(previewCard);
+  assert.ok(previewJson.includes('approve_release'));
+  assert.ok(previewJson.includes('open_rework_form'));
+});
+
+test('browserNotifications enforces permission gating and deduplicates identical tags within cooldown window', async () => {
+  const {
+    resetNotificationDedupeForTest,
+    shouldDispatchBrowserNotification,
+  } = await import('./browserNotifications.ts');
+
+  resetNotificationDedupeForTest();
+
+  assert.equal(
+    shouldDispatchBrowserNotification({
+      supported: false,
+      permission: 'granted',
+      enabled: true,
+      tag: 'task-0',
+      nowMs: 1000,
+    }),
+    false
+  );
+  assert.equal(
+    shouldDispatchBrowserNotification({
+      supported: true,
+      permission: 'default',
+      enabled: true,
+      tag: 'task-1',
+      nowMs: 1000,
+    }),
+    false
+  );
+  assert.equal(
+    shouldDispatchBrowserNotification({
+      supported: true,
+      permission: 'granted',
+      enabled: false,
+      tag: 'task-1',
+      nowMs: 1000,
+    }),
+    false
+  );
+  assert.equal(
+    shouldDispatchBrowserNotification({
+      supported: true,
+      permission: 'granted',
+      enabled: true,
+      tag: 'task-1',
+      nowMs: 1000,
+    }),
+    true
+  );
+  // Same tag within 15s cooldown is deduplicated
+  assert.equal(
+    shouldDispatchBrowserNotification({
+      supported: true,
+      permission: 'granted',
+      enabled: true,
+      tag: 'task-1',
+      nowMs: 5000,
+    }),
+    false
+  );
+  // After cooldown window, allowed again
+  assert.equal(
+    shouldDispatchBrowserNotification({
+      supported: true,
+      permission: 'granted',
+      enabled: true,
+      tag: 'task-1',
+      nowMs: 20_000,
+    }),
+    true
+  );
+});
+
+test('deploySanitizer avoids deprecated npm_config_production, caps heap/threads for Cloud Run, reports SIGKILL/SIGTERM clearly, and Feishu Card 2.0 buttons use behaviors[]', async () => {
+  const {
+    buildTargetRepoNpmEnv,
+    computeSafeNodeHeapMb,
+    formatDeployCommandError,
+    stripAnsi,
+  } = await import('./deploySanitizer.ts');
+  const {
+    buildFeishuPrdFormCard,
+    buildFeishuReworkFormCard,
+    buildFeishuStageCard,
+    parseFeishuCardCallbackBody,
+  } = await import('./feishuProtocol.ts');
+
+  const cloudRunEnv = {
+    PATH: '/usr/local/bin:/usr/bin',
+    NODE_ENV: 'production',
+    npm_config_production: 'true',
+    npm_config_omit: 'dev',
+    NPM_CONFIG_ONLY: 'prod',
+  };
+
+  const installEnv = buildTargetRepoNpmEnv(
+    cloudRunEnv,
+    'install',
+    { CLOUDFLARE_API_TOKEN: 'tok' },
+    { containerMemoryBytes: 512 * 1024 * 1024, npmCacheDir: '/tmp/test-cache' }
+  );
+  assert.equal(installEnv.NODE_ENV, 'development');
+  // Must NOT set deprecated npm_config_production (which causes npm v10+ warnings)
+  assert.equal(installEnv.npm_config_production, undefined);
+  assert.equal(installEnv.npm_config_omit, undefined);
+  assert.equal(installEnv.NPM_CONFIG_ONLY, undefined);
+  assert.equal(installEnv.npm_config_cache, '/tmp/test-cache');
+  assert.equal(installEnv.npm_config_maxsockets, '4');
+  assert.equal(installEnv.NO_COLOR, '1');
+  assert.equal(installEnv.CLOUDFLARE_API_TOKEN, 'tok');
+  assert.ok(installEnv.NODE_OPTIONS.includes('--max-old-space-size=224'));
+
+  const buildEnv = buildTargetRepoNpmEnv(
+    cloudRunEnv,
+    'build',
+    {},
+    { containerMemoryBytes: 1024 * 1024 * 1024 }
+  );
+  assert.equal(buildEnv.NODE_ENV, 'production');
+  assert.equal(buildEnv.GOMAXPROCS, '2');
+  assert.ok(buildEnv.NODE_OPTIONS.includes('--max-old-space-size=448'));
+  assert.equal(computeSafeNodeHeapMb(4 * 1024 * 1024 * 1024, 'build'), 1536);
+
+  const rawAnsi = '\u001b[33m[UNRESOLVED_IMPORT]\u001b[0m Could not resolve vite\u001b[39m';
+  assert.equal(stripAnsi(rawAnsi), '[UNRESOLVED_IMPORT] Could not resolve vite');
+
+  const oomErr = formatDeployCommandError(
+    {
+      message: 'Command failed: npm run build:client',
+      stdout: 'vite v6.4.6 building for production...\ntransforming...',
+      stderr: '',
+      killed: true,
+      signal: 'SIGKILL',
+    },
+    'fallback'
+  );
+  assert.ok(oomErr.includes('SIGKILL/137'));
+  assert.ok(oomErr.includes('OOM'));
+  assert.ok(oomErr.includes('transforming...'));
+
+  const timeoutErr = formatDeployCommandError(
+    {
+      message: 'Command failed: npm install --include=dev',
+      stderr: 'npm warn config production',
+      killed: true,
+      signal: 'SIGTERM',
+    },
+    'fallback'
+  );
+  assert.ok(timeoutErr.includes('SIGTERM'));
+  assert.ok(timeoutErr.includes('超时'));
+
+  // Verify every Feishu Card 2.0 button uses behaviors[] instead of legacy top-level value
+  const cards = [
+    buildFeishuPrdFormCard({ repoFullName: 'owner/repo', chatId: 'oc_1' }),
+    buildFeishuReworkFormCard({ runId: 'run-1', prdTitle: 'Demo', chatId: 'oc_1' }),
+    buildFeishuStageCard({
+      kind: 'production_failed',
+      prdTitle: 'Demo',
+      repoFullName: 'owner/repo',
+      runId: 'run-1',
+      chatId: 'oc_1',
+      error: rawAnsi,
+    }),
+  ];
+
+  const collectButtons = (node: unknown, out: Array<Record<string, unknown>> = []) => {
+    if (Array.isArray(node)) {
+      for (const item of node) collectButtons(item, out);
+    } else if (node && typeof node === 'object') {
+      const obj = node as Record<string, unknown>;
+      if (obj.tag === 'button') out.push(obj);
+      for (const val of Object.values(obj)) collectButtons(val, out);
+    }
+    return out;
+  };
+
+  for (const card of cards) {
+    const btns = collectButtons(card);
+    assert.ok(btns.length >= 1);
+    for (const btn of btns) {
+      assert.equal('value' in btn, false, 'Card 2.0 button must not have legacy top-level value');
+      assert.ok(Array.isArray(btn.behaviors) && btn.behaviors.length > 0, 'Card 2.0 button must declare behaviors[]');
+    }
+  }
+
+  // Stage failure card must strip ANSI escape sequences
+  const stageJson = JSON.stringify(cards[2]);
+  assert.ok(!stageJson.includes('\\u001b'));
+  assert.ok(stageJson.includes('redeploy_production'));
+
+  // Form submission fallback by action.name if action.value is omitted
+  const parsedForm = parseFeishuCardCallbackBody({
+    schema: '2.0',
+    header: { event_id: 'evt_form_fallback', token: 'tok' },
+    event: {
+      context: { open_chat_id: 'oc_1' },
+      action: {
+        name: 'submit_prd_btn',
+        value: {},
+        form_value: { prd_title: '测试', prd_content: '内容详述超过二十个字符的完整需求描述' },
+      },
+    },
+  });
+  assert.equal(parsedForm.kind, 'card_action');
+  assert.equal(parsedForm.actionType, 'submit_prd_form');
+});
+
+
+
+
 
 
 

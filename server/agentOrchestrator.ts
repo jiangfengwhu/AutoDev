@@ -7,6 +7,7 @@ import type {
 } from '../src/types/autodev.ts';
 import { resolveEffectiveTechStack } from '../src/lib/workflowBuilder.ts';
 import { formatRsiPromptBlock } from '../src/lib/rsiEngine.ts';
+import { formatRepoContextForPrompt } from '../src/lib/iterationContext.ts';
 import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore.ts';
 
 export const GEMINI_AGENT_MODEL = 'gemini-4-hydrogen';
@@ -130,7 +131,7 @@ export interface AgentRunInput {
   prdTitle: string;
   prdContent: string;
   techStackHint?: string;
-  repoContext?: import('../src/types/autodev').RepoContextSnapshot;
+  repoContext?: import('../src/types/autodev.ts').RepoContextSnapshot;
 }
 
 const ARCHITECT_RESPONSE_SCHEMA = {
@@ -324,7 +325,6 @@ export async function runArchitectAgent(
   input: AgentRunInput,
   onChunk?: (chunkText: string) => void
 ): Promise<ArchitectOutput> {
-  const { formatRepoContextForPrompt } = await import('../src/lib/iterationContext');
   const { stack: effectiveStack, isDefaultCloudflare } = resolveEffectiveTechStack(
     input.techStackHint
   );
@@ -387,7 +387,6 @@ export async function runQaSpecAgent(
   apiContracts: ApiContract[],
   onChunk?: (chunkText: string) => void
 ): Promise<QaSpecOutput> {
-  const { formatRepoContextForPrompt } = await import('../src/lib/iterationContext');
   const rsiBlock = formatRsiPromptBlock(listAllRsiRules(), 'qa_spec');
   if (rsiBlock) recordRulesAppliedForStage('qa_spec');
 
@@ -435,7 +434,6 @@ export async function runQaCriticAgent(
   qaSpec: QaSpecOutput,
   onChunk?: (chunkText: string) => void
 ): Promise<QaCriticOutput> {
-  const { formatRepoContextForPrompt } = await import('../src/lib/iterationContext');
   const rsiBlock = formatRsiPromptBlock(listAllRsiRules(), 'qa_critic');
   if (rsiBlock) recordRulesAppliedForStage('qa_critic');
 

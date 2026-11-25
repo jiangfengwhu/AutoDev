@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   ClipboardList,
+  Cloud,
   ExternalLink,
   FileText,
   GitBranch,
@@ -13,6 +14,7 @@ import {
   GitPullRequest,
   Globe,
   History,
+  Loader2,
   MessageSquare,
   Plus,
   RefreshCw,
@@ -41,7 +43,9 @@ import {
   type RequirementsBoardPayload,
   type RequirementStatusBucket,
 } from '../lib/requirementsBoard';
+import type { BackgroundTask } from '../types/autodev';
 import { formatTokenCount } from '../lib/overviewMetrics';
+import { apiFetch } from '../lib/editAuthClient';
 import { RequirementReportModal } from './RequirementReportModal';
 
 interface RequirementsBoardViewProps {
@@ -51,6 +55,7 @@ interface RequirementsBoardViewProps {
   onGoToNewPrd: () => void;
   onGoToPipeline: (runId: string) => void;
   onGoToApproval: (runId: string) => void;
+  onBackgroundTaskStarted?: (task: BackgroundTask) => void;
   onRecordDeleted?: () => void;
   onSuccessToast?: (message: string, title?: string) => void;
   onErrorToast: (message: string, title?: string) => void;
@@ -152,6 +157,7 @@ export function RequirementsBoardView({
   onGoToNewPrd,
   onGoToPipeline,
   onGoToApproval,
+  onBackgroundTaskStarted,
   onRecordDeleted,
   onSuccessToast,
   onErrorToast,
@@ -167,6 +173,7 @@ export function RequirementsBoardView({
   const [reportTargetId, setReportTargetId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [redeployingProdId, setRedeployingProdId] = useState<string | null>(null);
 
   const [auditCategory, setAuditCategory] = useState<AuditCategoryFilter>('all');
   const [auditQuery, setAuditQuery] = useState('');
@@ -175,7 +182,7 @@ export function RequirementsBoardView({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/requirements/board');
+      const res = await apiFetch('/api/requirements/board');
       const json = await res.json().catch(() => ({}));
       if (!res.ok) {
         throw new Error(json.error || `HTTP ${res.status}`);
@@ -206,7 +213,7 @@ export function RequirementsBoardView({
         if (!endpoint) {
           throw new Error('该记录缺少可删除的标识 ID');
         }
-        const res = await fetch(endpoint, { method: 'DELETE' });
+        const res = await apiFetch(endpoint, { method: 'DELETE' });
         const json = await res.json().catch(() => ({}));
         if (!res.ok) {
           throw new Error(json.error || `HTTP ${res.status}`);
@@ -225,6 +232,51 @@ export function RequirementsBoardView({
       }
     },
     [fetchBoard, onRecordDeleted, onSuccessToast, onErrorToast]
+  );
+
+  const handleRedeployProduction = useCallback(
+    async (item: RequirementBoardItem) => {
+      setRedeployingProdId(item.id);
+      try {
+        const res = await apiFetch('/api/cloudflare/deploy-production', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            async: true,
+            runId: item.runId,
+            repoFullName: item.repoFullName,
+            branchName: item.mergedBaseBranch || item.defaultBranch || 'main',
+          }),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (res.status === 202 && json.task) {
+          onBackgroundTaskStarted?.(json.task as BackgroundTask);
+          onSuccessToast?.(
+            `已启动「${item.title}」的 Cloudflare 生产环境重新部署`,
+            '后台生产部署已启动'
+          );
+          return;
+        }
+        if (!res.ok) {
+          throw new Error(json.error || `HTTP ${res.status}`);
+        }
+        onSuccessToast?.(
+          json.deployment?.url
+            ? `生产环境已重新上线：${json.deployment.url}`
+            : '生产环境已重新部署上线',
+          '生产部署完成'
+        );
+        await fetchBoard();
+      } catch (err) {
+        onErrorToast(
+          err instanceof Error ? err.message : '重新部署生产环境失败',
+          '生产部署失败'
+        );
+      } finally {
+        setRedeployingProdId(null);
+      }
+    },
+    [fetchBoard, onBackgroundTaskStarted, onErrorToast, onSuccessToast]
   );
 
   const filteredRequirements = useMemo(() => {
@@ -599,6 +651,7 @@ export function RequirementsBoardView({
                 <Search className="h-3.5 w-3.5 text-[#8B949E] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   type="text"
+                  data-readonly-safe="true"
                   value={reqQuery}
                   onChange={(e) => setReqQuery(e.target.value)}
                   aria-label="搜索历史需求"
@@ -646,6 +699,7 @@ export function RequirementsBoardView({
                 <Search className="h-3.5 w-3.5 text-[#8B949E] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   type="text"
+                  data-readonly-safe="true"
                   value={auditQuery}
                   onChange={(e) => setAuditQuery(e.target.value)}
                   aria-label="搜索操作日志"
@@ -802,7 +856,17 @@ export function RequirementsBoardView({
                                 ) : (
                                   <span className="text-[#6E7681]">—</span>
                                 )}
-                                {item.previewUrl && (
+                                {item.productionUrl ? (
+                                  <a
+                                    href={item.productionUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="inline-flex items-center gap-1 text-[#3FB950] hover:underline"
+                                  >
+                                    <Globe className="h-3 w-3" />
+                                    <span>线上</span>
+                                  </a>
+                                ) : item.previewUrl ? (
                                   <a
                                     href={item.previewUrl}
                                     target="_blank"
@@ -812,7 +876,7 @@ export function RequirementsBoardView({
                                     <Globe className="h-3 w-3" />
                                     <span>预览</span>
                                   </a>
-                                )}
+                                ) : null}
                               </div>
 
                               <div className="py-3 px-3 font-mono tabular-nums text-[11px] text-[#8B949E] whitespace-nowrap">
@@ -951,24 +1015,58 @@ export function RequirementsBoardView({
                                       </div>
                                     )}
 
-                                    {item.mergedCommitSha && (
-                                      <div className="rounded-md border border-[#3FB950]/40 bg-[#2EA043]/10 px-3 py-2 text-[12px] text-[#AFF5B4] flex items-center justify-between gap-2">
+                                    {(item.mergedCommitSha || item.status === 'approved' || item.status === 'merged') && (
+                                      <div className="rounded-md border border-[#3FB950]/40 bg-[#2EA043]/10 px-3 py-2 text-[12px] text-[#AFF5B4] flex flex-wrap items-center justify-between gap-2">
                                         <span className="inline-flex items-center gap-1.5 font-mono">
                                           <GitMerge className="h-3.5 w-3.5 text-[#3FB950]" />
-                                          已合入 {item.mergedBaseBranch || 'main'} (
-                                          {item.mergedCommitSha.slice(0, 7)})
+                                          {item.mergedCommitSha
+                                            ? `已合入 ${item.mergedBaseBranch || 'main'} (${item.mergedCommitSha.slice(0, 7)})`
+                                            : '已批准上线'}
                                         </span>
-                                        {item.mergedCommitUrl && (
-                                          <a
-                                            href={item.mergedCommitUrl}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            className="inline-flex items-center gap-1 underline text-[11px]"
+                                        <div className="flex items-center gap-2.5">
+                                          {item.productionUrl && (
+                                            <a
+                                              href={item.productionUrl}
+                                              target="_blank"
+                                              rel="noreferrer"
+                                              className="inline-flex items-center gap-1 underline text-[11px]"
+                                            >
+                                              <Globe className="h-3 w-3" />
+                                              <span>生产站</span>
+                                            </a>
+                                          )}
+                                          {item.mergedCommitUrl && (
+                                            <a
+                                              href={item.mergedCommitUrl}
+                                              target="_blank"
+                                              rel="noreferrer"
+                                              className="inline-flex items-center gap-1 underline text-[11px]"
+                                            >
+                                              <span>Commit</span>
+                                              <ExternalLink className="h-3 w-3" />
+                                            </a>
+                                          )}
+                                          <button
+                                            type="button"
+                                            data-testid="btn-board-redeploy-production"
+                                            disabled={redeployingProdId === item.id}
+                                            onClick={() => handleRedeployProduction(item)}
+                                            className="inline-flex items-center gap-1 rounded border border-[#3FB950]/40 bg-[#0D1117]/70 px-2 py-0.5 text-[11px] font-medium text-[#AFF5B4] hover:bg-[#2EA043]/30 disabled:opacity-50 transition-colors cursor-pointer"
                                           >
-                                            <span>查看 Commit</span>
-                                            <ExternalLink className="h-3 w-3" />
-                                          </a>
-                                        )}
+                                            {redeployingProdId === item.id ? (
+                                              <Loader2 className="h-3 w-3 animate-spin" />
+                                            ) : (
+                                              <Cloud className="h-3 w-3" />
+                                            )}
+                                            <span>
+                                              {redeployingProdId === item.id
+                                                ? '部署中…'
+                                                : item.productionUrl
+                                                  ? '重部署生产'
+                                                  : '重新部署生产'}
+                                            </span>
+                                          </button>
+                                        </div>
                                       </div>
                                     )}
 

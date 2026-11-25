@@ -3,7 +3,7 @@ import type {
   BackgroundTask,
   BackgroundTaskKind,
   NavSectionId,
-} from '../src/types/autodev';
+} from '../src/types/autodev.ts';
 
 const MAX_RETAINED_TASKS = 40;
 

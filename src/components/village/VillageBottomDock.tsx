@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
+  Bell,
+  BellOff,
   Camera,
   ChevronDown,
   ChevronUp,
@@ -9,6 +11,7 @@ import {
   FilePlus2,
   Grid2x2,
   Layers,
+  Lock,
   Moon,
   Pause,
   Play,
@@ -17,6 +20,7 @@ import {
   SkipForward,
   Sun,
   Sunset,
+  Unlock,
 } from 'lucide-react';
 import {
   DEMO_PIPELINE_PHASES,
@@ -28,6 +32,7 @@ import type {
   AtmospherePresetId,
   CameraPresetId,
 } from '../../scene/villageConfig';
+import type { BrowserNotificationPermission } from '../../lib/browserNotifications';
 
 interface VillageBottomDockProps {
   factoryMode: FactoryMode;
@@ -38,6 +43,11 @@ interface VillageBottomDockProps {
   demoPlaying: boolean;
   showBuildingLabels?: boolean;
   onToggleBuildingLabels?: () => void;
+  notificationPermission?: BrowserNotificationPermission;
+  notificationsEnabled?: boolean;
+  onToggleNotifications?: () => void;
+  isEditUnlocked?: boolean;
+  onOpenUnlockModal?: () => void;
   onSelectCameraPreset: (preset: CameraPresetId) => void;
   onSelectAtmosphere: (preset: AtmospherePresetId) => void;
   onOpenStation: (stationId: FactoryStationId) => void;
@@ -86,6 +96,11 @@ export function VillageBottomDock({
   demoPlaying,
   showBuildingLabels = true,
   onToggleBuildingLabels,
+  notificationPermission = 'default',
+  notificationsEnabled = false,
+  onToggleNotifications,
+  isEditUnlocked = false,
+  onOpenUnlockModal,
   onSelectCameraPreset,
   onSelectAtmosphere,
   onOpenStation,
@@ -332,6 +347,64 @@ export function VillageBottomDock({
               <Eye className="h-3.5 w-3.5" />
             ) : (
               <EyeOff className="h-3.5 w-3.5" />
+            )}
+          </button>
+
+          <button
+            type="button"
+            data-testid="dock-toggle-notifications"
+            aria-label={
+              notificationPermission === 'granted' && notificationsEnabled
+                ? '关闭浏览器任务完成通知'
+                : '开启浏览器任务完成通知'
+            }
+            aria-pressed={notificationPermission === 'granted' && notificationsEnabled}
+            onClick={onToggleNotifications}
+            title={
+              notificationPermission === 'unsupported'
+                ? '当前浏览器不支持系统通知'
+                : notificationPermission === 'denied'
+                  ? '浏览器通知权限已被阻止，请在浏览器地址栏设置中允许通知'
+                  : notificationPermission === 'granted' && notificationsEnabled
+                    ? '浏览器桌面通知已开启（每次任务完成时提醒，点击关闭）'
+                    : '点击开启浏览器桌面通知（每次任务完成自动提醒）'
+            }
+            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition-colors cursor-pointer ${
+              notificationPermission === 'granted' && notificationsEnabled
+                ? 'border-[#2563EB] bg-[#EFF6FF] text-[#1D4ED8] hover:bg-[#DBEAFE]'
+                : notificationPermission === 'denied'
+                  ? 'border-[#FCA5A5] bg-[#FEF2F2] text-[#DC2626] hover:bg-[#FEE2E2]'
+                  : 'border-[#CBD5E1] bg-white text-[#64748B] hover:text-[#0F172A] hover:bg-[#F8FAFC]'
+            }`}
+          >
+            {notificationPermission === 'granted' && notificationsEnabled ? (
+              <Bell className="h-3.5 w-3.5" />
+            ) : (
+              <BellOff className="h-3.5 w-3.5" />
+            )}
+          </button>
+
+          <button
+            type="button"
+            data-testid="dock-toggle-lock"
+            aria-label={isEditUnlocked ? '管理编辑权限（已解锁）' : '解锁编辑权限'}
+            aria-pressed={isEditUnlocked}
+            onClick={onOpenUnlockModal}
+            title={
+              isEditUnlocked
+                ? '编辑权限已解锁（点击重新锁定或修改密码）'
+                : '当前为只读锁定状态（点击输入密码解锁编辑）'
+            }
+            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition-colors cursor-pointer ${
+              isEditUnlocked
+                ? 'border-[#10B981] bg-[#ECFDF5] text-[#059669] hover:bg-[#D1FAE5]'
+                : 'border-[#F59E0B]/70 bg-[#FFFBEB] text-[#D97706] hover:bg-[#FEF3C7]'
+            }`}
+          >
+            {isEditUnlocked ? (
+              <Unlock className="h-3.5 w-3.5" />
+            ) : (
+              <Lock className="h-3.5 w-3.5" />
             )}
           </button>
 

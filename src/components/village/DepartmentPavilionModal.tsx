@@ -1,9 +1,11 @@
-import { useEffect, type ReactNode } from 'react';
+import { useEffect, type ReactNode, type SyntheticEvent } from 'react';
 import {
   ChevronLeft,
   ChevronRight,
   GitBranch,
+  Lock,
   MapPin,
+  Unlock,
   X,
 } from 'lucide-react';
 import {
@@ -16,6 +18,8 @@ interface DepartmentPavilionModalProps {
   stationId: FactoryStationId | null;
   snapshot: FactoryPipelineSnapshot;
   repoFullName: string;
+  isEditUnlocked: boolean;
+  onOpenUnlockModal: (reason?: string) => void;
   onSelectStation: (stationId: FactoryStationId) => void;
   onFocusBuilding: (stationId: FactoryStationId) => void;
   onClose: () => void;
@@ -35,6 +39,8 @@ export function DepartmentPavilionModal({
   stationId,
   snapshot,
   repoFullName,
+  isEditUnlocked,
+  onOpenUnlockModal,
   onSelectStation,
   onFocusBuilding,
   onClose,
@@ -61,6 +67,29 @@ export function DepartmentPavilionModal({
     ];
   const nextStation =
     DEPARTMENT_ORDER[(currentIndex + 1) % DEPARTMENT_ORDER.length];
+
+  const isLockedEditableTarget = (target: EventTarget | null): boolean => {
+    if (isEditUnlocked || !(target instanceof HTMLElement)) return false;
+    if (target.closest('[data-readonly-safe="true"]')) return false;
+    const tag = target.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  };
+
+  const guardEditInteraction = (e: SyntheticEvent) => {
+    if (isLockedEditableTarget(e.target)) {
+      e.preventDefault();
+      e.stopPropagation();
+      onOpenUnlockModal('当前为只读锁定状态，请输入编辑密码后再进行表单编辑或提交');
+    }
+  };
+
+  const guardFormSubmit = (e: SyntheticEvent) => {
+    if (!isEditUnlocked) {
+      e.preventDefault();
+      e.stopPropagation();
+      onOpenUnlockModal('当前为只读锁定状态，请输入编辑密码后再提交操作');
+    }
+  };
 
   return (
     <div
@@ -93,8 +122,48 @@ export function DepartmentPavilionModal({
         {/* Operational Department Workspace */}
         <main
           data-testid="pavilion-workspace"
+          data-edit-locked={isEditUnlocked ? 'false' : 'true'}
+          onSubmitCapture={guardFormSubmit}
+          onBeforeInputCapture={guardEditInteraction}
+          onChangeCapture={guardEditInteraction}
+          onMouseDownCapture={(e) => {
+            if (isLockedEditableTarget(e.target)) {
+              const el = e.target as HTMLElement;
+              if (
+                el.tagName === 'SELECT' ||
+                (el instanceof HTMLInputElement &&
+                  (el.type === 'checkbox' || el.type === 'radio'))
+              ) {
+                e.preventDefault();
+                e.stopPropagation();
+                onOpenUnlockModal('当前为只读锁定状态，请输入编辑密码后再修改选项');
+              }
+            }
+          }}
           className="flex-1 min-w-0 min-h-0 overflow-y-auto px-5 pt-5 pb-6 sm:px-7 sm:pt-6 village-pavilion-surface bg-[#F6F8FA]/68"
         >
+          {!isEditUnlocked && (
+            <div
+              data-testid="readonly-lock-banner"
+              className="mb-4 mr-10 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[#FDE68A] bg-[#FFFBEB]/95 px-3.5 py-2 text-[12px] text-[#92400E]"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <Lock className="h-3.5 w-3.5 text-[#D97706] shrink-0" />
+                <span className="font-medium">
+                  当前为只读锁定模式，可自由查看数据；所有编辑、派发、签批与重置操作需解锁后执行。
+                </span>
+              </div>
+              <button
+                type="button"
+                data-testid="banner-unlock-btn"
+                onClick={() => onOpenUnlockModal()}
+                className="inline-flex items-center gap-1 rounded-lg bg-[#D97706] px-2.5 py-1 text-[11.5px] font-semibold text-white hover:bg-[#B45309] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Unlock className="h-3 w-3" />
+                <span>输入密码解锁</span>
+              </button>
+            </div>
+          )}
           {children}
         </main>
 
@@ -120,6 +189,24 @@ export function DepartmentPavilionModal({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-testid="pavilion-toggle-lock"
+              onClick={() => onOpenUnlockModal()}
+              className={`inline-flex items-center gap-1.5 rounded-[10px] border px-2.5 py-1.5 text-[11.5px] font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                isEditUnlocked
+                  ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#059669] hover:bg-[#D1FAE5]'
+                  : 'border-[#FDE68A] bg-[#FFFBEB] text-[#B45309] hover:bg-[#FEF3C7]'
+              }`}
+            >
+              {isEditUnlocked ? (
+                <Unlock className="h-3.5 w-3.5" />
+              ) : (
+                <Lock className="h-3.5 w-3.5" />
+              )}
+              <span>{isEditUnlocked ? '已解锁编辑' : '只读 · 解锁'}</span>
+            </button>
+
             <button
               type="button"
               data-testid="pavilion-focus-camera"

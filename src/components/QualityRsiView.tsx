@@ -30,6 +30,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { apiFetch } from '../lib/editAuthClient';
 import {
   ROOT_CAUSE_LABELS,
   RSI_BUDGET_LIMITS,
@@ -374,7 +375,7 @@ export function QualityRsiView({
     setSyncing(true);
     setError(null);
     try {
-      const res = await fetch('/api/rsi/sync', {
+      const res = await apiFetch('/api/rsi/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -419,7 +420,7 @@ export function QualityRsiView({
   const handleAnalyzeIncident = async (incidentId: string) => {
     setAnalyzingIncidentId(incidentId);
     try {
-      const res = await fetch(`/api/rsi/incidents/${encodeURIComponent(incidentId)}/analyze`, {
+      const res = await apiFetch(`/api/rsi/incidents/${encodeURIComponent(incidentId)}/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ async: true }),
@@ -464,7 +465,7 @@ export function QualityRsiView({
     }
     setSubmittingIncident(true);
     try {
-      const res = await fetch('/api/rsi/incidents', {
+      const res = await apiFetch('/api/rsi/incidents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -524,7 +525,7 @@ export function QualityRsiView({
     }
     setSavingRule(true);
     try {
-      const res = await fetch('/api/rsi/rules', {
+      const res = await apiFetch('/api/rsi/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -556,7 +557,7 @@ export function QualityRsiView({
   const handleUpdateRuleStatus = async (rule: RsiSystemRule, nextStatus: RsiRuleStatus) => {
     setBusyRuleId(rule.id);
     try {
-      const res = await fetch(`/api/rsi/rules/${encodeURIComponent(rule.id)}`, {
+      const res = await apiFetch(`/api/rsi/rules/${encodeURIComponent(rule.id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: nextStatus }),
@@ -585,7 +586,7 @@ export function QualityRsiView({
   const handleConsolidateRules = async () => {
     setConsolidating(true);
     try {
-      const res = await fetch('/api/rsi/consolidate', {
+      const res = await apiFetch('/api/rsi/consolidate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ async: true }),
@@ -622,7 +623,7 @@ export function QualityRsiView({
   const handleDeleteRule = async (rule: RsiSystemRule) => {
     setBusyRuleId(rule.id);
     try {
-      const res = await fetch(`/api/rsi/rules/${encodeURIComponent(rule.id)}`, {
+      const res = await apiFetch(`/api/rsi/rules/${encodeURIComponent(rule.id)}`, {
         method: 'DELETE',
       });
       const json = await res.json().catch(() => ({}));

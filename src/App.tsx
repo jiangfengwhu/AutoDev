@@ -19,12 +19,20 @@ import { QualityRsiView, type QualityFocusTarget } from './components/QualityRsi
 import { RequirementReportModal } from './components/RequirementReportModal';
 import { ToastContainer } from './components/ToastContainer';
 import { DepartmentPavilionModal } from './components/village/DepartmentPavilionModal';
+import { EditUnlockModal } from './components/village/EditUnlockModal';
 import { PreviewZoomModal } from './components/cleanroom/PreviewZoomModal';
 import { VillageViewport } from './components/village/VillageViewport';
 import { VillageBottomDock } from './components/village/VillageBottomDock';
 import type { AtmospherePresetId, CameraPresetId, VillageBuildingId } from './scene/villageConfig';
 import { FIXED_TARGET_REPO } from './lib/workflowBuilder';
 import { clearPrdDraft, loadPrdDraft } from './lib/prdDraftStorage';
+import {
+  apiFetch,
+  installEditAuthFetchInterceptor,
+  subscribeEditAuthLocked,
+  type EditAuthMeta,
+  type EditAuthStatusResponse,
+} from './lib/editAuthClient';
 import type { SevenDayOverviewMetrics } from './lib/overviewMetrics';
 import {
   DEMO_PIPELINE_PHASES,
@@ -34,6 +42,14 @@ import {
   type FactoryStationId,
 } from './lib/factoryPipelineState';
 import { soundEngine } from './game/soundEngine';
+import {
+  getBrowserNotificationPermission,
+  loadBrowserNotificationsEnabled,
+  requestBrowserNotificationPermission,
+  saveBrowserNotificationsEnabled,
+  sendBrowserNotification,
+  type BrowserNotificationPermission,
+} from './lib/browserNotifications';
 
 const DEFAULT_PINNED_REPO: SelectedTargetRepo = {
   fullName: FIXED_TARGET_REPO.fullName,
@@ -79,6 +95,19 @@ export default function App() {
   const [reportModalRequirementId, setReportModalRequirementId] = useState<string | null>(null);
   const [approvedStampRunId, setApprovedStampRunId] = useState<string | null>(null);
   const [showBuildingLabels, setShowBuildingLabels] = useState(true);
+
+  // Browser desktop notification state (fires on every task completion/failure)
+  const [notificationPermission, setNotificationPermission] =
+    useState<BrowserNotificationPermission>(() => getBrowserNotificationPermission());
+  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() =>
+    loadBrowserNotificationsEnabled()
+  );
+
+  // Password-gated edit permission state (Bearer token kept strictly in JS memory)
+  const [isEditUnlocked, setIsEditUnlocked] = useState(false);
+  const [editAuthMeta, setEditAuthMeta] = useState<EditAuthMeta | null>(null);
+  const [unlockModalOpen, setUnlockModalOpen] = useState(false);
+  const [unlockReason, setUnlockReason] = useState<string | null>(null);
 
   // Real Backend State
   const [status, setStatus] = useState<IntegrationsStatusResponse | null>(null);
@@ -136,6 +165,37 @@ export default function App() {
     document.body.dataset.mode = factoryMode;
   }, [factoryMode]);
 
+  const openUnlockModal = useCallback((reason?: string) => {
+    setUnlockReason(reason ?? null);
+    setUnlockModalOpen(true);
+  }, []);
+
+  useEffect(() => {
+    installEditAuthFetchInterceptor();
+    const unsubscribe = subscribeEditAuthLocked((reason) => {
+      setIsEditUnlocked(false);
+      setUnlockReason(reason);
+      setUnlockModalOpen(true);
+    });
+
+    let cancelled = false;
+    apiFetch('/api/auth/status')
+      .then((res) => (res.ok ? (res.json() as Promise<EditAuthStatusResponse>) : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        setIsEditUnlocked(Boolean(data.unlocked));
+        if (data.meta) setEditAuthMeta(data.meta);
+      })
+      .catch(() => {
+        // non-fatal
+      });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
@@ -162,6 +222,69 @@ export default function App() {
     },
     [pushToast]
   );
+
+  const notifyDesktop = useCallback(
+    (params: {
+      title: string;
+      body: string;
+      tag: string;
+      stationId?: FactoryStationId;
+    }) => {
+      sendBrowserNotification({
+        title: params.title,
+        body: params.body,
+        tag: params.tag,
+        enabled: notificationsEnabled,
+        onClick: params.stationId
+          ? () => setDrawerStationId(params.stationId!)
+          : undefined,
+      });
+    },
+    [notificationsEnabled]
+  );
+
+  const handleToggleNotifications = useCallback(async () => {
+    const currentPerm = getBrowserNotificationPermission();
+    setNotificationPermission(currentPerm);
+
+    if (currentPerm === 'unsupported') {
+      pushErrorToast('当前浏览器环境不支持桌面通知 API。', '不支持通知');
+      return;
+    }
+    if (currentPerm === 'denied') {
+      pushErrorToast(
+        '浏览器已阻止本站通知权限，请在地址栏左侧网站设置中改为「允许」后再试。',
+        '通知权限已被拒绝'
+      );
+      return;
+    }
+    if (currentPerm === 'default') {
+      const granted = await requestBrowserNotificationPermission();
+      setNotificationPermission(granted);
+      if (granted === 'granted') {
+        saveBrowserNotificationsEnabled(true);
+        setNotificationsEnabled(true);
+        pushSuccessToast('已开启浏览器桌面通知，每次任务完成时将自动弹窗提醒。', '通知已开启');
+        sendBrowserNotification({
+          title: 'AutoDev Studio 通知已就绪',
+          body: '后续每次架构规划、编码流水线、预览与生产部署完成时，都会第一时间提醒你。',
+          tag: 'autodev-notify-ready',
+          enabled: true,
+        });
+      } else {
+        pushErrorToast('未授予浏览器通知权限，可在浏览器设置中重新开启。', '未开启通知');
+      }
+      return;
+    }
+
+    const nextEnabled = !notificationsEnabled;
+    saveBrowserNotificationsEnabled(nextEnabled);
+    setNotificationsEnabled(nextEnabled);
+    pushSuccessToast(
+      nextEnabled ? '已恢复浏览器任务完成桌面通知。' : '已静音浏览器桌面通知（站内提示仍保留）。',
+      nextEnabled ? '通知已开启' : '通知已关闭'
+    );
+  }, [notificationsEnabled, pushErrorToast, pushSuccessToast]);
 
   const fetchOverviewMetrics = useCallback(async (repoFullName: string) => {
     try {
@@ -390,12 +513,32 @@ export default function App() {
                 task.progressMessage || `${task.title} 已在后台完成`,
                 `后台完成：${task.title}`
               );
+              const stationId =
+                task.roomId && task.roomId !== 'studio'
+                  ? ROOM_TO_STATION[task.roomId]
+                  : 'ST-04';
+              notifyDesktop({
+                title: `任务完成 · ${task.title}`,
+                body: task.progressMessage || `${task.title} 已完成，点击查看详情`,
+                tag: `bg-task-done:${task.id}`,
+                stationId,
+              });
             } else if (prevStatus === 'running' && task.status === 'failed') {
               needsRefresh = true;
               pushErrorToast(
                 task.error || task.progressMessage || '后台任务执行失败',
                 `后台失败：${task.title}`
               );
+              const stationId =
+                task.roomId && task.roomId !== 'studio'
+                  ? ROOM_TO_STATION[task.roomId]
+                  : 'ST-04';
+              notifyDesktop({
+                title: `任务失败 · ${task.title}`,
+                body: task.error || task.progressMessage || '后台任务执行失败，请检查日志',
+                tag: `bg-task-fail:${task.id}`,
+                stationId,
+              });
             }
           }
 
@@ -427,6 +570,7 @@ export default function App() {
       fetchRsiState,
       fetchRunsAndLatestJob,
       handleEnvironmentReset,
+      notifyDesktop,
       pushErrorToast,
       pushSuccessToast,
       selectedRepo.fullName,
@@ -459,7 +603,20 @@ export default function App() {
     const timer = setInterval(() => {
       fetchBackgroundTasks(true);
     }, 1800);
-    return () => clearInterval(timer);
+
+    let keepalive: EventSource | null = null;
+    if (typeof window !== 'undefined' && typeof window.EventSource === 'function') {
+      try {
+        keepalive = new window.EventSource('/api/tasks/keepalive');
+      } catch {
+        keepalive = null;
+      }
+    }
+
+    return () => {
+      clearInterval(timer);
+      keepalive?.close();
+    };
   }, [hasRunningBackgroundTask, fetchBackgroundTasks]);
 
   const handleRunCompleted = useCallback((run: PipelineRun) => {
@@ -546,9 +703,21 @@ export default function App() {
             `「${nextJob.prdTitle}」已完成联合架构设计与 E2E 验收用例评审，支持直接修改规划方案`,
             '分析完成'
           );
+          notifyDesktop({
+            title: `架构规划完成 · ${nextJob.prdTitle}`,
+            body: '多智能体已完成架构拆解与盲测用例评审，点击前往创建 Draft PR。',
+            tag: `plan-done:${nextJob.id}`,
+            stationId: 'ST-01',
+          });
         } else if (lastJobStatusRef.current === 'running' && nextJob.status === 'error') {
           lastJobStatusRef.current = 'error';
           pushErrorToast(nextJob.error || '多智能体执行失败', 'PRD 分析中断');
+          notifyDesktop({
+            title: `架构规划失败 · ${nextJob.prdTitle}`,
+            body: nextJob.error || '规划任务异常中断，点击查看详情。',
+            tag: `plan-fail:${nextJob.id}`,
+            stationId: 'ST-01',
+          });
         }
       } catch {
         // retry next tick
@@ -562,6 +731,7 @@ export default function App() {
     fetchRsiState,
     fetchRuns,
     handleRunCompleted,
+    notifyDesktop,
     pushErrorToast,
     pushSuccessToast,
     selectedRepo.fullName,
@@ -705,6 +875,18 @@ export default function App() {
             fetchRsiState(selectedRepo.fullName);
             fetchOverviewMetrics(selectedRepo.fullName);
             setRefreshNonce((n) => n + 1);
+            const succeeded = nextConclusion === 'success';
+            const prTitle = inFlightPrRun?.prdTitle || inFlightPrBranch || 'AGY 编码流水线';
+            notifyDesktop({
+              title: succeeded
+                ? `AGY 编码与校验完成 · ${prTitle}`
+                : `AGY 编码流水线异常 · ${prTitle}`,
+              body: succeeded
+                ? '代码实现与自动化测试已完成，点击前往部署隔离预览环境进行验收。'
+                : `流水线结束状态：${nextConclusion || 'failure'}，点击查看日志。`,
+              tag: `agy-coding:${inFlightPrBranch}:${nextConclusion || 'done'}`,
+              stationId: succeeded ? 'ST-04' : 'ST-02',
+            });
           }
         }
       } catch {
@@ -723,6 +905,8 @@ export default function App() {
     fetchRunsAndLatestJob,
     inFlightPrBranch,
     inFlightPrCreatedAtMs,
+    inFlightPrRun?.prdTitle,
+    notifyDesktop,
     selectedRepo.fullName,
     refreshNonce,
   ]);
@@ -849,7 +1033,8 @@ export default function App() {
           drawerStationId ||
             tasksDrawerOpen ||
             previewZoomOpen ||
-            reportModalRequirementId
+            reportModalRequirementId ||
+            unlockModalOpen
         )}
         onSelectStation={openStationDrawer}
         onSelectBackgroundTasks={() => setTasksDrawerOpen(true)}
@@ -870,6 +1055,11 @@ export default function App() {
         demoPlaying={demoPlaying}
         showBuildingLabels={showBuildingLabels}
         onToggleBuildingLabels={() => setShowBuildingLabels((prev) => !prev)}
+        notificationPermission={notificationPermission}
+        notificationsEnabled={notificationsEnabled}
+        onToggleNotifications={handleToggleNotifications}
+        isEditUnlocked={isEditUnlocked}
+        onOpenUnlockModal={() => openUnlockModal()}
         onSelectCameraPreset={handleSelectCameraPreset}
         onSelectAtmosphere={setAtmospherePreset}
         onOpenStation={openStationDrawer}
@@ -901,6 +1091,8 @@ export default function App() {
         stationId={drawerStationId}
         snapshot={factorySnapshot}
         repoFullName={selectedRepo.fullName}
+        isEditUnlocked={isEditUnlocked}
+        onOpenUnlockModal={openUnlockModal}
         onSelectStation={openStationDrawer}
         onFocusBuilding={(sid) => {
           setCameraPreset(null);
@@ -1016,6 +1208,7 @@ export default function App() {
               setActiveRunId(runId);
               openStationDrawer('ST-04');
             }}
+            onBackgroundTaskStarted={handleBackgroundTaskStarted}
             onRecordDeleted={handleRecordDeleted}
             onSuccessToast={pushSuccessToast}
             onErrorToast={pushErrorToast}
@@ -1057,6 +1250,28 @@ export default function App() {
           setFocusBuildingNonce((n) => n + 1);
         }}
         onNavigateToRoom={handleNavigateFromTasksDrawer}
+      />
+
+      {/* Password-Gated Edit Permission Modal */}
+      <EditUnlockModal
+        open={unlockModalOpen}
+        unlocked={isEditUnlocked}
+        reason={unlockReason}
+        meta={editAuthMeta}
+        onClose={() => {
+          setUnlockModalOpen(false);
+          setUnlockReason(null);
+        }}
+        onUnlocked={(meta) => {
+          setIsEditUnlocked(true);
+          setEditAuthMeta(meta);
+          setUnlockReason(null);
+        }}
+        onLocked={(meta) => {
+          setIsEditUnlocked(false);
+          if (meta) setEditAuthMeta(meta);
+        }}
+        onSuccessToast={pushSuccessToast}
       />
 
       {/* Cleanroom Toast Notifications */}

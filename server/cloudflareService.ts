@@ -3,7 +3,7 @@ import type {
   CloudflareKvNamespace,
   CloudflareWorker,
   CloudflareWorkflow,
-} from '../src/types/autodev';
+} from '../src/types/autodev.ts';
 
 const CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4';
 
