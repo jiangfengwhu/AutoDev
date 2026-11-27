@@ -79,6 +79,7 @@ import {
   getRunningAnalysisJob,
   listAnalysisJobs,
   reloadJobsFromDisk,
+  registerSignalPlanLifecycleHooks,
   resumeRunningVpsPlanJobs,
   syncRunPlanToLinkedJobs,
 } from './server/analysisJobStore.ts';
@@ -202,13 +203,19 @@ import {
   dispatchSingleFeedbackDirect,
   drainQueuedSignalsIfIdle,
   flushProdErrorAutofixQueue,
+  handleSignalPlanCompleted,
+  handleSignalPlanFailed,
   isCronSecretConfigured,
   isIngestTokenConfigured,
   maybeAutoRegisterPublicStudioUrl,
+  notifyAtdV1FeedbackForRun,
   pullUnsyncedSignalsFromAtdV1,
+  reconcileLaunchedFeedbackReplies,
   runDailyFeedbackTriage,
   scheduleProdErrorBurstFlush,
   syncAtdV1SignalsInfra,
+  syncSignalsOnAgyCodingDispatched,
+  syncSignalsOnDraftPrCreated,
   verifyCronSecret,
   verifyIngestToken,
 } from './server/signalsService.ts';
@@ -1479,6 +1486,10 @@ async function startServer() {
       const executeCreateDraftPr = async (setProgress?: (msg: string) => void) => {
         setProgress?.('正在写入规格文档、盲测隔离用例并创建特性分支…');
         const artifacts = buildPrArtifacts(targetRun);
+        if (targetRun.linkedIssueNumbers?.length) {
+          const fixesLines = targetRun.linkedIssueNumbers.map((num) => `Fixes #${num}`).join('\n');
+          artifacts.prBody = `${artifacts.prBody.trimEnd()}\n\n${fixesLines}\n`;
+        }
         const draftPr = await createSpecDraftPr({
           owner: parsedRepo.owner,
           repo: parsedRepo.name,
@@ -1508,6 +1519,7 @@ async function startServer() {
           status: 'pr_created' as const,
           draftPr,
         };
+        syncSignalsOnDraftPrCreated(updatedRun, draftPr);
 
         appendAuditLog({
           category: 'planning',
@@ -2092,16 +2104,20 @@ async function startServer() {
         owner: parsed.owner,
         repo: parsed.name,
         prBranch: cleanBranch,
-        prNumber: prNumber ? Number(prNumber) : undefined,
+        prNumber: prNumber ? Number(prNumber) : linkedRun?.draftPr?.prNumber,
         runId: runId ? String(runId) : linkedRun?.id,
-        e2eTestPath: e2eTestPath ? String(e2eTestPath) : undefined,
+        e2eTestPath: e2eTestPath ? String(e2eTestPath) : linkedRun?.draftPr?.e2eTestPath,
         revisionNote: revisionNote ? String(revisionNote) : undefined,
         agyModel: agyModel ? String(agyModel) : undefined,
         agyMode: agyMode ? String(agyMode) : undefined,
-        baseBranch: baseBranch ? String(baseBranch) : undefined,
+        baseBranch: baseBranch ? String(baseBranch) : linkedRun?.defaultBranch || 'main',
         sessionMode: sessionPolicy.mode,
         resumeSessionId: sessionPolicy.resumeSessionId,
       });
+
+      if (linkedRun) {
+        syncSignalsOnAgyCodingDispatched(linkedRun);
+      }
 
       appendAuditLog({
         category: 'execution',
@@ -2240,6 +2256,17 @@ async function startServer() {
           summary: `Worker ${deployment.workerName} 已部署上线。`,
         });
 
+        if (existingRun?.id) {
+          void notifyAtdV1FeedbackForRun(
+            existingRun.id,
+            deployMode === 'production' ? 'launched' : 'preview_deployed',
+            {
+              prNumber: resolvedPrNumber,
+              productionUrl: deployMode === 'production' ? deployment.url : undefined,
+            }
+          ).catch(() => {});
+        }
+
         return {
           deployment,
           deployLogTail,
@@ -2365,6 +2392,13 @@ async function startServer() {
         summary: `生产 Worker ${deployment.workerName} 已重新发布上线。`,
         chatId: params.chatId,
       });
+
+      if (existingRun?.id) {
+        void notifyAtdV1FeedbackForRun(existingRun.id, 'launched', {
+          prNumber: existingRun.draftPr?.prNumber,
+          productionUrl: deployment.url,
+        }).catch(() => {});
+      }
 
       return { deployment, deployLogTail, run: updatedRun };
     } catch (err) {
@@ -2836,6 +2870,10 @@ async function startServer() {
               productionUrl: productionDeployResult.deployment.url,
               summary: `PR 已合入 ${mergeResult?.baseBranch || 'main'} 并自动发布生产环境。`,
             });
+            void notifyAtdV1FeedbackForRun(updated.id, 'launched', {
+              prNumber: updated.draftPr?.prNumber,
+              productionUrl: productionDeployResult.deployment.url,
+            }).catch(() => {});
           } else if (productionDeployResult && !productionDeployResult.deployed) {
             await notifyFeishuStageEvent({
               kind: 'production_failed',
@@ -2858,6 +2896,10 @@ async function startServer() {
               prUrl: updated.draftPr?.prUrl,
               error: `PR 合并失败：${mergeResult.error || '请检查冲突'}`,
             });
+          } else if (mergeResult?.merged) {
+            void notifyAtdV1FeedbackForRun(updated.id, 'launched', {
+              prNumber: updated.draftPr?.prNumber,
+            }).catch(() => {});
           }
         } else if (decision === 'changes_requested' && reworkResult?.dispatched) {
           const parsedReworkRepo = parseRepoFullName(updated.repoFullName);
@@ -2872,6 +2914,10 @@ async function startServer() {
             actionsUrl: reworkResult.actionsUrl,
             summary: reworkResult.note || '已按人工修订意见启动自动返工。',
           });
+          void notifyAtdV1FeedbackForRun(updated.id, 'rework_dispatched', {
+            prNumber: updated.draftPr?.prNumber,
+            reworkNote: reworkResult.note,
+          }).catch(() => {});
           if (parsedReworkRepo) {
             void watchAgyCodingRunAndNotifyFeishu({
               owner: parsedReworkRepo.owner,
@@ -3012,6 +3058,11 @@ async function startServer() {
                   updateProdErrorGroup(g.id, { status: 'pr_ready' });
                 }
               }
+              void notifyAtdV1FeedbackForRun(params.runId, 'coding_completed', {
+                prNumber: params.prNumber,
+                passedTests: latestRep?.passed,
+                failedTests: latestRep?.failed,
+              }).catch(() => {});
             }
 
             if (getFeishuIntegrationStatus().configured) {
@@ -3068,6 +3119,10 @@ async function startServer() {
     if (!parsedRepo) throw new Error(`无效的目标仓库格式：${targetRun.repoFullName}`);
 
     const artifacts = buildPrArtifacts(targetRun);
+    if (targetRun.linkedIssueNumbers?.length) {
+      const fixesLines = targetRun.linkedIssueNumbers.map((num) => `Fixes #${num}`).join('\n');
+      artifacts.prBody = `${artifacts.prBody.trimEnd()}\n\n${fixesLines}\n`;
+    }
     const draftPr = await createSpecDraftPr({
       owner: parsedRepo.owner,
       repo: parsedRepo.name,
@@ -3095,6 +3150,7 @@ async function startServer() {
       status: 'pr_created' as const,
       draftPr,
     };
+    syncSignalsOnDraftPrCreated(updatedRun, draftPr);
 
     appendAuditLog({
       category: 'planning',
@@ -3443,6 +3499,9 @@ async function startServer() {
             sessionMode: sessionPolicy.mode,
             resumeSessionId: sessionPolicy.resumeSessionId,
           });
+          if (run) {
+            syncSignalsOnAgyCodingDispatched(run);
+          }
           appendAuditLog({
             category: 'execution',
             action: 'agy_coding_dispatched',
@@ -3536,6 +3595,11 @@ async function startServer() {
               summary: `预览 Worker ${deployment.workerName} 已就绪。`,
               chatId,
             });
+            if (run?.id) {
+              void notifyAtdV1FeedbackForRun(run.id, 'preview_deployed', {
+                prNumber,
+              }).catch(() => {});
+            }
             return {
               summary: `预览环境已就绪：${deployment.url}`,
               result: { url: deployment.url, workerName: deployment.workerName },
@@ -3617,6 +3681,8 @@ async function startServer() {
           }
 
           updateRunReview(run.id, { mergedRelease: resMerge.release });
+          markProdErrorsResolvedForRun(run.id);
+          void drainQueuedSignalsIfIdle().catch(() => {});
           appendAuditLog({
             category: 'approval',
             action: 'release_approved',
@@ -3771,6 +3837,10 @@ async function startServer() {
             summary: note,
             chatId,
           });
+          void notifyAtdV1FeedbackForRun(run.id, 'rework_dispatched', {
+            prNumber: draftPrNum,
+            reworkNote: note,
+          }).catch(() => {});
           void watchAgyCodingRunAndNotifyFeishu({
             owner: parsedRepo.owner,
             repo: parsedRepo.name,
@@ -3862,6 +3932,11 @@ async function startServer() {
       void watchAgyCodingRunAndNotifyFeishu(dispatchParams);
     },
   };
+
+  registerSignalPlanLifecycleHooks({
+    onCompleted: (job, run) => handleSignalPlanCompleted(job, run, signalDispatchCallbacks),
+    onFailed: (job, errorMessage) => handleSignalPlanFailed(job, errorMessage),
+  });
 
   app.use((req, _res, next) => {
     maybeAutoRegisterPublicStudioUrl(req);
@@ -3997,11 +4072,11 @@ async function startServer() {
     if (runAsync) {
       const { task, deduplicated } = enqueueBackgroundTask({
         kind: 'signals_triage',
-        title: '每日用户反馈 AI 筛选与直通编码派发',
+        title: '每日用户反馈 AI 筛选与 ST-01 策划立项',
         roomId: 'quality',
         repoFullName: FIXED_TARGET_REPO.fullName,
         dedupeKey: `signals_daily_triage:${FIXED_TARGET_REPO.fullName}`,
-        initialMessage: '正在同步线上反馈并调用 AI 进行安全分诊与轻量任务派发…',
+        initialMessage: '正在同步线上反馈并调用 AI 安全分诊，通过后按标准需求路径发起 ST-01 架构策划…',
         executor: async ({ setProgress }) => {
           const outcome = await runDailyFeedbackTriage({
             trigger: 'manual',
@@ -4013,6 +4088,7 @@ async function startServer() {
             summary: outcome.message,
             result: {
               batchId: outcome.batch.id,
+              jobId: outcome.job?.id || outcome.batch.linkedJobId,
               runId: outcome.batch.linkedRunId,
               prUrl: outcome.batch.linkedPrUrl,
             },
@@ -4044,6 +4120,18 @@ async function startServer() {
       res.status(404).json({ error: '未找到指定反馈记录' });
       return;
     }
+    if (existing.status === 'planning' && existing.linkedJobId) {
+      res.status(409).json({
+        error: `该反馈正在进行 ST-01 架构与 QA 策划（Job ${existing.linkedJobId}），请前往 ST-01 查看进度`,
+      });
+      return;
+    }
+    if (existing.status === 'plan_ready' && existing.linkedRunId) {
+      res.status(409).json({
+        error: '该反馈已完成 ST-01 策划，请前往 ST-01 架构策划部审阅并创建 Draft PR',
+      });
+      return;
+    }
     if (existing.status === 'dispatched' && existing.linkedPrNumber) {
       res.status(409).json({
         error: `该反馈已派发至 PR #${existing.linkedPrNumber}，无需重复派发`,
@@ -4054,11 +4142,11 @@ async function startServer() {
     const shortLabel = existing.content.trim().slice(0, 22);
     const { task, deduplicated } = enqueueBackgroundTask({
       kind: 'signals_triage',
-      title: `一键直派用户反馈：${shortLabel}${existing.content.trim().length > 22 ? '…' : ''}`,
+      title: `反馈转标准需求立项：${shortLabel}${existing.content.trim().length > 22 ? '…' : ''}`,
       roomId: 'quality',
       repoFullName: FIXED_TARGET_REPO.fullName,
       dedupeKey: `signals_direct_feedback:${id}`,
-      initialMessage: '正在生成轻量任务书、创建 Draft PR 并直发 AGY 编码…',
+      initialMessage: '正在按标准新建需求路径发起 ST-01 三阶段策划，完成后在 ST-01 审阅并创建 Draft PR…',
       executor: async ({ setProgress }) => {
         const outcome = await dispatchSingleFeedbackDirect({
           feedbackId: id,
@@ -4071,6 +4159,7 @@ async function startServer() {
           result: {
             status: outcome.status,
             batchId: outcome.batch.id,
+            jobId: outcome.job?.id || outcome.batch.linkedJobId,
             runId: outcome.batch.linkedRunId,
             prUrl: outcome.batch.linkedPrUrl,
           },
@@ -4097,11 +4186,11 @@ async function startServer() {
 
     const { task, deduplicated } = enqueueBackgroundTask({
       kind: 'signals_autofix',
-      title: '合并派发线上报错自愈修复 PR',
+      title: '线上报错评估与 ST-01 策划立项',
       roomId: 'quality',
       repoFullName: FIXED_TARGET_REPO.fullName,
       dedupeKey: `signals_error_flush:${FIXED_TARGET_REPO.fullName}`,
-      initialMessage: '正在评估线上报错指纹并合并为单一修复 PR 派发至 AGY…',
+      initialMessage: '正在评估线上报错指纹并按标准需求路径发起 ST-01 完整策划…',
       executor: async ({ setProgress }) => {
         const outcome = await flushProdErrorAutofixQueue({
           trigger: 'manual',
@@ -4114,6 +4203,7 @@ async function startServer() {
           summary: outcome.message,
           result: {
             action: outcome.action,
+            jobId: outcome.job?.id || outcome.batch?.linkedJobId,
             runId: outcome.batch?.linkedRunId,
             prUrl: outcome.batch?.linkedPrUrl,
           },
@@ -4257,8 +4347,22 @@ async function startServer() {
                       ? `skipped(${res.githubSecretsSkippedReason})`
                       : 'none';
                 console.log(
-                  `[AutoDev Signals] Synced atd-v1 infra (workflow=${res.workflowSynced}, ghSecrets=${ghSecretsSummary}, cfSecrets=${res.cloudflareSecretsUpdated.join(',') || 'none'}${res.errors.length ? `, errors=${res.errors.join(' | ')}` : ''})`
+                  `[AutoDev Signals] Synced atd-v1 infra (workflow=${res.workflowSynced}, feedbackBridge=${res.feedbackBridgeSynced}, ghSecrets=${ghSecretsSummary}, cfSecrets=${res.cloudflareSecretsUpdated.join(',') || 'none'}${res.errors.length ? `, errors=${res.errors.join(' | ')}` : ''})`
                 );
+                void reconcileLaunchedFeedbackReplies()
+                  .then((rec) => {
+                    if (rec.replied > 0) {
+                      console.log(
+                        `[AutoDev Signals] Backfilled ${rec.replied}/${rec.checked} launched @官方反馈 post reply(s).`
+                      );
+                    }
+                  })
+                  .catch((recErr) => {
+                    console.warn(
+                      '[AutoDev Signals] Feedback reply reconciliation skipped:',
+                      recErr?.message || recErr
+                    );
+                  });
               })
               .catch((err) => {
                 console.warn('[AutoDev Signals] Background atd-v1 infra sync skipped:', err?.message || err);

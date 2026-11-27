@@ -150,6 +150,16 @@ export function recordFeedbackItem(
   return record;
 }
 
+export function listFeedbackRecordsByRunId(runId: string): FeedbackRecord[] {
+  return feedbackRecords.filter((r) => r.linkedRunId === runId);
+}
+
+export function listFeedbackRecordsByIds(ids: string[]): FeedbackRecord[] {
+  if (ids.length === 0) return [];
+  const set = new Set(ids);
+  return feedbackRecords.filter((r) => set.has(r.id));
+}
+
 export function updateFeedbackRecord(
   id: string,
   patch: Partial<{
@@ -157,11 +167,13 @@ export function updateFeedbackRecord(
     decisionScores: FeedbackDecisionScores;
     triageReason: string;
     triageBatchId: string;
+    linkedJobId: string;
     linkedIssueNumber: number;
     linkedIssueUrl: string;
     linkedRunId: string;
     linkedPrNumber: number;
     linkedPrUrl: string;
+    repliedStageKeys: string[];
   }>
 ): FeedbackRecord | null {
   const idx = feedbackRecords.findIndex((r) => r.id === id);
@@ -176,8 +188,30 @@ export function updateFeedbackRecord(
   return updated;
 }
 
+export function markFeedbackStageReplied(id: string, stageKey: string): FeedbackRecord | null {
+  const idx = feedbackRecords.findIndex((r) => r.id === id);
+  if (idx < 0) return null;
+  const existing = feedbackRecords[idx];
+  const prevKeys = Array.isArray(existing.repliedStageKeys) ? existing.repliedStageKeys : [];
+  if (prevKeys.includes(stageKey)) {
+    return existing;
+  }
+  const updated: FeedbackRecord = {
+    ...existing,
+    repliedStageKeys: [...prevKeys, stageKey].slice(-30),
+    updatedAt: new Date().toISOString(),
+  };
+  feedbackRecords[idx] = updated;
+  persistFeedback();
+  return updated;
+}
+
 export function listFeedbackBatches(limit = 40): FeedbackTriageBatch[] {
   return feedbackBatches.slice(0, limit);
+}
+
+export function getFeedbackBatchById(id: string): FeedbackTriageBatch | undefined {
+  return feedbackBatches.find((b) => b.id === id);
 }
 
 export function saveFeedbackBatch(batch: FeedbackTriageBatch): FeedbackTriageBatch {
@@ -288,6 +322,7 @@ export function updateProdErrorGroup(
     decisionScores: ProdErrorDecisionScores;
     triageReason: string;
     autofixBatchId: string;
+    linkedJobId: string;
     linkedIssueNumber: number;
     linkedIssueUrl: string;
     linkedRunId: string;
@@ -331,6 +366,10 @@ export function markProdErrorsResolvedForRun(runId: string): number {
 
 export function listProdErrorBatches(limit = 40): ProdErrorAutofixBatch[] {
   return errorBatches.slice(0, limit);
+}
+
+export function getProdErrorBatchById(id: string): ProdErrorAutofixBatch | undefined {
+  return errorBatches.find((b) => b.id === id);
 }
 
 export function saveProdErrorBatch(batch: ProdErrorAutofixBatch): ProdErrorAutofixBatch {

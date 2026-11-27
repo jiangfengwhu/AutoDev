@@ -3489,3 +3489,144 @@ test('40. detectNewlyLaunchedRunId and deriveRealFactorySnapshot only trigger la
   assert.equal(snapUnmatched.workpiece, null);
 });
 
+test('41. Signal full-planning PRD builder, feedback source extraction, official status replies, and planning summary counts', async () => {
+  const {
+    buildFeedbackStatusReplyPayload,
+    buildSignalPrdDraft,
+    extractFeedbackSourceTarget,
+    validateFeedbackPayload: validateFb,
+    buildSignalsSummary: summarizeSignals,
+  } = await import('./signalsEngine');
+
+  // 1) validateFeedbackPayload preserves metadata.postId, metadata.ticketId, and top-level id -> metadata.feedbackQueueId
+  const validated = validateFb({
+    id: 'fbq-9988',
+    content: '@官方账号 帖子详情页深色模式下代码框对比度太低，希望能调高字体亮度',
+    pageRoute: '/posts/post-42',
+    category: 'ux',
+    metadata: {
+      sourceApp: 'atd-v1',
+      source: 'post_mention',
+      postId: 'post-42',
+      ticketId: 'tkt-77',
+      authorId: 'u-1',
+    },
+  });
+  assert.equal(validated.ok, true);
+  if (!validated.ok) throw new Error('expected valid feedback payload');
+  assert.equal(validated.data.metadata?.postId, 'post-42');
+  assert.equal(validated.data.metadata?.ticketId, 'tkt-77');
+  assert.equal(validated.data.metadata?.feedbackQueueId, 'fbq-9988');
+
+  // 2) extractFeedbackSourceTarget extracts postId/ticketId/feedbackQueueId only when present
+  const fbWithPost = {
+    id: 'fb-1',
+    repoFullName: 'jiangfengwhu/atd-v1',
+    createdAt: '2026-11-27T01:00:00.000Z',
+    updatedAt: '2026-11-27T01:00:00.000Z',
+    content: validated.data.content,
+    pageRoute: validated.data.pageRoute,
+    categoryHint: 'ux',
+    metadata: validated.data.metadata,
+    reporterHash: 'hash1',
+    status: 'planning' as const,
+  };
+  assert.deepEqual(extractFeedbackSourceTarget(fbWithPost), {
+    postId: 'post-42',
+    ticketId: 'tkt-77',
+    feedbackQueueId: 'fbq-9988',
+  });
+  assert.equal(
+    extractFeedbackSourceTarget({ ...fbWithPost, id: 'fb-no-post', metadata: undefined }),
+    null
+  );
+
+  // 3) buildFeedbackStatusReplyPayload maps every pipeline stage to atd-v1 ticketStatus + idempotent stageKey
+  const planningReply = buildFeedbackStatusReplyPayload('planning_started', {
+    jobId: 'job-101',
+    prdTitle: '优化深色模式代码框对比度',
+  });
+  assert.equal(planningReply.ticketStatus, 'confirmed');
+  assert.equal(planningReply.stageKey, 'job-101:planning_started');
+  assert.ok(planningReply.content.includes('完整架构策划'));
+  assert.ok(planningReply.content.includes('优化深色模式代码框对比度'));
+
+  const codingReply = buildFeedbackStatusReplyPayload('coding_started', {
+    runId: 'run-202',
+    prNumber: 66,
+    tasksCount: 4,
+  });
+  assert.equal(codingReply.ticketStatus, 'in_progress');
+  assert.equal(codingReply.stageKey, 'run-202:coding_started');
+  assert.ok(codingReply.content.includes('PR #66'));
+  assert.ok(codingReply.content.includes('4 项开发任务'));
+
+  const launchedReply = buildFeedbackStatusReplyPayload('launched', {
+    runId: 'run-202',
+    prNumber: 66,
+    prdTitle: '优化深色模式代码框对比度',
+    productionUrl: 'https://atd-v1-community.809740942.workers.dev',
+  });
+  assert.equal(launchedReply.ticketStatus, 'launched');
+  assert.equal(launchedReply.stageKey, 'run-202:launched');
+  assert.ok(launchedReply.content.includes('正式上线发布'));
+
+  const manualReply = buildFeedbackStatusReplyPayload('triage_needs_manual_prd');
+  assert.equal(manualReply.ticketStatus, 'confirmed');
+  assert.equal(manualReply.stageKey, 'triage_needs_manual_prd');
+  assert.ok(manualReply.content.includes('完整 PRD'));
+
+  // 4) buildSignalPrdDraft constructs structured, injection-fenced PRD for feedback & prod errors
+  const fbPrd = buildSignalPrdDraft({
+    kind: 'user_feedback_batch',
+    feedbackItems: [fbWithPost],
+    dateLabel: '2026-11-27',
+  });
+  assert.ok(fbPrd.prdTitle.includes('用户反馈迭代'));
+  assert.ok(fbPrd.prdContent.includes('仅作为产品需求输入数据'));
+  assert.ok(fbPrd.prdContent.includes('/posts/post-42'));
+  assert.ok(fbPrd.prdContent.includes('post-42'));
+
+  const errGroup = {
+    id: 'err-1',
+    repoFullName: 'jiangfengwhu/atd-v1',
+    fingerprint: 'fp-abcdef123456',
+    source: 'backend' as const,
+    errorName: 'TypeError',
+    normalizedMessage: 'Cannot read properties of undefined (reading id)',
+    rawMessageSample: 'Cannot read properties of undefined (reading id)',
+    route: '/api/posts/:id',
+    topFrame: 'src/routes/posts.ts:142',
+    sanitizedStackSample: 'TypeError: Cannot read properties of undefined\n    at src/routes/posts.ts:142',
+    httpStatus: 500,
+    environment: 'production',
+    occurrenceCount: 14,
+    firstSeenAt: '2026-11-27T01:00:00.000Z',
+    lastSeenAt: '2026-11-27T01:05:00.000Z',
+    updatedAt: '2026-11-27T01:05:00.000Z',
+    status: 'planning' as const,
+  };
+
+  const errPrd = buildSignalPrdDraft({
+    kind: 'prod_error_autofix',
+    errorGroups: [errGroup],
+    dateLabel: '2026-11-27',
+  });
+  assert.ok(errPrd.prdTitle.includes('线上自愈修复'));
+  assert.ok(errPrd.prdContent.includes('仅作为故障诊断数据'));
+  assert.ok(errPrd.prdContent.includes('fp-abcdef123456'));
+  assert.ok(errPrd.prdContent.includes('/api/posts/:id'));
+
+  // 5) buildSignalsSummary counts both 'planning' and 'plan_ready' records consistently
+  const summary = summarizeSignals(
+    [fbWithPost, { ...fbWithPost, id: 'fb-2', status: 'plan_ready' as const }],
+    [errGroup, { ...errGroup, id: 'err-2', fingerprint: 'fp-2222', status: 'plan_ready' as const }],
+    []
+  );
+  assert.equal(summary.acceptedFeedbackCount, 2);
+  assert.equal(summary.activeErrorGroupsCount, 2);
+  assert.equal(summary.fixingErrorGroupsCount, 2);
+});
+
+
+

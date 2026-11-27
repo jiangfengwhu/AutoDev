@@ -373,6 +373,8 @@ export interface PipelineRun {
   origin?: PipelineRunOrigin;
   linkedIssueNumbers?: number[];
   linkedIssueUrls?: string[];
+  linkedFeedbackIds?: string[];
+  linkedErrorGroupIds?: string[];
   techStackHint?: string;
   repoContext?: RepoContextSnapshot;
   architect: ArchitectOutput;
@@ -422,6 +424,18 @@ export type AnalysisJobStatus = 'running' | 'completed' | 'error';
 
 export type AnalysisExecutionMode = 'vps_agy' | 'gemini_api';
 
+export interface SignalPlanContext {
+  origin: 'user_feedback_batch' | 'prod_error_autofix';
+  batchId: string;
+  feedbackIds?: string[];
+  errorGroupIds?: string[];
+  issueNumber?: number;
+  issueUrl?: string;
+  prTitlePrefix?: string;
+  /** Defaults to false: stops at ST-01 (status='analyzed') for review & standard Draft PR creation, identical to user-created PRDs. */
+  autoDispatchCoding?: boolean;
+}
+
 export interface AnalysisJob {
   id: string;
   createdAt: string;
@@ -443,6 +457,7 @@ export interface AnalysisJob {
   planMode?: 'unified_single_turn' | 'three_stage';
   tokenUsage?: TokenUsageSummary;
   repoContext?: RepoContextSnapshot;
+  signalContext?: SignalPlanContext;
   status: AnalysisJobStatus;
   steps: AgentStepState[];
   architect?: ArchitectOutput;

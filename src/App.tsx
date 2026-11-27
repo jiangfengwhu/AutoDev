@@ -970,6 +970,17 @@ export default function App() {
       if (section === 'studio') {
         setDrawerStationId(null);
       } else {
+        if (
+          task &&
+          (task.kind === 'signals_triage' || task.kind === 'signals_autofix') &&
+          task.status === 'completed' &&
+          typeof task.result?.jobId === 'string' &&
+          task.result.jobId
+        ) {
+          void fetchRunsAndLatestJob();
+          openStationDrawer('ST-01');
+          return;
+        }
         if (section === 'quality' && task) {
           if (task.kind === 'signals_triage') {
             setFocusedQualityTarget({ topSection: 'feedback', nonce: Date.now() });
@@ -980,7 +991,7 @@ export default function App() {
         openStationDrawer(ROOM_TO_STATION[section]);
       }
     },
-    [openStationDrawer]
+    [fetchRunsAndLatestJob, openStationDrawer]
   );
 
   const handleSelectCameraPreset = useCallback((preset: CameraPresetId) => {
@@ -1207,6 +1218,11 @@ export default function App() {
             onClearFocusedTarget={handleClearFocusedQualityTarget}
             activeTasks={backgroundTasks}
             onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            onOpenPrdWorkspace={(runId) => {
+              if (runId) setActiveRunId(runId);
+              void fetchRunsAndLatestJob();
+              openStationDrawer('ST-01');
+            }}
             onClosePavilion={() => setDrawerStationId(null)}
             refreshNonce={refreshNonce}
             onErrorToast={pushErrorToast}

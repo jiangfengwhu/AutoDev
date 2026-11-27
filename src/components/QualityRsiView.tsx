@@ -69,6 +69,7 @@ interface QualityRsiViewProps {
   onClearFocusedTarget?: () => void;
   activeTasks?: BackgroundTask[];
   onBackgroundTaskStarted?: (task: BackgroundTask) => void;
+  onOpenPrdWorkspace?: (runId?: string) => void;
   onClosePavilion?: () => void;
   refreshNonce?: number;
   onErrorToast: (message: string, title?: string) => void;
@@ -268,6 +269,7 @@ export function QualityRsiView({
   onClearFocusedTarget,
   activeTasks = [],
   onBackgroundTaskStarted,
+  onOpenPrdWorkspace,
   onClosePavilion,
   refreshNonce = 0,
   onErrorToast,
@@ -742,6 +744,7 @@ export function QualityRsiView({
           refreshNonce={refreshNonce}
           activeTasks={activeTasks}
           onBackgroundTaskStarted={onBackgroundTaskStarted}
+          onOpenPrdWorkspace={onOpenPrdWorkspace}
           onClosePavilion={onClosePavilion}
           onErrorToast={onErrorToast}
           onSuccessToast={onSuccessToast}

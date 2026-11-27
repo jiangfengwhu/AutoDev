@@ -27,6 +27,14 @@ export type AuditActionType =
   | 'prod_error_occurrence_recorded'
   | 'prod_error_merged_into_active_pr'
   | 'prod_error_autofix_dispatched'
+  | 'atd_v1_feedback_reply_bridge_synced'
+  | 'atd_v1_feedback_post_replied'
+  | 'feedback_plan_to_code_dispatched'
+  | 'signal_full_plan_failed'
+  | 'prod_error_merge_plan_started'
+  | 'prod_error_full_plan_started'
+  | 'daily_feedback_full_plan_started'
+  | 'feedback_direct_full_plan_started'
   | 'ai_model_config_updated';
 
 export interface AuditLogEntry {
@@ -171,6 +179,14 @@ export const AUDIT_ACTION_LABELS: Record<AuditActionType, string> = {
   prod_error_occurrence_recorded: '线上报错复发计数',
   prod_error_merged_into_active_pr: '合并线上报错至进行中 PR',
   prod_error_autofix_dispatched: '派发线上报错自愈修复',
+  atd_v1_feedback_reply_bridge_synced: '同步 atd-v1 官方反馈回帖桥接',
+  atd_v1_feedback_post_replied: '自动以 @官方反馈 回复社区原帖',
+  feedback_plan_to_code_dispatched: '反馈策划完成并自动派发编码',
+  signal_full_plan_failed: '线上信号完整策划失败回退',
+  prod_error_merge_plan_started: '线上报错增量策划（合入活跃 PR）',
+  prod_error_full_plan_started: '线上报错启动完整架构策划',
+  daily_feedback_full_plan_started: '每日反馈合批启动完整策划',
+  feedback_direct_full_plan_started: '单条反馈启动完整策划',
   ai_model_config_updated: '更新 AI 模型与容灾配置',
 };
 

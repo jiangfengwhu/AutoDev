@@ -11,6 +11,7 @@ import type {
   PipelineRun,
   QaCriticOutput,
   QaSpecOutput,
+  SignalPlanContext,
 } from '../src/types/autodev.ts';
 import {
   runArchitectAgent,
@@ -41,7 +42,7 @@ import {
   validateQaCriticOutput,
   validateQaSpecOutput,
 } from '../src/lib/planProtocol.ts';
-import { saveRun } from './runStore.ts';
+import { getRunById, saveRun, updateRunPlan } from './runStore.ts';
 import { formatRsiPromptBlock } from '../src/lib/rsiEngine.ts';
 import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore.ts';
 import { captureAndReflectIncident } from './rsiService.ts';
@@ -58,6 +59,66 @@ const PLAN_HARD_TIMEOUT_MS = 95 * 60 * 1000;
 
 let jobsCache: AnalysisJob[] | null = null;
 const activeVpsPollers = new Set<string>();
+
+export interface SignalPlanLifecycleHooks {
+  onCompleted: (job: AnalysisJob, run: PipelineRun) => Promise<void> | void;
+  onFailed: (job: AnalysisJob, errorMessage: string) => Promise<void> | void;
+}
+
+let signalPlanHooks: SignalPlanLifecycleHooks | null = null;
+
+export function registerSignalPlanLifecycleHooks(hooks: SignalPlanLifecycleHooks): void {
+  signalPlanHooks = hooks;
+}
+
+function finalizeRunForCompletedJob(
+  current: AnalysisJob,
+  outputs: {
+    architect: ArchitectOutput;
+    qaSpec: QaSpecOutput;
+    qaCritic: QaCriticOutput;
+    headSha?: string;
+    tokenUsage?: AnalysisJob['tokenUsage'];
+  }
+): PipelineRun {
+  const sig = current.signalContext;
+
+  const runPrefix =
+    sig?.origin === 'prod_error_autofix'
+      ? 'run-err'
+      : sig?.origin === 'user_feedback_batch'
+        ? 'run-fb'
+        : 'run';
+  const runId = `${runPrefix}-${crypto.randomBytes(4).toString('hex')}`;
+  const run: PipelineRun = {
+    id: runId,
+    createdAt: new Date().toISOString(),
+    repoFullName: current.repoFullName,
+    defaultBranch: current.defaultBranch,
+    prdTitle: current.prdTitle,
+    prdContent: current.prdContent,
+    origin: sig?.origin,
+    linkedIssueNumbers: sig?.issueNumber ? [sig.issueNumber] : undefined,
+    linkedIssueUrls: sig?.issueUrl ? [sig.issueUrl] : undefined,
+    linkedFeedbackIds: sig?.feedbackIds?.length ? [...sig.feedbackIds] : undefined,
+    linkedErrorGroupIds: sig?.errorGroupIds?.length ? [...sig.errorGroupIds] : undefined,
+    techStackHint: current.techStackHint,
+    repoContext: current.repoContext
+      ? {
+          ...current.repoContext,
+          headSha: outputs.headSha || current.repoContext.headSha,
+        }
+      : undefined,
+    architect: outputs.architect,
+    qaSpec: outputs.qaSpec,
+    qaCritic: outputs.qaCritic,
+    planTokenUsage: outputs.tokenUsage,
+    status: 'analyzed',
+    checkedCriteriaIds: [],
+  };
+  saveRun(run);
+  return run;
+}
 
 function ensureDataDir(): void {
   if (!fs.existsSync(DATA_DIR)) {
@@ -222,7 +283,7 @@ export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob | nu
     }
   }
 
-  return updateJob(jobId, (j) => ({
+  const cancelled = updateJob(jobId, (j) => ({
     ...j,
     status: 'error',
     error: '已手动取消本次需求规划任务。',
@@ -230,6 +291,12 @@ export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob | nu
       s.status === 'running' ? { ...s, status: 'error', message: '已手动取消' } : s
     ),
   }));
+  if (cancelled?.signalContext && signalPlanHooks) {
+    void Promise.resolve(signalPlanHooks.onFailed(cancelled, '已手动取消本次需求规划任务。')).catch((err) => {
+      console.warn('[AutoDev Plan] Signal onFailed hook error:', err);
+    });
+  }
+  return cancelled;
 }
 
 export function deleteAnalysisJobById(jobId: string): boolean {
@@ -278,6 +345,7 @@ export function createAndStartAnalysisJob(input: {
   agyModel?: string;
   agyMode?: string;
   executionMode?: AnalysisExecutionMode;
+  signalContext?: SignalPlanContext;
 }): AnalysisJob {
   const existingRunning = getRunningAnalysisJob();
   if (existingRunning) {
@@ -311,6 +379,7 @@ export function createAndStartAnalysisJob(input: {
     planMode: resolvedMode === 'vps_agy' ? 'unified_single_turn' : 'three_stage',
     agyModel: resolvedMode === 'vps_agy' ? agyModel : undefined,
     agyMode: resolvedMode === 'vps_agy' ? agyMode : undefined,
+    signalContext: input.signalContext,
     status: 'running',
     steps: createInitialSteps(),
   };
@@ -456,7 +525,7 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
     void pollVpsAgyPlanJob(jobId);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : '派发 Instabox AGY 规划工作流失败';
-    updateJob(jobId, (j) => ({
+    const failedJob = updateJob(jobId, (j) => ({
       ...j,
       status: 'error',
       error: errMsg,
@@ -464,6 +533,11 @@ async function executeVpsAgyPlanInBackground(initialJob: AnalysisJob): Promise<v
         s.id === 'architect' ? { ...s, status: 'error', message: errMsg } : s
       ),
     }));
+    if (failedJob?.signalContext && signalPlanHooks) {
+      void Promise.resolve(signalPlanHooks.onFailed(failedJob, errMsg)).catch((hookErr) => {
+        console.warn('[AutoDev Plan] Signal onFailed hook error:', hookErr);
+      });
+    }
     void captureAndReflectIncident({
       sourceRefKey: `plan-dispatch:${jobId}`,
       source: 'plan_error',
@@ -498,14 +572,20 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
       }
 
       if (Date.now() - startedWaitMs > PLAN_HARD_TIMEOUT_MS) {
-        updateJob(jobId, (j) => ({
+        const timeoutMsg = 'Instabox AGY 规划等待超时，请检查 Runner 日志。';
+        const timedOutJob = updateJob(jobId, (j) => ({
           ...j,
           status: 'error',
-          error: 'Instabox AGY 三阶段规划等待超时（超过 26 分钟），请检查 Runner 日志。',
+          error: timeoutMsg,
           steps: j.steps.map((s) =>
             s.status === 'running' ? { ...s, status: 'error', message: '规划执行超时' } : s
           ),
         }));
+        if (timedOutJob?.signalContext && signalPlanHooks) {
+          void Promise.resolve(signalPlanHooks.onFailed(timedOutJob, timeoutMsg)).catch((hookErr) => {
+            console.warn('[AutoDev Plan] Signal onFailed hook error:', hookErr);
+          });
+        }
         return;
       }
 
@@ -583,7 +663,7 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
 
           if (remote.status === 'error') {
             const failMsg = remote.error || 'Instabox AGY 规划执行失败';
-            updateJob(jobId, (j) => ({
+            const failedJob = updateJob(jobId, (j) => ({
               ...j,
               status: 'error',
               error: failMsg,
@@ -596,6 +676,11 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
                 s.status === 'running' ? { ...s, status: 'error' } : s
               ),
             }));
+            if (failedJob?.signalContext && signalPlanHooks) {
+              void Promise.resolve(signalPlanHooks.onFailed(failedJob, failMsg)).catch((hookErr) => {
+                console.warn('[AutoDev Plan] Signal onFailed hook error:', hookErr);
+              });
+            }
             void captureAndReflectIncident({
               sourceRefKey: remote.actionsRunId ? `actions:${remote.actionsRunId}` : `plan-remote:${jobId}`,
               source: 'plan_error',
@@ -619,31 +704,15 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
           }
 
           if (remote.status === 'completed' && nextArchitect && nextQaSpec && nextQaCritic) {
-            const runId = `run-${crypto.randomBytes(4).toString('hex')}`;
-            const run: PipelineRun = {
-              id: runId,
-              createdAt: new Date().toISOString(),
-              repoFullName: current.repoFullName,
-              defaultBranch: current.defaultBranch,
-              prdTitle: current.prdTitle,
-              prdContent: current.prdContent,
-              techStackHint: current.techStackHint,
-              repoContext: current.repoContext
-                ? {
-                    ...current.repoContext,
-                    headSha: remote.headSha || current.repoContext.headSha,
-                  }
-                : undefined,
+            const run = finalizeRunForCompletedJob(current, {
               architect: nextArchitect,
               qaSpec: nextQaSpec,
               qaCritic: nextQaCritic,
-              planTokenUsage: remote.tokenUsage,
-              status: 'analyzed',
-              checkedCriteriaIds: [],
-            };
-            saveRun(run);
+              headSha: remote.headSha,
+              tokenUsage: remote.tokenUsage,
+            });
 
-            updateJob(jobId, (j) => ({
+            const completedJob = updateJob(jobId, (j) => ({
               ...j,
               status: 'completed',
               planMode: remote.mode ?? j.planMode ?? 'unified_single_turn',
@@ -668,6 +737,11 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
               actionsUrl: remote.actionsUrl ?? current.planActionsUrl,
               summary: nextArchitect.architectureSummary?.slice(0, 200),
             });
+            if (completedJob?.signalContext && signalPlanHooks) {
+              void Promise.resolve(signalPlanHooks.onCompleted(completedJob, run)).catch((hookErr) => {
+                console.error('[AutoDev Plan] Signal onCompleted hook failed:', hookErr);
+              });
+            }
             return;
           }
 
@@ -709,7 +783,7 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
               const failReason =
                 latestRemote?.error ||
                 `GitHub Actions 规划任务异常结束（conclusion: ${actionRun.conclusion}），请点击查看 Actions 日志。`;
-              updateJob(jobId, (j) => ({
+              const failedJob = updateJob(jobId, (j) => ({
                 ...j,
                 status: 'error',
                 error: failReason,
@@ -719,6 +793,11 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
                   s.status === 'running' ? { ...s, status: 'error', message: failReason } : s
                 ),
               }));
+              if (failedJob?.signalContext && signalPlanHooks) {
+                void Promise.resolve(signalPlanHooks.onFailed(failedJob, failReason)).catch((hookErr) => {
+                  console.warn('[AutoDev Plan] Signal onFailed hook error:', hookErr);
+                });
+              }
               await notifyFeishuStageEvent({
                 kind: 'plan_failed',
                 prdTitle: current.prdTitle,
@@ -744,7 +823,6 @@ async function pollVpsAgyPlanJob(jobId: string): Promise<void> {
 
 async function executeGeminiJobInBackground(initialJob: AnalysisJob): Promise<void> {
   const jobId = initialJob.id;
-  const runId = `run-${crypto.randomBytes(4).toString('hex')}`;
   let currentStep: AgentStepId = 'architect';
 
   const setStep = (stepId: AgentStepId, patch: Partial<AgentStepState>) => {
@@ -843,24 +921,14 @@ async function executeGeminiJobInBackground(initialJob: AnalysisJob): Promise<vo
     const qaCritic = await runQaCriticAgent(agentInput, architect.apiContracts, qaSpec);
     const d3 = Date.now() - t3;
 
-    const run: PipelineRun = {
-      id: runId,
-      createdAt: new Date().toISOString(),
-      repoFullName: initialJob.repoFullName,
-      defaultBranch: initialJob.defaultBranch,
-      prdTitle: initialJob.prdTitle,
-      prdContent: initialJob.prdContent,
-      techStackHint: initialJob.techStackHint,
-      repoContext: repoContext ?? undefined,
+    const latestJob = getAnalysisJobById(jobId) ?? initialJob;
+    const run = finalizeRunForCompletedJob(latestJob, {
       architect,
       qaSpec,
       qaCritic,
-      status: 'analyzed',
-      checkedCriteriaIds: [],
-    };
-    saveRun(run);
+    });
 
-    updateJob(jobId, (j) => ({
+    const completedJob = updateJob(jobId, (j) => ({
       ...j,
       status: 'completed',
       qaCritic,
@@ -888,9 +956,14 @@ async function executeGeminiJobInBackground(initialJob: AnalysisJob): Promise<vo
       ambiguitiesCount: architect.ambiguities.length,
       summary: architect.architectureSummary?.slice(0, 200),
     });
+    if (completedJob?.signalContext && signalPlanHooks) {
+      void Promise.resolve(signalPlanHooks.onCompleted(completedJob, run)).catch((hookErr) => {
+        console.error('[AutoDev Plan] Signal onCompleted hook failed:', hookErr);
+      });
+    }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : '多智能体执行失败';
-    updateJob(jobId, (j) => ({
+    const failedJob = updateJob(jobId, (j) => ({
       ...j,
       status: 'error',
       error: errMsg,
@@ -898,6 +971,11 @@ async function executeGeminiJobInBackground(initialJob: AnalysisJob): Promise<vo
         s.id === currentStep ? { ...s, status: 'error', message: errMsg } : s
       ),
     }));
+    if (failedJob?.signalContext && signalPlanHooks) {
+      void Promise.resolve(signalPlanHooks.onFailed(failedJob, errMsg)).catch((hookErr) => {
+        console.warn('[AutoDev Plan] Signal onFailed hook error:', hookErr);
+      });
+    }
     void captureAndReflectIncident({
       sourceRefKey: `plan-gemini:${jobId}`,
       source: 'plan_error',

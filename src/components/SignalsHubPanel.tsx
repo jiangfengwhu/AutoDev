@@ -31,6 +31,7 @@ interface SignalsHubPanelProps {
   refreshNonce?: number;
   activeTasks?: BackgroundTask[];
   onBackgroundTaskStarted?: (task: BackgroundTask) => void;
+  onOpenPrdWorkspace?: (runId?: string) => void;
   onClosePavilion?: () => void;
   onErrorToast: (message: string, title?: string) => void;
   onSuccessToast: (message: string, title?: string) => void;
@@ -41,8 +42,10 @@ const FEEDBACK_STATUS_META: Record<
   { label: string; colorClass: string }
 > = {
   pending: { label: '待巡检', colorClass: 'text-amber-700' },
-  accepted_queued: { label: '已采纳·待派发', colorClass: 'text-blue-700' },
-  dispatched: { label: '已直通编码', colorClass: 'text-emerald-700' },
+  accepted_queued: { label: '已采纳·待立项', colorClass: 'text-blue-700' },
+  planning: { label: 'ST-01 策划中', colorClass: 'text-indigo-700' },
+  plan_ready: { label: '策划完成·待建 PR', colorClass: 'text-sky-700' },
+  dispatched: { label: '已派发 AGY 编码', colorClass: 'text-emerald-700' },
   rejected_malicious: { label: '已拦截·恶意/注入', colorClass: 'text-red-700' },
   rejected_invalid: { label: '已过滤·无效反馈', colorClass: 'text-slate-500' },
   needs_manual_prd: { label: '建议转大型 PRD', colorClass: 'text-violet-700' },
@@ -57,9 +60,11 @@ const ERROR_STATUS_META: Record<
   analyzing: { label: 'AI 评估中', colorClass: 'text-blue-700' },
   filtered_noise: { label: '已过滤·外部噪音', colorClass: 'text-slate-500' },
   rejected_malicious: { label: '已拦截·疑似注入', colorClass: 'text-red-700' },
-  queued_for_agy: { label: '排队等待合批 PR', colorClass: 'text-amber-700' },
+  queued_for_agy: { label: '排队待立项', colorClass: 'text-amber-700' },
+  planning: { label: 'ST-01 策划中', colorClass: 'text-indigo-700' },
+  plan_ready: { label: '策划完成·待建 PR', colorClass: 'text-sky-700' },
   fixing: { label: 'AGY 修复中', colorClass: 'text-blue-700' },
-  pr_ready: { label: 'PR 待 ST-04 验收', colorClass: 'text-emerald-700' },
+  pr_ready: { label: 'PR 已建·待编码/验收', colorClass: 'text-emerald-700' },
   resolved: { label: '已合入解决', colorClass: 'text-emerald-700' },
   ignored: { label: '已忽略指纹', colorClass: 'text-slate-400' },
 };
@@ -83,6 +88,7 @@ export function SignalsHubPanel({
   refreshNonce = 0,
   activeTasks = [],
   onBackgroundTaskStarted,
+  onOpenPrdWorkspace,
   onClosePavilion,
   onErrorToast,
   onSuccessToast,
@@ -168,8 +174,8 @@ export function SignalsHubPanel({
       }
       setExpandedFbId(null);
       onSuccessToast(
-        json.message || '已启动用户反馈 AI 筛选与直通编码派发，可在后台队列实时查看进度。',
-        '反馈派发已启动'
+        json.message || '已启动用户反馈 AI 筛选，通过后将按标准需求路径进入 ST-01 架构策划。',
+        '反馈巡检已启动'
       );
       onClosePavilion?.();
     } catch (err) {
@@ -188,19 +194,19 @@ export function SignalsHubPanel({
       });
       const json = (await res.json()) as { task?: BackgroundTask; error?: string };
       if (!res.ok) {
-        throw new Error(json.error || `直接派发编码失败 (HTTP ${res.status})`);
+        throw new Error(json.error || `发起 ST-01 架构策划失败 (HTTP ${res.status})`);
       }
       if (json.task && onBackgroundTaskStarted) {
         onBackgroundTaskStarted(json.task);
       }
       setExpandedFbId(null);
       onSuccessToast(
-        '已一键直派该条反馈至 AGY 编码流水线，正在生成轻量任务书与 Draft PR。',
-        '一键直派已启动'
+        '已按标准新建需求路径发起 ST-01 架构策划，策划完成后可在 ST-01 或飞书卡片审阅并创建 Draft PR。',
+        '已进入 ST-01 策划'
       );
       onClosePavilion?.();
     } catch (err) {
-      onErrorToast(err instanceof Error ? err.message : '直接派发失败', '派发失败');
+      onErrorToast(err instanceof Error ? err.message : '立项发起失败', '发起失败');
     } finally {
       setDispatchingFbId(null);
     }
@@ -218,19 +224,19 @@ export function SignalsHubPanel({
       });
       const json = (await res.json()) as { task?: BackgroundTask; error?: string };
       if (!res.ok) {
-        throw new Error(json.error || `触发报错合并修复失败 (HTTP ${res.status})`);
+        throw new Error(json.error || `发起线上报错策划立项失败 (HTTP ${res.status})`);
       }
       if (json.task && onBackgroundTaskStarted) {
         onBackgroundTaskStarted(json.task);
       }
       setExpandedErrId(null);
       onSuccessToast(
-        '已启动线上报错单 PR 合并自愈调度（若已有活跃自愈 PR 将自动合并至同一 PR）。',
-        '报错自愈调度已启动'
+        '已按标准新建需求路径发起线上报错 ST-01 策划，策划完成后可在 ST-01 或飞书卡片审阅并创建 Draft PR。',
+        '报错策划立项已启动'
       );
       onClosePavilion?.();
     } catch (err) {
-      onErrorToast(err instanceof Error ? err.message : '触发合并修复失败', '调度失败');
+      onErrorToast(err instanceof Error ? err.message : '发起报错立项失败', '调度失败');
     } finally {
       setFlushingErrId(null);
       setFlushingErrors(false);
@@ -296,7 +302,15 @@ export function SignalsHubPanel({
     const q = fbSearch.trim().toLowerCase();
     return list.filter((item) => {
       if (fbFilter === 'pending' && item.status !== 'pending') return false;
-      if (fbFilter === 'accepted' && item.status !== 'accepted_queued' && item.status !== 'dispatched') return false;
+      if (
+        fbFilter === 'accepted' &&
+        item.status !== 'accepted_queued' &&
+        item.status !== 'planning' &&
+        item.status !== 'plan_ready' &&
+        item.status !== 'dispatched'
+      ) {
+        return false;
+      }
       if (fbFilter === 'blocked' && item.status !== 'rejected_malicious' && item.status !== 'rejected_invalid' && item.status !== 'ignored') return false;
       if (fbFilter === 'manual' && item.status !== 'needs_manual_prd') return false;
       if (q) {
@@ -312,7 +326,15 @@ export function SignalsHubPanel({
     const q = errSearch.trim().toLowerCase();
     return list.filter((item) => {
       if (errFilter === 'active' && item.status !== 'new' && item.status !== 'analyzing' && item.status !== 'queued_for_agy') return false;
-      if (errFilter === 'fixing' && item.status !== 'fixing' && item.status !== 'pr_ready') return false;
+      if (
+        errFilter === 'fixing' &&
+        item.status !== 'planning' &&
+        item.status !== 'plan_ready' &&
+        item.status !== 'fixing' &&
+        item.status !== 'pr_ready'
+      ) {
+        return false;
+      }
       if (errFilter === 'filtered' && item.status !== 'filtered_noise' && item.status !== 'rejected_malicious' && item.status !== 'ignored') return false;
       if (errFilter === 'resolved' && item.status !== 'resolved') return false;
       if (q) {
@@ -388,10 +410,10 @@ export function SignalsHubPanel({
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200">
             <div>
               <h2 className="text-[18px] font-semibold text-slate-900 tracking-tight">
-                线上用户反馈与每日直通迭代
+                线上用户反馈与标准需求立项
               </h2>
               <p className="mt-1 text-[13px] text-slate-600">
-                自动从线上 <code className="font-mono text-slate-800">atd-v1</code> 同步并保存至 <code className="font-mono text-slate-800">autodev-state</code> · 支持单条一键直派或每日合并筛选直发 AGY
+                自动从线上 <code className="font-mono text-slate-800">atd-v1</code>（含 <code className="font-mono text-slate-800">@官方账号</code> 反馈帖）同步 · 走与新建需求一致的<strong>ST-01 策划审阅 → Draft PR → AGY 编码 → ST-04 验收上线</strong>路径，并随状态流转自动以 <code className="font-mono text-slate-800">@官方反馈</code> 回复原帖
                 {summary?.lastDailyTriageAt && (
                   <span className="font-mono text-[12px] text-slate-500 tabular-nums">
                     {' '}· 上次巡检 {formatTime(summary.lastDailyTriageAt)}
@@ -413,10 +435,10 @@ export function SignalsHubPanel({
                 )}
                 <span>
                   {triagingDaily || runningSignalTasks.some((t) => t.kind === 'signals_triage')
-                    ? '巡检派发中…'
+                    ? '巡检立项中…'
                     : (summary?.pendingFeedbackCount ?? 0) > 0
-                      ? `一键巡检并派发 (${summary?.pendingFeedbackCount})`
-                      : '一键巡检并派发'}
+                      ? `一键巡检并立项 (${summary?.pendingFeedbackCount})`
+                      : '一键巡检并立项'}
                 </span>
               </button>
             </div>
@@ -432,11 +454,11 @@ export function SignalsHubPanel({
               <div className="mt-0.5 text-[11px] text-slate-500">等待每日 Cron 或手动巡检</div>
             </div>
             <div className="rounded-md border border-slate-200 bg-white p-4">
-              <div className="text-[12px] text-slate-500">已采纳 / 已派发</div>
+              <div className="text-[12px] text-slate-500">已采纳 / 策划与编码</div>
               <div className="mt-1 font-mono text-[24px] font-semibold text-emerald-700 tabular-nums">
                 {summary?.acceptedFeedbackCount ?? 0}
               </div>
-              <div className="mt-0.5 text-[11px] text-slate-500">通过防注入审查并合并直通 AGY</div>
+              <div className="mt-0.5 text-[11px] text-slate-500">通过防注入审查，走完整策划 + AGY 编码</div>
             </div>
             <div className="rounded-md border border-slate-200 bg-white p-4">
               <div className="text-[12px] text-slate-500">已拦截（恶意 / 无效）</div>
@@ -521,8 +543,13 @@ export function SignalsHubPanel({
                     colorClass: 'text-slate-600',
                   };
                   const expanded = expandedFbId === item.id;
-                  const canQuickDispatch = item.status !== 'dispatched';
+                  const canQuickDispatch =
+                    item.status !== 'dispatched' &&
+                    item.status !== 'planning' &&
+                    item.status !== 'plan_ready';
+                  const canOpenSt01 = item.status === 'planning' || item.status === 'plan_ready';
                   const isRowDispatching = dispatchingFbId === item.id;
+                  const replyCount = item.repliedStageKeys?.length ?? 0;
                   return (
                     <div key={item.id} className="bg-white">
                       <div className="px-4 py-3 hover:bg-slate-50 transition-colors flex items-start justify-between gap-3">
@@ -549,6 +576,14 @@ export function SignalsHubPanel({
                             <span className="font-mono text-slate-500 tabular-nums">
                               {formatTime(item.createdAt)}
                             </span>
+                            {item.linkedJobId && (
+                              <>
+                                <span aria-hidden="true" className="text-slate-300">·</span>
+                                <span className="font-mono text-indigo-700">
+                                  策划 {item.linkedJobId.slice(0, 12)}
+                                </span>
+                              </>
+                            )}
                             {item.linkedIssueNumber && (
                               <>
                                 <span aria-hidden="true" className="text-slate-300">·</span>
@@ -562,6 +597,14 @@ export function SignalsHubPanel({
                                 <span aria-hidden="true" className="text-slate-300">·</span>
                                 <span className="font-mono text-emerald-700">
                                   PR #{item.linkedPrNumber}
+                                </span>
+                              </>
+                            )}
+                            {replyCount > 0 && (
+                              <>
+                                <span aria-hidden="true" className="text-slate-300">·</span>
+                                <span className="text-sky-700 font-medium">
+                                  已官方回帖 {replyCount} 次
                                 </span>
                               </>
                             )}
@@ -582,6 +625,15 @@ export function SignalsHubPanel({
                               <div>注入 {(item.decisionScores.injectionProb * 100).toFixed(0)}%</div>
                             </div>
                           )}
+                          {canOpenSt01 && onOpenPrdWorkspace && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenPrdWorkspace(item.linkedRunId)}
+                              className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-1 text-[12px] font-medium text-sky-700 hover:bg-sky-100 transition-colors whitespace-nowrap"
+                            >
+                              <span>{item.status === 'plan_ready' ? '前往 ST-01 审阅/建 PR' : '查看 ST-01 策划'}</span>
+                            </button>
+                          )}
                           {canQuickDispatch && (
                             <button
                               type="button"
@@ -594,7 +646,7 @@ export function SignalsHubPanel({
                               ) : (
                                 <Send className="h-3 w-3" />
                               )}
-                              <span>{isRowDispatching ? '派发中…' : '直接派发'}</span>
+                              <span>{isRowDispatching ? '立项中…' : '发起 ST-01 策划'}</span>
                             </button>
                           )}
                         </div>
@@ -634,12 +686,21 @@ export function SignalsHubPanel({
                                   rel="noreferrer"
                                   className="inline-flex items-center gap-1 text-emerald-700 hover:underline font-medium"
                                 >
-                                  <span>查看直通 Draft PR #{item.linkedPrNumber}</span>
+                                  <span>查看 Draft PR #{item.linkedPrNumber}</span>
                                   <ExternalLink className="h-3 w-3" />
                                 </a>
                               )}
                             </div>
                             <div className="flex flex-wrap items-center gap-2">
+                              {canOpenSt01 && onOpenPrdWorkspace && (
+                                <button
+                                  type="button"
+                                  onClick={() => onOpenPrdWorkspace(item.linkedRunId)}
+                                  className="inline-flex items-center gap-1 rounded bg-sky-600 px-2.5 py-1 text-[12px] font-medium text-white hover:bg-sky-700"
+                                >
+                                  <span>{item.status === 'plan_ready' ? '前往 ST-01 审阅并创建 Draft PR' : '前往 ST-01 查看策划进度'}</span>
+                                </button>
+                              )}
                               {canQuickDispatch && (
                                 <button
                                   type="button"
@@ -652,10 +713,10 @@ export function SignalsHubPanel({
                                   ) : (
                                     <Send className="h-3 w-3" />
                                   )}
-                                  <span>直接派发 AGY 编码</span>
+                                  <span>按标准路径发起 ST-01 策划</span>
                                 </button>
                               )}
-                              {item.status !== 'pending' && item.status !== 'dispatched' && (
+                              {item.status !== 'pending' && item.status !== 'dispatched' && item.status !== 'planning' && item.status !== 'plan_ready' && (
                                 <button
                                   type="button"
                                   onClick={() => void handleUpdateFeedbackStatus(item.id, 'pending')}
@@ -664,7 +725,7 @@ export function SignalsHubPanel({
                                   重置为待巡检
                                 </button>
                               )}
-                              {item.status !== 'ignored' && item.status !== 'dispatched' && (
+                              {item.status !== 'ignored' && item.status !== 'dispatched' && item.status !== 'planning' && item.status !== 'plan_ready' && (
                                 <button
                                   type="button"
                                   onClick={() => void handleUpdateFeedbackStatus(item.id, 'ignored')}
@@ -744,10 +805,10 @@ export function SignalsHubPanel({
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200">
             <div>
               <h2 className="text-[18px] font-semibold text-slate-900 tracking-tight">
-                线上报错收集与单 PR 合并自愈
+                线上报错收集与标准自愈立项
               </h2>
               <p className="mt-1 text-[13px] text-slate-600">
-                自动从线上 <code className="font-mono text-slate-800">atd-v1</code> 捕获前后端未处理异常并按堆栈指纹去重 · 报错风暴进入 {config?.burstDebounceSec ?? 15}s 聚合窗口，同一波或已有未合入修复 PR 时<strong>强制合并为 1 个 Draft PR</strong>，绝不创建海量 PR
+                自动从线上 <code className="font-mono text-slate-800">atd-v1</code> 捕获前后端未处理异常并按堆栈指纹去重 · 报错风暴进入 {config?.burstDebounceSec ?? 15}s 聚合窗口，合并后走与新建需求一致的<strong>ST-01 策划审阅 → Draft PR → AGY 编码 → ST-04 验收上线</strong>单任务串行流水线
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -762,7 +823,7 @@ export function SignalsHubPanel({
                 ) : (
                   <Wrench className="h-3.5 w-3.5" />
                 )}
-                <span>{flushingErrors ? '合并派发中…' : '立即合并派发修复 PR'}</span>
+                <span>{flushingErrors ? '合并立项中…' : '立即合并发起 ST-01 策划'}</span>
               </button>
             </div>
           </div>
@@ -887,7 +948,13 @@ export function SignalsHubPanel({
                     colorClass: 'text-slate-600',
                   };
                   const expanded = expandedErrId === g.id;
-                  const canQuickFix = g.status !== 'fixing' && g.status !== 'resolved';
+                  const canQuickFix =
+                    g.status !== 'planning' &&
+                    g.status !== 'plan_ready' &&
+                    g.status !== 'fixing' &&
+                    g.status !== 'pr_ready' &&
+                    g.status !== 'resolved';
+                  const canOpenSt01 = g.status === 'planning' || g.status === 'plan_ready';
                   const isRowFixing = flushingErrId === g.id;
                   return (
                     <div key={g.id} className="bg-white">
@@ -915,6 +982,14 @@ export function SignalsHubPanel({
                             <span className="font-mono text-slate-700">{g.route}</span>
                             <span aria-hidden="true" className="text-slate-300">·</span>
                             <span className="font-mono text-slate-500">#{g.fingerprint.slice(0, 8)}</span>
+                            {g.linkedJobId && (
+                              <>
+                                <span aria-hidden="true" className="text-slate-300">·</span>
+                                <span className="font-mono text-indigo-700">
+                                  策划 {g.linkedJobId.slice(0, 12)}
+                                </span>
+                              </>
+                            )}
                             {g.linkedPrNumber && (
                               <>
                                 <span aria-hidden="true" className="text-slate-300">·</span>
@@ -942,6 +1017,15 @@ export function SignalsHubPanel({
                               {formatTime(g.lastSeenAt)}
                             </div>
                           </div>
+                          {canOpenSt01 && onOpenPrdWorkspace && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenPrdWorkspace(g.linkedRunId)}
+                              className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-1 text-[12px] font-medium text-sky-700 hover:bg-sky-100 transition-colors whitespace-nowrap"
+                            >
+                              <span>{g.status === 'plan_ready' ? '前往 ST-01 审阅/建 PR' : '查看 ST-01 策划'}</span>
+                            </button>
+                          )}
                           {canQuickFix && (
                             <button
                               type="button"
@@ -954,7 +1038,7 @@ export function SignalsHubPanel({
                               ) : (
                                 <Wrench className="h-3 w-3" />
                               )}
-                              <span>{isRowFixing ? '派发中…' : '立即修复'}</span>
+                              <span>{isRowFixing ? '立项中…' : '发起 ST-01 策划'}</span>
                             </button>
                           )}
                         </div>
@@ -1011,13 +1095,22 @@ export function SignalsHubPanel({
                             </div>
 
                             <div className="flex flex-wrap items-center gap-2">
-                              {g.status !== 'fixing' && g.status !== 'resolved' && (
+                              {canOpenSt01 && onOpenPrdWorkspace && (
+                                <button
+                                  type="button"
+                                  onClick={() => onOpenPrdWorkspace(g.linkedRunId)}
+                                  className="rounded bg-sky-600 px-2.5 py-1 text-[12px] font-medium text-white hover:bg-sky-700"
+                                >
+                                  {g.status === 'plan_ready' ? '前往 ST-01 审阅并创建 Draft PR' : '前往 ST-01 查看策划进度'}
+                                </button>
+                              )}
+                              {canQuickFix && (
                                 <button
                                   type="button"
                                   onClick={() => void handleFlushErrors([g.id])}
                                   className="rounded border border-blue-300 bg-white px-2.5 py-1 text-[12px] font-medium text-blue-700 hover:bg-blue-50"
                                 >
-                                  合并进自愈 PR 修复
+                                  按标准路径发起 ST-01 策划
                                 </button>
                               )}
                               {g.status !== 'resolved' && (
@@ -1064,11 +1157,15 @@ export function SignalsHubPanel({
                         <span>{formatTime(b.createdAt)}</span>
                         <span>·</span>
                         <span>
-                          {b.status === 'merged_into_active_pr'
-                            ? '合并进活跃 PR'
-                            : b.status === 'queued_for_agy'
-                              ? '队列等待'
-                              : '新建合并 PR'}
+                          {b.status === 'planning'
+                            ? 'ST-01 策划中'
+                            : b.status === 'plan_ready'
+                              ? '策划完成·待建 PR'
+                              : b.status === 'merged_into_active_pr'
+                                ? '合并进活跃 PR'
+                                : b.status === 'queued_for_agy'
+                                  ? '队列等待'
+                                  : '已派发 AGY 修复'}
                         </span>
                         <span>·</span>
                         <span>包含 {b.errorGroupIds.length} 类指纹</span>
