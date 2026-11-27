@@ -14,6 +14,24 @@ import {
   isEmptyGitHubRepoError,
 } from './specBuilder';
 import type { AtomicTask, PipelineRun } from '../types/autodev';
+import {
+  buildMicroSpecRunAndArtifacts,
+  buildSignalsSummary,
+  computeProdErrorFingerprint,
+  detectObviousErrorNoise,
+  hashAnonymousReporter,
+  normalizeErrorMessage,
+  normalizeRouteTemplate,
+  redactSensitiveText,
+  selectErrorAutofixStrategy,
+  validateFeedbackPayload,
+  validateProdErrorPayload,
+  type ProdErrorGroup,
+} from './signalsEngine';
+import {
+  AUTODEV_DAILY_FEEDBACK_WORKFLOW_PATH,
+  buildDailyFeedbackCronWorkflowYaml,
+} from './workflowBuilder';
 
 test('parseRepoFullName accepts valid owner/repo slugs and rejects invalid ones', () => {
   assert.deepEqual(parseRepoFullName('acme-org/checkout-api'), {
@@ -253,8 +271,11 @@ test('buildAgyRunnerWorkflowYaml enforces direct-wait no-timeout self-push, blin
     AGY_AGENT_MODES,
     AGY_AVAILABLE_MODELS,
     AUTODEV_LIVE_LOG_ISSUE_TITLE,
+    DEFAULT_AGY_CODING_MODEL,
     DEFAULT_AGY_MODE,
     DEFAULT_AGY_MODEL,
+    DEFAULT_AGY_PLAN_MODEL,
+    buildAgyPlanWorkflowYaml,
     buildAgyRunnerWorkflowYaml,
     buildCloudflareDeployWorkflowYaml,
     DEFAULT_CLOUDFLARE_TECH_STACK,
@@ -263,6 +284,8 @@ test('buildAgyRunnerWorkflowYaml enforces direct-wait no-timeout self-push, blin
   } = await import('./workflowBuilder');
   assert.equal(FIXED_TARGET_REPO.fullName, 'jiangfengwhu/atd-v1');
   assert.equal(DEFAULT_AGY_MODEL, 'gemini-4-neon-high');
+  assert.equal(DEFAULT_AGY_PLAN_MODEL, 'gemini-4-neon-high');
+  assert.equal(DEFAULT_AGY_CODING_MODEL, 'gemini-4-hydrogen-high');
   assert.equal(DEFAULT_AGY_MODE, 'auto');
   assert.ok(AGY_AVAILABLE_MODELS.some((m) => m.id === 'gemini-4-neon-high'));
   assert.ok(AGY_AVAILABLE_MODELS.some((m) => m.id === 'gemini-4-hydrogen-high'));
@@ -270,6 +293,8 @@ test('buildAgyRunnerWorkflowYaml enforces direct-wait no-timeout self-push, blin
   assert.ok(AGY_AGENT_MODES.some((m) => m.id === 'auto') && AGY_AGENT_MODES.some((m) => m.id === 'accept-edits'));
 
   const yaml = buildAgyRunnerWorkflowYaml('jiangfengwhu');
+  assert.match(yaml, /default:\s*'gemini-4-hydrogen-high'/);
+  assert.match(buildAgyPlanWorkflowYaml('jiangfengwhu'), /default:\s*'gemini-4-neon-high'/);
   assert.ok(yaml.includes('runs-on: [self-hosted, linux, x64, vps-agy]'));
   assert.ok(yaml.includes("github.actor == 'jiangfengwhu'"));
   assert.ok(yaml.includes('group: autodev-agy-single-queue'));
@@ -3087,9 +3112,380 @@ test('deploySanitizer avoids deprecated npm_config_production, caps heap/threads
   assert.equal(parsedForm.actionType, 'submit_prd_form');
 });
 
+test('37. signalsEngine: PII redaction, deterministic fingerprinting, noise filter, single-PR burst coalescing, and micro-spec builder', () => {
+  // 1) PII & secret redaction
+  const dirty =
+    'Bearer eyJhbGciOiJIUzI1NiJ9.secret.sig failed for alice@example.com with ghp_123456789012345678901234567890123456 on 13812345678';
+  const cleaned = redactSensitiveText(dirty);
+  assert.ok(!cleaned.includes('alice@example.com'));
+  assert.ok(!cleaned.includes('ghp_1234567890'));
+  assert.ok(!cleaned.includes('13812345678'));
+  assert.ok(!cleaned.includes('eyJhbGciOiJIUzI1NiJ9'));
 
+  // 2) Anonymous reporter hashing is deterministic & non-reversible
+  const h1 = hashAnonymousReporter('user-42');
+  const h2 = hashAnonymousReporter('user-42');
+  assert.ok(h1);
+  assert.equal(h1, h2);
+  assert.equal(h1.length, 14);
+  assert.ok(!h1.includes('user-42'));
 
+  // 3) Route & message normalization + deterministic SHA-256 fingerprint
+  assert.equal(
+    normalizeRouteTemplate('/posts/123456/comments/550e8400-e29b-41d4-a716-446655440000?tab=1'),
+    '/posts/:id/comments/:uuid'
+  );
+  const normMsg = normalizeErrorMessage(
+    'Cannot read post 987654 for request 550e8400-e29b-41d4-a716-446655440000'
+  );
+  assert.ok(normMsg.includes('<num>'));
+  assert.ok(normMsg.includes('<uuid>'));
 
+  const fpA = computeProdErrorFingerprint({
+    source: 'frontend',
+    errorName: 'TypeError',
+    message: 'Cannot read properties of undefined (reading "avatar") for user 1001',
+    stack:
+      'TypeError: oops\n    at PostCard (https://app.example.com/src/components/PostCard.tsx:48:12)',
+    route: '/posts/1001',
+  });
+  const fpB = computeProdErrorFingerprint({
+    source: 'frontend',
+    errorName: 'TypeError',
+    message: 'Cannot read properties of undefined (reading "avatar") for user 2002',
+    stack:
+      'TypeError: oops\n    at PostCard (https://app.example.com/src/components/PostCard.tsx:48:12)',
+    route: '/posts/2002',
+  });
+  assert.equal(fpA.fingerprint, fpB.fingerprint);
+  assert.equal(fpA.topFrame.includes('PostCard.tsx'), true);
 
+  // 4) Obvious browser noise detection
+  const noiseHit = detectObviousErrorNoise({
+    source: 'frontend',
+    errorName: 'Error',
+    message: 'ResizeObserver loop completed with undelivered notifications.',
+  });
+  assert.equal(noiseHit.isNoise, true);
+  const realBug = detectObviousErrorNoise({
+    source: 'backend',
+    errorName: 'D1Error',
+    message: 'SQLITE_CONSTRAINT: NOT NULL constraint failed: comments.author_id',
+  });
+  assert.equal(realBug.isNoise, false);
 
+  // 5) Payload validation
+  assert.equal(validateFeedbackPayload({ content: 'ab' }).ok, false);
+  assert.equal(validateFeedbackPayload({ content: '列表页增加按点赞数排序按钮' }).ok, true);
+  assert.equal(validateProdErrorPayload({ source: 'backend', message: '' }).ok, false);
+  assert.equal(validateProdErrorPayload({ source: 'backend', message: 'TypeError: boom' }).ok, true);
+
+  // 6) SINGLE_ACTIVE_AUTOFIX_PR burst coalescing strategy
+  const mkErr = (id: string, count: number): ProdErrorGroup => ({
+    id,
+    fingerprint: `fp-${id}`,
+    repoFullName: 'jiangfengwhu/atd-v1',
+    source: 'backend',
+    errorName: 'TypeError',
+    rawMessageSample: `Crash ${id}`,
+    normalizedMessage: `Crash ${id}`,
+    topFrame: 'at handler (/src/worker.ts)',
+    route: '/api/posts',
+    environment: 'production',
+    occurrenceCount: count,
+    firstSeenAt: '2026-11-24T01:00:00Z',
+    lastSeenAt: '2026-11-24T01:01:00Z',
+    sanitizedStackSample: 'TypeError: Crash\n  at handler (/src/worker.ts:42:5)',
+    status: 'new',
+    updatedAt: '2026-11-24T01:01:00Z',
+  });
+  const burst = Array.from({ length: 20 }, (_, i) => mkErr(`e${i + 1}`, 20 - i));
+
+  // Case A: Idle repo with 20 simultaneous errors -> 1 consolidated PR capped at 15
+  const idleStrategy = selectErrorAutofixStrategy({
+    eligibleGroups: burst,
+    activeAutofixRun: undefined,
+    activeAutofixAgyRunning: false,
+    serialLockBusy: false,
+    maxPerBatch: 15,
+  });
+  assert.equal(idleStrategy.action, 'create_consolidated_pr');
+  assert.equal(idleStrategy.selectedGroups.length, 15);
+
+  // Build an active open autofix PipelineRun to test active PR reuse
+  const { run: builtRun, artifacts } = buildMicroSpecRunAndArtifacts({
+    runId: 'run-autofix-1',
+    repoFullName: 'jiangfengwhu/atd-v1',
+    defaultBranch: 'main',
+    origin: 'prod_error_autofix',
+    issueNumber: 42,
+    issueUrl: 'https://github.com/jiangfengwhu/atd-v1/issues/42',
+    sourceItemSummaryLines: ['[backend /api/posts] TypeError: Crash e1 (20次)'],
+    specDraft: {
+      title: '线上报错自愈修复（3 项）',
+      summary: '修复空指针异常与 D1 约束缺失',
+      rootCauseOrContext: 'PostCard 渲染时未判空 author 字段',
+      tasks: [
+        {
+          id: 'T1',
+          title: '防御 PostCard 空 author 字段',
+          module: 'frontend',
+          description: '在 PostCard 中安全访问 author?.avatar',
+          filesHint: ['src/components/PostCard.tsx'],
+          acceptanceCriteria: ['无 avatar 字段时正常渲染默认头像'],
+        },
+      ],
+      verificationChecklist: ['无 avatar 字段时正常渲染默认头像'],
+      nonGoals: ['不改动用户认证流程'],
+      riskNotes: ['注意保持旧接口响应兼容'],
+    },
+  });
+  assert.equal(builtRun.origin, 'prod_error_autofix');
+  assert.deepEqual(builtRun.linkedIssueNumbers, [42]);
+  assert.ok(artifacts.prBody.includes('Fixes #42'));
+
+  const activeAutofixRun: PipelineRun = {
+    ...builtRun,
+    status: 'pr_created',
+    draftPr: {
+      prUrl: 'https://github.com/jiangfengwhu/atd-v1/pull/77',
+      prNumber: 77,
+      branchName: 'autodev/fix-20261124-010000',
+      baseBranch: 'main',
+      commitSha: 'abc1234',
+      filesCommitted: ['docs/prd.md', 'docs/spec.json'],
+      createdAt: '2026-11-24T01:02:00Z',
+    },
+  };
+
+  // Case B: Active autofix PR already open & AGY running -> NEVER creates a 2nd PR; appends into existing PR & defers redispatch
+  const activePrBusyStrategy = selectErrorAutofixStrategy({
+    eligibleGroups: [mkErr('late1', 5), mkErr('late2', 3)],
+    activeAutofixRun,
+    activeAutofixAgyRunning: true,
+    serialLockBusy: true,
+  });
+  assert.equal(activePrBusyStrategy.action, 'append_to_active_pr');
+  assert.equal(activePrBusyStrategy.targetRun.draftPr?.prNumber, 77);
+  assert.equal(activePrBusyStrategy.dispatchNow, false);
+
+  // Case C: Active autofix PR open & runner idle -> appends AND re-dispatches AGY on same branch
+  const activePrIdleStrategy = selectErrorAutofixStrategy({
+    eligibleGroups: [mkErr('late3', 2)],
+    activeAutofixRun,
+    activeAutofixAgyRunning: false,
+    serialLockBusy: false,
+  });
+  assert.equal(activePrIdleStrategy.action, 'append_to_active_pr');
+  assert.equal(activePrIdleStrategy.dispatchNow, true);
+
+  // Case D: Unrelated feature PR holds serial lock -> queue behind lock without opening PR
+  const lockedStrategy = selectErrorAutofixStrategy({
+    eligibleGroups: [mkErr('q1', 4)],
+    activeAutofixRun: undefined,
+    activeAutofixAgyRunning: false,
+    serialLockBusy: true,
+  });
+  assert.equal(lockedStrategy.action, 'queue_behind_lock');
+
+  // 7) Summary computation
+  const summary = buildSignalsSummary([], burst, [], activeAutofixRun);
+  assert.equal(summary.activeErrorGroupsCount, 20);
+  assert.equal(summary.activeAutofixPrNumber, 77);
+});
+
+test('38. buildDailyFeedbackCronWorkflowYaml generates secure daily cron workflow calling /api/triage/feedback/daily', () => {
+  assert.equal(
+    AUTODEV_DAILY_FEEDBACK_WORKFLOW_PATH,
+    '.github/workflows/autodev-daily-feedback.yml'
+  );
+  const yaml = buildDailyFeedbackCronWorkflowYaml('jiangfengwhu');
+  assert.ok(yaml.includes("cron: '0 1 * * *'"));
+  assert.ok(yaml.includes('workflow_dispatch:'));
+  assert.ok(yaml.includes('secrets.AUTODEV_STUDIO_URL'));
+  assert.ok(yaml.includes('secrets.AUTODEV_CRON_SECRET'));
+  assert.ok(yaml.includes('/api/triage/feedback/daily'));
+  assert.ok(yaml.includes('X-AutoDev-Cron-Secret'));
+});
+
+test('39. signalsService auto-derives deterministic ingest/cron secrets from GITHUB_TOKEN and .env.example has zero optional vars', async () => {
+  const fs = await import('fs');
+  const path = await import('path');
+  const {
+    getResolvedCronSecret,
+    getResolvedIngestToken,
+    verifyCronSecret,
+    verifyIngestToken,
+  } = await import('../../server/signalsService');
+
+  const prevGh = process.env.GITHUB_TOKEN;
+  try {
+    process.env.GITHUB_TOKEN = 'ghp_test_deterministic_seed_value_123456';
+
+    const ingest1 = getResolvedIngestToken();
+    const ingest2 = getResolvedIngestToken();
+    const cron1 = getResolvedCronSecret();
+
+    assert.equal(ingest1, ingest2);
+    assert.match(ingest1, /^[0-9a-f]{64}$/);
+    assert.match(cron1, /^[0-9a-f]{64}$/);
+    assert.notEqual(ingest1, cron1);
+
+    assert.equal(
+      verifyIngestToken({ headers: { 'x-autodev-ingest-token': ingest1 } } as never),
+      true
+    );
+    assert.equal(
+      verifyIngestToken({ headers: { 'x-autodev-ingest-token': cron1 } } as never),
+      false
+    );
+    assert.equal(
+      verifyCronSecret({ headers: { 'x-autodev-cron-secret': cron1 } } as never),
+      true
+    );
+    assert.equal(
+      verifyCronSecret({ headers: { 'x-autodev-cron-secret': 'wrong-secret' } } as never),
+      false
+    );
+  } finally {
+    if (prevGh === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = prevGh;
+  }
+
+  const envExample = fs.readFileSync(path.join(process.cwd(), '.env.example'), 'utf-8');
+  for (const removedVar of [
+    'FEISHU_ENCRYPT_KEY',
+    'FEISHU_DEFAULT_CHAT_ID',
+    'FEISHU_ALLOWED_CHAT_IDS',
+    'PUBLIC_APP_URL',
+    'APP_BASE_URL',
+    'AUTODEV_INGEST_TOKEN',
+    'AUTODEV_CRON_SECRET',
+    'AUTODEV_INGEST_ALLOWED_ORIGINS',
+    'AUTODEV_GEMINI_PRIMARY_MODEL',
+    'AUTODEV_GEMINI_FALLBACK_MODEL',
+    'AUTODEV_GEMINI_DECISION_MODEL',
+    'AUTODEV_BACKUP_BASE_URL',
+    'AUTODEV_BACKUP_MODEL',
+    'AUTODEV_BACKUP_API_KEY',
+  ]) {
+    assert.equal(
+      envExample.includes(removedVar),
+      false,
+      `.env.example must not include removed optional var ${removedVar}`
+    );
+  }
+});
+
+test('40. detectNewlyLaunchedRunId and deriveRealFactorySnapshot only trigger launch/archive animation on real live releases', async () => {
+  const {
+    detectNewlyLaunchedRunId,
+    deriveRealFactorySnapshot,
+  } = await import('./factoryPipelineState');
+  const nowMs = Date.parse('2026-11-27T11:00:00.000Z');
+
+  const oldHistoricalDelivered = {
+    id: 'run-old-merged',
+    createdAt: '2026-11-25T04:18:25.820Z',
+    approvedAt: '2026-11-25T04:30:00.000Z',
+    repoFullName: 'jiangfengwhu/atd-v1',
+    defaultBranch: 'main',
+    prdTitle: '历史已上线需求',
+    prdContent: '历史内容',
+    status: 'approved',
+    mergedRelease: {
+      prNumber: 15,
+      prUrl: 'https://github.com/jiangfengwhu/atd-v1/pull/15',
+      mergeCommitSha: 'abc123',
+      commitUrl: 'https://github.com/jiangfengwhu/atd-v1/commit/abc123',
+      baseBranch: 'main',
+      mergedAt: '2026-11-25T04:30:00.000Z',
+    },
+    architect: {
+      architectureSummary: '',
+      apiContracts: [],
+      tasks: [],
+      risks: [],
+    },
+    qaSpec: {
+      testStrategy: '',
+      playwrightCases: [],
+    },
+    qaCritic: {
+      reviewSummary: '',
+      acceptanceCriteria: [],
+      blindTestCases: [],
+      edgeCases: [],
+      finalApiTestChecklist: [],
+    },
+  } as unknown as PipelineRun;
+
+  // 1) Cold-start hydration after triage ("转大型PRD", no coding dispatched): MUST NOT celebrate historical delivered runs
+  assert.equal(
+    detectNewlyLaunchedRunId({
+      runs: [oldHistoricalDelivered],
+      knownDeliveredIds: new Set(),
+      knownInFlightIds: new Set(),
+      nowMs,
+    }),
+    null
+  );
+
+  // 2) Even if a fresh delivered run appears that was NEVER observed in-flight in this session, do not false-trigger
+  const freshlyHydratedUnseen: PipelineRun = {
+    ...oldHistoricalDelivered,
+    id: 'run-unseen-fresh',
+    approvedAt: '2026-11-27T10:59:30.000Z',
+    mergedRelease: {
+      ...oldHistoricalDelivered.mergedRelease!,
+      mergedAt: '2026-11-27T10:59:30.000Z',
+    },
+  };
+  assert.equal(
+    detectNewlyLaunchedRunId({
+      runs: [freshlyHydratedUnseen],
+      knownDeliveredIds: new Set(),
+      knownInFlightIds: new Set(),
+      nowMs,
+    }),
+    null
+  );
+
+  // 3) Genuine live launch: previously observed in-flight run transitions to mergedRelease just now -> triggers celebration
+  assert.equal(
+    detectNewlyLaunchedRunId({
+      runs: [freshlyHydratedUnseen],
+      knownDeliveredIds: new Set(),
+      knownInFlightIds: new Set(['run-unseen-fresh']),
+      nowMs,
+    }),
+    'run-unseen-fresh'
+  );
+
+  // 4) Stale timestamp (> 5 min old) does not celebrate even if ID was in-flight earlier
+  assert.equal(
+    detectNewlyLaunchedRunId({
+      runs: [oldHistoricalDelivered],
+      knownDeliveredIds: new Set(),
+      knownInFlightIds: new Set(['run-old-merged']),
+      nowMs,
+    }),
+    null
+  );
+
+  // 5) deriveRealFactorySnapshot never falls back to celebrating deliveredRuns[0] on an unmatched celebratingDeliveredRunId
+  const snapUnmatched = deriveRealFactorySnapshot({
+    runs: [oldHistoricalDelivered],
+    analysisJob: null,
+    backgroundTasks: [],
+    status: null,
+    overviewMetrics: null,
+    rsiReports: [],
+    rsiRules: [],
+    celebratingDeliveredRunId: 'run-nonexistent',
+  });
+  assert.equal(snapUnmatched.activeStationId, 'ST-00');
+  assert.equal(snapUnmatched.justDelivered, false);
+  assert.equal(snapUnmatched.workpiece, null);
+});
 

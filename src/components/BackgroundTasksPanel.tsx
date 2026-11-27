@@ -18,7 +18,7 @@ interface BackgroundTasksPanelProps {
   runningAnalysisJob: AnalysisJob | null;
   repoFullName?: string;
   onFocusOpsBuilding?: () => void;
-  onNavigateToRoom: (room: NavSectionId) => void;
+  onNavigateToRoom: (room: NavSectionId, task?: BackgroundTask) => void;
 }
 
 const ROOM_ID_TO_STATION: Record<string, FactoryStationId> = {
@@ -183,7 +183,7 @@ export function BackgroundTasksPanel({
                   key={task.id}
                   type="button"
                   onClick={() => {
-                    onNavigateToRoom(task.roomId);
+                    onNavigateToRoom(task.roomId, task);
                     onClose();
                   }}
                   className={`w-full text-left rounded-[14px] border p-3.5 space-y-1.5 transition-colors cursor-pointer shadow-[0_4px_14px_-6px_rgba(15,23,42,0.08)] ${

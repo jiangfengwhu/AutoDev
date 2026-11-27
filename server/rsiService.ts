@@ -38,10 +38,29 @@ import {
   readPlanChannelJson,
 } from './githubService.ts';
 import { AUTODEV_PLAN_CHANNEL_BRANCH } from '../src/lib/planProtocol.ts';
+import {
+  isTransientGeminiError,
+  withGeminiModelFallback,
+  withGeminiRetry,
+} from '../src/lib/geminiResilience.ts';
+import {
+  generateShushengStructuredJson,
+  isShushengConfigured,
+} from './shushengService.ts';
+import { getAiModelConfig } from './aiModelConfigStore.ts';
 
-const RSI_ANALYZER_MODEL = 'gemini-4-hydrogen';
-const RSI_FALLBACK_MODEL = 'gemini-3.1-flash-lite';
-const RSI_DECISION_MODEL = 'gemini-decision-1';
+function getRsiModels() {
+  const cfg = getAiModelConfig();
+  return {
+    decisionModel: cfg.geminiDecisionModel,
+    geminiChain: Array.from(new Set([cfg.geminiPrimaryModel, cfg.geminiFallbackModel].filter(Boolean))),
+  };
+}
+
+function supportsMediumThinking(model: string): boolean {
+  const lower = model.toLowerCase();
+  return !lower.includes('flash-lite') && (lower.includes('gemini-4') || lower.includes('pro'));
+}
 
 function createRsiGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -188,7 +207,6 @@ export async function evaluateCandidateWithDecisionModel(params: {
   };
   existingRules: RsiSystemRule[];
 }): Promise<RsiDecisionGateResult> {
-  const decisionsAi = createRsiDecisionsClient();
   const activeAndCandidate = params.existingRules
     .filter((r) => r.status === 'active' || r.status === 'candidate')
     .slice(0, 30);
@@ -289,58 +307,66 @@ export async function evaluateCandidateWithDecisionModel(params: {
     };
   }
 
-  const result = await decisionsAi.decisions.create({
-    model: RSI_DECISION_MODEL,
-    input: [{ type: 'text', text: JSON.stringify(payload) }],
-    questions,
-  });
+  const decisionsAi = createRsiDecisionsClient();
+  const { decisionModel } = getRsiModels();
+  try {
+    const result = await withGeminiRetry(
+      () =>
+        decisionsAi.decisions.create({
+          model: decisionModel,
+          input: [{ type: 'text', text: JSON.stringify(payload) }],
+          questions,
+        }),
+      { maxAttempts: 3, baseDelayMs: 1400 }
+    );
 
-  if (!result.answers) {
-    throw new Error('gemini-decision-1 未返回有效的决策结果（输入可能被安全策略拦截）。');
+    if (!result.answers) {
+      throw new Error(`${decisionModel} 未返回有效的决策结果（输入可能被安全策略拦截）。`);
+    }
+
+    const genAns = result.answers.is_generalizable;
+    const dupAns = result.answers.is_duplicate_of_existing;
+    const actAns = result.answers.rule_action;
+    const scoreAns = result.answers.generality_score;
+    const mergeAns = result.answers.merge_target;
+
+    if (
+      genAns?.type !== 'noul' ||
+      dupAns?.type !== 'noul' ||
+      actAns?.type !== 'choice' ||
+      scoreAns?.type !== 'score'
+    ) {
+      throw new Error(`${decisionModel} 返回结构异常，缺少必需的校准概率字段。`);
+    }
+
+    let matchedRuleId: string | undefined;
+    let matchedRuleConfidence: number | undefined;
+    if (mergeAns?.type === 'choice' && mergeAns.choice !== 'z_no_match') {
+      matchedRuleId = ruleKeyToId.get(mergeAns.choice);
+      matchedRuleConfidence = mergeAns.confidence;
+    }
+
+    return {
+      model: decisionModel,
+      generalizableProb: Number(genAns.noul.toFixed(4)),
+      duplicateProb: Number(dupAns.noul.toFixed(4)),
+      generalityScore: Number(scoreAns.score.toFixed(3)),
+      chosenAction: actAns.choice as RsiDecisionAction,
+      actionConfidence: Number(actAns.confidence.toFixed(4)),
+      matchedRuleId,
+      matchedRuleConfidence:
+        matchedRuleConfidence !== undefined ? Number(matchedRuleConfidence.toFixed(4)) : undefined,
+      evaluatedAt: new Date().toISOString(),
+    };
+  } catch (err) {
+    throw err;
   }
-
-  const genAns = result.answers.is_generalizable;
-  const dupAns = result.answers.is_duplicate_of_existing;
-  const actAns = result.answers.rule_action;
-  const scoreAns = result.answers.generality_score;
-  const mergeAns = result.answers.merge_target;
-
-  if (
-    genAns?.type !== 'noul' ||
-    dupAns?.type !== 'noul' ||
-    actAns?.type !== 'choice' ||
-    scoreAns?.type !== 'score'
-  ) {
-    throw new Error('gemini-decision-1 返回结构异常，缺少必需的校准概率字段。');
-  }
-
-  let matchedRuleId: string | undefined;
-  let matchedRuleConfidence: number | undefined;
-  if (mergeAns?.type === 'choice' && mergeAns.choice !== 'z_no_match') {
-    matchedRuleId = ruleKeyToId.get(mergeAns.choice);
-    matchedRuleConfidence = mergeAns.confidence;
-  }
-
-  return {
-    model: RSI_DECISION_MODEL,
-    generalizableProb: Number(genAns.noul.toFixed(4)),
-    duplicateProb: Number(dupAns.noul.toFixed(4)),
-    generalityScore: Number(scoreAns.score.toFixed(3)),
-    chosenAction: actAns.choice as RsiDecisionAction,
-    actionConfidence: Number(actAns.confidence.toFixed(4)),
-    matchedRuleId,
-    matchedRuleConfidence:
-      matchedRuleConfidence !== undefined ? Number(matchedRuleConfidence.toFixed(4)) : undefined,
-    evaluatedAt: new Date().toISOString(),
-  };
 }
 
 export async function analyzeIncidentWithGemini(
   incident: FailureIncident,
   existingRules: RsiSystemRule[]
 ): Promise<RsiAttributionDecision> {
-  const ai = createRsiGeminiClient();
-
   const existingSummary =
     existingRules.length > 0
       ? existingRules
@@ -357,7 +383,7 @@ export async function analyzeIncidentWithGemini(
     '你是 AutoDev Studio 的 RSI（Recursive Self-Improvement，递归自进化）故障归因引擎。',
     '每次自动化测试失败、环境/流水线异常、需求规划报错、部署失败或人工验收退回发生时，你负责：',
     '1. 精准定位根本原因分类（rootCauseCategory）并用简体中文给出简明根因诊断（rootCauseSummary）；',
-    '2. 初步判断该问题是否包含可复用的工程规律（shouldCodifyAsRule），后续还将交由专门的 gemini-decision-1 决策模型做严格的通用性/去重门控；',
+    '2. 初步判断该问题是否包含可复用的工程规律（shouldCodifyAsRule），后续还将交由专门的决策门控模型做严格的通用性/去重门控；',
     `3. 若存在可复用工程规律，请提炼一条高度凝练、不超过 ${RSI_BUDGET_LIMITS.maxDirectiveChars} 字的可执行指令（suggestedRule.promptDirective），避免冗长与口水话；`,
     '4. 避免规则膨胀：若现有规则库中已有同主题规则，请复用该规则的 `dedupeKey`。',
     '所有文字描述必须使用专业、简洁的简体中文。',
@@ -377,41 +403,77 @@ export async function analyzeIncidentWithGemini(
     (incident.rawEvidence || incident.errorSummary).slice(0, 8000),
   ].join('\n');
 
-  const attempts: Array<{ model: string; thinkingLevel?: ThinkingLevel }> = [
-    { model: RSI_ANALYZER_MODEL, thinkingLevel: ThinkingLevel.MEDIUM },
-    { model: RSI_FALLBACK_MODEL },
-  ];
+  const attributionSchemaHint = JSON.stringify({
+    rootCauseCategory: 'test_assertion | env_infra | contract_mismatch | ui_ux_acceptance | build_typecheck | ci_workflow',
+    rootCauseSummary: '简明中文根因诊断',
+    shouldCodifyAsRule: true,
+    decisionRationale: '中文决策理由',
+    confidence: 0.85,
+    suggestedRule: {
+      title: '规则标题（<=24字）',
+      targetStage: 'architect | qa_spec | qa_critic | coding | all',
+      severity: 'critical | recommended',
+      promptDirective: '可执行中文指令',
+      dedupeKey: 'kebab-case-key',
+    },
+  });
 
-  let parsed: RawAttributionPayload | null = null;
-  let usedModel = RSI_ANALYZER_MODEL;
-  let lastErr: unknown;
+  let parsed: RawAttributionPayload;
+  let usedModel: string;
 
-  for (const step of attempts) {
+  if (!process.env.GEMINI_API_KEY?.trim() && isShushengConfigured()) {
+    const shushengRes = await generateShushengStructuredJson<RawAttributionPayload>({
+      systemInstruction,
+      prompt,
+      schemaHint: attributionSchemaHint,
+      temperature: 0.2,
+      maxTokens: 2048,
+    });
+    parsed = shushengRes.value;
+    usedModel = `shusheng/${shushengRes.model}`;
+  } else {
     try {
-      const response = await ai.models.generateContent({
-        model: step.model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: RSI_ATTRIBUTION_SCHEMA,
-          ...(step.thinkingLevel
-            ? { thinkingConfig: { thinkingLevel: step.thinkingLevel } }
-            : {}),
+      const ai = createRsiGeminiClient();
+      const { geminiChain } = getRsiModels();
+      const res = await withGeminiModelFallback(
+        geminiChain,
+        async (model) => {
+          const response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema: RSI_ATTRIBUTION_SCHEMA,
+              ...(supportsMediumThinking(model)
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } }
+                : {}),
+            },
+          });
+          const rawText = (response.text ?? '').trim();
+          if (!rawText) throw new Error('Gemini RSI 归因引擎返回空响应');
+          return JSON.parse(rawText) as RawAttributionPayload;
         },
-      });
-      const rawText = (response.text ?? '').trim();
-      if (!rawText) throw new Error('Gemini RSI 归因引擎返回空响应');
-      parsed = JSON.parse(rawText) as RawAttributionPayload;
-      usedModel = step.model;
-      break;
+        { retriesPerModel: 2, baseDelayMs: 1600 }
+      );
+      parsed = res.value;
+      usedModel = res.model;
     } catch (err) {
-      lastErr = err;
+      if (isTransientGeminiError(err) && isShushengConfigured()) {
+        console.warn('[AutoDev RSI] Gemini 全线繁忙，自动容灾切换至书生·端砚平台执行故障归因');
+        const shushengRes = await generateShushengStructuredJson<RawAttributionPayload>({
+          systemInstruction,
+          prompt,
+          schemaHint: attributionSchemaHint,
+          temperature: 0.2,
+          maxTokens: 2048,
+        });
+        parsed = shushengRes.value;
+        usedModel = `shusheng/${shushengRes.model}`;
+      } else {
+        throw err;
+      }
     }
-  }
-
-  if (!parsed) {
-    throw lastErr instanceof Error ? lastErr : new Error('RSI AI 归因分析失败');
   }
 
   const rootCauseSummary = (parsed.rootCauseSummary || '').trim() || incident.errorSummary;
@@ -553,44 +615,31 @@ export async function consolidateRsiRulesWithGemini(): Promise<{
     };
   }
 
-  const ai = createRsiGeminiClient();
-  const response = await ai.models.generateContent({
-    model: RSI_ANALYZER_MODEL,
-    contents: JSON.stringify(
-      existing.map((r) => ({
-        id: r.id,
-        title: r.title,
-        targetStage: r.targetStage,
-        severity: r.severity,
-        status: r.status,
-        rootCauseCategory: r.rootCauseCategory,
-        hitCount: r.hitCount,
-        dedupeKey: r.dedupeKey,
-        promptDirective: r.promptDirective,
-      })),
-      null,
-      2
-    ),
-    config: {
-      systemInstruction: [
-        '你是 AutoDev Studio 的 RSI Prompt 蒸馏压缩引擎。',
-        '你的职责是把当前活跃和候选规则库进行精简与去重合并，防止 System Prompt 膨胀：',
-        '1. 合并所有语义相近、主题重叠的规则，保留其核心硬性约束，并在 sourceRuleIds 中列出被合并的原规则 ID；',
-        `2. 每条提炼后的 promptDirective 必须高度凝练且严格不超过 ${RSI_BUDGET_LIMITS.maxDirectiveChars} 个汉字/字符；`,
-        `3. 蒸馏后的规则总数不得超过原数量，且不超过 ${RSI_BUDGET_LIMITS.codingMaxRules} 条黄金准则；`,
-        '4. 绝不丢失 Critical 级别的系统性防线（如 E2E 只读契约、防后台挂起、亮暗色变量、D1 迁移幂等）。',
-      ].join('\n'),
-      responseMimeType: 'application/json',
-      responseSchema: RSI_CONSOLIDATION_SCHEMA,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
-    },
-  });
+  const rulesPrompt = JSON.stringify(
+    existing.map((r) => ({
+      id: r.id,
+      title: r.title,
+      targetStage: r.targetStage,
+      severity: r.severity,
+      status: r.status,
+      rootCauseCategory: r.rootCauseCategory,
+      hitCount: r.hitCount,
+      dedupeKey: r.dedupeKey,
+      promptDirective: r.promptDirective,
+    })),
+    null,
+    2
+  );
+  const consolidationSystemInstruction = [
+    '你是 AutoDev Studio 的 RSI Prompt 蒸馏压缩引擎。',
+    '你的职责是把当前活跃和候选规则库进行精简与去重合并，防止 System Prompt 膨胀：',
+    '1. 合并所有语义相近、主题重叠的规则，保留其核心硬性约束，并在 sourceRuleIds 中列出被合并的原规则 ID；',
+    `2. 每条提炼后的 promptDirective 必须高度凝练且严格不超过 ${RSI_BUDGET_LIMITS.maxDirectiveChars} 个汉字/字符；`,
+    `3. 蒸馏后的规则总数不得超过原数量，且不超过 ${RSI_BUDGET_LIMITS.codingMaxRules} 条黄金准则；`,
+    '4. 绝不丢失 Critical 级别的系统性防线（如 E2E 只读契约、防后台挂起、亮暗色变量、D1 迁移幂等）。',
+  ].join('\n');
 
-  const rawText = (response.text ?? '').trim();
-  if (!rawText) {
-    throw new Error('RSI 蒸馏压缩返回空响应');
-  }
-  const parsed = JSON.parse(rawText) as {
+  type ConsolidatedPayload = {
     summary: string;
     rules: Array<{
       title: string;
@@ -602,6 +651,63 @@ export async function consolidateRsiRulesWithGemini(): Promise<{
       sourceRuleIds: string[];
     }>;
   };
+
+  let parsed: ConsolidatedPayload;
+  if (!process.env.GEMINI_API_KEY?.trim() && isShushengConfigured()) {
+    const shusheng = await generateShushengStructuredJson<ConsolidatedPayload>({
+      systemInstruction: consolidationSystemInstruction,
+      prompt: rulesPrompt,
+      schemaHint:
+        '{"summary": "蒸馏摘要", "rules": [{"title": "...", "targetStage": "coding", "severity": "critical", "promptDirective": "...", "rootCauseCategory": "env_infra", "dedupeKey": "...", "sourceRuleIds": ["..."]}]}',
+      temperature: 0.2,
+      maxTokens: 3072,
+    });
+    parsed = shusheng.value;
+  } else {
+    try {
+      const ai = createRsiGeminiClient();
+      const { geminiChain } = getRsiModels();
+      const { value: rawText } = await withGeminiModelFallback(
+        geminiChain,
+        async (model) => {
+          const response = await ai.models.generateContent({
+            model,
+            contents: rulesPrompt,
+            config: {
+              systemInstruction: consolidationSystemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema: RSI_CONSOLIDATION_SCHEMA,
+              ...(supportsMediumThinking(model)
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } }
+                : {}),
+            },
+          });
+          const text = (response.text ?? '').trim();
+          if (!text) {
+            throw new Error('RSI 蒸馏压缩返回空响应');
+          }
+          return text;
+        },
+        { retriesPerModel: 2, baseDelayMs: 1600 }
+      );
+      parsed = JSON.parse(rawText) as ConsolidatedPayload;
+    } catch (err) {
+      if (isTransientGeminiError(err) && isShushengConfigured()) {
+        console.warn('[AutoDev RSI] Gemini 全线繁忙，自动容灾切换至书生·端砚平台执行 RSI 规则蒸馏');
+        const shusheng = await generateShushengStructuredJson<ConsolidatedPayload>({
+          systemInstruction: consolidationSystemInstruction,
+          prompt: rulesPrompt,
+          schemaHint:
+            '{"summary": "蒸馏摘要", "rules": [{"title": "...", "targetStage": "coding", "severity": "critical", "promptDirective": "...", "rootCauseCategory": "env_infra", "dedupeKey": "...", "sourceRuleIds": ["..."]}]}',
+          temperature: 0.2,
+          maxTokens: 3072,
+        });
+        parsed = shusheng.value;
+      } else {
+        throw err;
+      }
+    }
+  }
 
   if (!Array.isArray(parsed.rules) || parsed.rules.length === 0) {
     throw new Error('RSI 蒸馏结果为空，已中止写入以保护现有规则库。');
@@ -672,7 +778,7 @@ export async function captureAndReflectIncident(input: {
     return { incident, created: false };
   }
 
-  if (!process.env.GEMINI_API_KEY?.trim()) {
+  if (!process.env.GEMINI_API_KEY?.trim() && !isShushengConfigured()) {
     return { incident, created };
   }
 
@@ -968,7 +1074,7 @@ export async function syncRepoTestReportsAndFailures(
   // Auto-analyze up to autoAnalyzeLimit pending incidents (newest first)
   const limit = options?.autoAnalyzeLimit ?? 3;
   let analyzedCount = 0;
-  if (limit > 0 && process.env.GEMINI_API_KEY?.trim()) {
+  if (limit > 0 && (process.env.GEMINI_API_KEY?.trim() || isShushengConfigured())) {
     const latestState = getRsiState();
     const pendingIds = Array.from(
       new Set([

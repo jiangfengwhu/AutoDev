@@ -244,6 +244,52 @@ export function buildRackLeds(
   }));
 }
 
+export const MAX_LIVE_LAUNCH_CELEBRATION_AGE_MS = 5 * 60 * 1000;
+
+export function isRunDelivered(run: Pick<PipelineRun, 'status' | 'mergedRelease'>): boolean {
+  return Boolean(run.mergedRelease) || run.status === 'approved';
+}
+
+/**
+ * Strictly detects whether a poll update contains a run that JUST launched to production
+ * during the current session. Prevents false "开发完成/上线归档" celebration animations
+ * during cold-start hydration, feedback triage ("转大型 PRD"), or non-release background tasks.
+ */
+export function detectNewlyLaunchedRunId(params: {
+  runs: PipelineRun[];
+  knownDeliveredIds: ReadonlySet<string>;
+  knownInFlightIds: ReadonlySet<string>;
+  nowMs?: number;
+  maxAgeMs?: number;
+}): string | null {
+  const {
+    runs,
+    knownDeliveredIds,
+    knownInFlightIds,
+    nowMs = Date.now(),
+    maxAgeMs = MAX_LIVE_LAUNCH_CELEBRATION_AGE_MS,
+  } = params;
+
+  for (const run of runs) {
+    if (!isRunDelivered(run)) continue;
+    if (knownDeliveredIds.has(run.id)) continue;
+    if (!knownInFlightIds.has(run.id)) continue;
+
+    const tsStr =
+      run.mergedRelease?.mergedAt ||
+      run.approvedAt ||
+      run.productionDeployment?.deployedAt ||
+      run.createdAt;
+    const tsMs = tsStr ? Date.parse(tsStr) : NaN;
+    if (Number.isFinite(tsMs) && nowMs - tsMs > maxAgeMs) {
+      continue;
+    }
+    return run.id;
+  }
+
+  return null;
+}
+
 export function deriveRealFactorySnapshot(input: RealFactoryInputs): FactoryPipelineSnapshot {
   const {
     runs,
@@ -491,28 +537,29 @@ export function deriveRealFactorySnapshot(input: RealFactoryInputs): FactoryPipe
       }
     }
   } else if (deliveredRuns.length > 0 && celebratingDeliveredRunId) {
-    const celebratingRun =
-      deliveredRuns.find((r) => r.id === celebratingDeliveredRunId) ?? deliveredRuns[0];
-    activeStationId = 'ST-05';
-    phaseLabel = 'ST-05 上线归档庆祝中';
-    phaseDescription = `「${celebratingRun.prdTitle}」已成功上线并归档至项目档案部`;
-    stationStates['ST-01'] = { led: 'passed', statusText: '就绪' };
-    stationStates['ST-02'] = { led: 'passed', statusText: '就绪' };
-    stationStates['ST-03'] = { led: 'passed', statusText: 'E2E 通过' };
-    stationStates['ST-04'] = { led: 'passed', statusText: '已签批上线' };
-    stationStates['ST-05'] = { led: 'passed', statusText: `已归档 ${deliveredRuns.length} 项` };
-    tracks.st01ToSt02 = 'passed';
-    tracks.st02ToSt03 = 'passed';
-    tracks.st03ToSt04 = 'passed';
-    tracks.st04ToSt05 = 'passed';
-    workpiece = {
-      prNumberLabel: celebratingRun.draftPr ? `PR #${celebratingRun.draftPr.prNumber}` : 'RELEASED',
-      title: celebratingRun.prdTitle,
-      statusLabel: '归档入库中',
-      tone: 'passed',
-      location: 'ST-05',
-      repairRound: 0,
-    };
+    const celebratingRun = deliveredRuns.find((r) => r.id === celebratingDeliveredRunId);
+    if (celebratingRun) {
+      activeStationId = 'ST-05';
+      phaseLabel = 'ST-05 上线归档庆祝中';
+      phaseDescription = `「${celebratingRun.prdTitle}」已成功上线并归档至项目档案部`;
+      stationStates['ST-01'] = { led: 'passed', statusText: '就绪' };
+      stationStates['ST-02'] = { led: 'passed', statusText: '就绪' };
+      stationStates['ST-03'] = { led: 'passed', statusText: 'E2E 通过' };
+      stationStates['ST-04'] = { led: 'passed', statusText: '已签批上线' };
+      stationStates['ST-05'] = { led: 'passed', statusText: `已归档 ${deliveredRuns.length} 项` };
+      tracks.st01ToSt02 = 'passed';
+      tracks.st02ToSt03 = 'passed';
+      tracks.st03ToSt04 = 'passed';
+      tracks.st04ToSt05 = 'passed';
+      workpiece = {
+        prNumberLabel: celebratingRun.draftPr ? `PR #${celebratingRun.draftPr.prNumber}` : 'RELEASED',
+        title: celebratingRun.prdTitle,
+        statusLabel: '归档入库中',
+        tone: 'passed',
+        location: 'ST-05',
+        repairRound: 0,
+      };
+    }
   }
   // When no run is in-flight and no delivery celebration is active, stay cleanly in ST-00 idle state
   // with workpiece = null so ZERO parcels linger on the conveyor belts!

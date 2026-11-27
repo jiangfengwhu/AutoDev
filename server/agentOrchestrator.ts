@@ -9,9 +9,18 @@ import { resolveEffectiveTechStack } from '../src/lib/workflowBuilder.ts';
 import { formatRsiPromptBlock } from '../src/lib/rsiEngine.ts';
 import { formatRepoContextForPrompt } from '../src/lib/iterationContext.ts';
 import { listAllRsiRules, recordRulesAppliedForStage } from './rsiStore.ts';
+import {
+  generateShushengStructuredJson,
+  isShushengConfigured,
+} from './shushengService.ts';
+import { getAiModelConfig } from './aiModelConfigStore.ts';
 
 export const GEMINI_AGENT_MODEL = 'gemini-4-hydrogen';
-const GEMINI_FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+
+function supportsThinkingConfig(model: string): boolean {
+  const lower = model.toLowerCase();
+  return !lower.includes('flash-lite') && (lower.includes('gemini-4') || lower.includes('pro'));
+}
 
 function createGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -61,12 +70,47 @@ async function generateStructuredJson<T>(params: {
   responseSchema: Record<string, unknown>;
   onChunk?: (chunkText: string) => void;
 }): Promise<T> {
+  const runWithShusheng = async (): Promise<T> => {
+    const schemaHint = JSON.stringify(params.responseSchema).slice(0, 6000);
+    const { value } = await generateShushengStructuredJson<T>({
+      systemInstruction: params.systemInstruction,
+      prompt: params.prompt,
+      schemaHint,
+      temperature: 0.2,
+      maxTokens: 6144,
+      onChunk: params.onChunk,
+    });
+    return value;
+  };
+
+  if (!process.env.GEMINI_API_KEY?.trim() && isShushengConfigured()) {
+    return runWithShusheng();
+  }
+
   const ai = createGeminiClient();
+  const modelCfg = getAiModelConfig();
+  const primaryModel = modelCfg.geminiPrimaryModel;
+  const fallbackModel = modelCfg.geminiFallbackModel;
   const attemptPlan: Array<{ model: string; thinkingLevel?: ThinkingLevel; delayBeforeMs: number }> = [
-    { model: GEMINI_AGENT_MODEL, thinkingLevel: ThinkingLevel.MEDIUM, delayBeforeMs: 0 },
-    { model: GEMINI_AGENT_MODEL, thinkingLevel: ThinkingLevel.MEDIUM, delayBeforeMs: 2500 },
-    { model: GEMINI_FALLBACK_MODEL, delayBeforeMs: 1000 },
-    { model: 'gemini-2.5-flash', delayBeforeMs: 1500 },
+    {
+      model: primaryModel,
+      thinkingLevel: supportsThinkingConfig(primaryModel) ? ThinkingLevel.MEDIUM : undefined,
+      delayBeforeMs: 0,
+    },
+    {
+      model: primaryModel,
+      thinkingLevel: supportsThinkingConfig(primaryModel) ? ThinkingLevel.MEDIUM : undefined,
+      delayBeforeMs: 2500,
+    },
+    ...(fallbackModel && fallbackModel !== primaryModel
+      ? [
+          {
+            model: fallbackModel,
+            thinkingLevel: supportsThinkingConfig(fallbackModel) ? ThinkingLevel.LOW : undefined,
+            delayBeforeMs: 1000,
+          },
+        ]
+      : []),
   ];
 
   let lastError: unknown;
@@ -119,6 +163,11 @@ async function generateStructuredJson<T>(params: {
         throw new Error(formatGeminiError(msg));
       }
     }
+  }
+
+  if (isShushengConfigured()) {
+    console.warn('[AutoDev Orchestrator] Gemini 全线高负载，自动容灾切换至书生·端砚平台生成规划方案');
+    return runWithShusheng();
   }
 
   const finalMsg = lastError instanceof Error ? lastError.message : 'Gemini API 调用失败';

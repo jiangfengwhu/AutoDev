@@ -2,17 +2,22 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
+  ArrowRight,
   Bot,
+  Bug,
   Cloud,
   Cpu,
   ExternalLink,
   Gauge,
   GitBranch,
+  Inbox,
   RefreshCw,
   RotateCcw,
   Server,
+  Settings2,
   Trash2,
   UploadCloud,
+  Wrench,
 } from 'lucide-react';
 import type {
   BackgroundTask,
@@ -20,9 +25,11 @@ import type {
   IntegrationsStatusResponse,
   SelectedTargetRepo,
 } from '../types/autodev';
+import type { SignalsDashboardPayload } from '../lib/signalsEngine';
 import { FIXED_TARGET_REPO } from '../lib/workflowBuilder';
 import { apiFetch } from '../lib/editAuthClient';
 import { OverviewDashboard } from './OverviewDashboard';
+import { AiModelConfigModal } from './AiModelConfigModal';
 
 interface EnvironmentViewProps {
   status: IntegrationsStatusResponse | null;
@@ -33,6 +40,7 @@ interface EnvironmentViewProps {
   onSelectRepo: (repo: SelectedTargetRepo) => void;
   onEnvironmentReset?: () => void;
   onBackgroundTaskStarted?: (task: BackgroundTask) => void;
+  onOpenSignalsTab?: (tab: 'feedback' | 'errors') => void;
   refreshNonce?: number;
   onErrorToast: (message: string, title?: string) => void;
   onSuccessToast: (message: string, title?: string) => void;
@@ -103,6 +111,7 @@ export function EnvironmentView({
   selectedRepo,
   onEnvironmentReset,
   onBackgroundTaskStarted,
+  onOpenSignalsTab,
   refreshNonce = 0,
   onErrorToast,
   onSuccessToast,
@@ -112,7 +121,9 @@ export function EnvironmentView({
   const [overviewRefreshSignal, setOverviewRefreshSignal] = useState(0);
   const [telemetry, setTelemetry] = useState<RateLimitAndPersistenceResponse | null>(null);
   const [telemetryLoading, setTelemetryLoading] = useState(false);
+  const [signalsState, setSignalsState] = useState<SignalsDashboardPayload | null>(null);
   const [syncingState, setSyncingState] = useState(false);
+  const [showAiConfigModal, setShowAiConfigModal] = useState(false);
 
   // Danger Zone clean-slate reset & wipe-repo-code state
   const [showResetPanel, setShowResetPanel] = useState(false);
@@ -171,6 +182,22 @@ export function EnvironmentView({
       setTelemetryLoading(false);
     }
   }, []);
+
+  const fetchSignalsSummary = useCallback(async () => {
+    try {
+      const res = await fetch('/api/signals/state');
+      if (res.ok) {
+        const data = (await res.json()) as SignalsDashboardPayload;
+        setSignalsState(data);
+      }
+    } catch {
+      // non-fatal
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSignalsSummary();
+  }, [fetchSignalsSummary, refreshNonce]);
 
   useEffect(() => {
     if (status?.github.connected) {
@@ -331,6 +358,8 @@ export function EnvironmentView({
   const runnerOk = onlineRunners.length > 0;
   const cloudflareOk = Boolean(status?.cloudflare.connected);
   const geminiOk = Boolean(status?.gemini.configured);
+  const shushengConfigured = Boolean(status?.shusheng?.configured);
+  const shushengOk = Boolean(status?.shusheng?.connected);
   const feishuOk = Boolean(status?.feishu?.configured);
 
   return (
@@ -356,22 +385,34 @@ export function EnvironmentView({
             </a>
           </div>
 
-          <button
-            type="button"
-            onClick={() => {
-              onRefresh();
-              fetchRunnerStatus();
-              fetchTelemetry(true);
-              setOverviewRefreshSignal((prev) => prev + 1);
-            }}
-            disabled={loading || runnerLoading || telemetryLoading}
-            className="inline-flex items-center gap-2 rounded-md border border-[#30363D] bg-[#21262D] px-3 py-1.5 text-[12.5px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <RefreshCw
-              className={`h-3.5 w-3.5 ${loading || runnerLoading || telemetryLoading ? 'animate-spin' : ''}`}
-            />
-            <span>{loading ? '检测中…' : '刷新状态'}</span>
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-testid="open-ai-config-btn"
+              onClick={() => setShowAiConfigModal(true)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-3 py-1.5 text-[12.5px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Settings2 className="h-3.5 w-3.5 text-[#58A6FF]" />
+              <span>模型配置</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onRefresh();
+                fetchRunnerStatus();
+                fetchTelemetry(true);
+                fetchSignalsSummary();
+                setOverviewRefreshSignal((prev) => prev + 1);
+              }}
+              disabled={loading || runnerLoading || telemetryLoading}
+              className="inline-flex items-center gap-2 rounded-md border border-[#30363D] bg-[#21262D] px-3 py-1.5 text-[12.5px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${loading || runnerLoading || telemetryLoading ? 'animate-spin' : ''}`}
+              />
+              <span>{loading ? '检测中…' : '刷新状态'}</span>
+            </button>
+          </div>
         </div>
 
         {/* Inline Live Health Strip: GitHub · VPS AGY Runner · Cloudflare · Gemini */}
@@ -461,7 +502,12 @@ export function EnvironmentView({
           </span>
 
           {/* Gemini Engine */}
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-[#30363D] bg-[#161B22] px-2.5 py-1">
+          <button
+            type="button"
+            onClick={() => setShowAiConfigModal(true)}
+            title={`Gemini 控制面主模型：${status?.gemini.model || 'gemini-4-hydrogen'} · 备用：${status?.gemini.fallbackModel || 'gemini-3.1-flash-lite'} · 决策：${status?.gemini.decisionModel || 'gemini-decision-1'}（点击配置）`}
+            className="inline-flex items-center gap-1.5 rounded-full border border-[#30363D] bg-[#161B22] px-2.5 py-1 hover:border-[#58A6FF]/70 transition-colors cursor-pointer"
+          >
             <span
               className={`h-2 w-2 rounded-full shrink-0 ${
                 loading && !status
@@ -474,9 +520,69 @@ export function EnvironmentView({
             <Cpu className="h-3 w-3 text-[#58A6FF] shrink-0" />
             <span className="font-semibold text-[#F0F6FC]">Gemini</span>
             <span className={`font-mono ${geminiOk ? 'text-[#3FB950]' : 'text-[#F85149]'}`}>
-              {loading && !status ? '检测中' : geminiOk ? 'OK' : '未配置'}
+              {loading && !status
+                ? '检测中'
+                : geminiOk
+                  ? status?.gemini.model || 'OK'
+                  : '未配置'}
             </span>
-          </span>
+          </button>
+
+          {/* OpenAI-Compatible Backup Engine (Default: 书生·端砚) */}
+          <button
+            type="button"
+            data-testid="env-shusheng-status"
+            onClick={() => setShowAiConfigModal(true)}
+            title={
+              status?.shusheng?.enabled === false
+                ? `${status.shusheng.providerName || '备用引擎'}已停用（点击启用或修改配置）`
+                : status?.shusheng?.error
+                  ? `${status.shusheng.providerName || '备用引擎'}：${status.shusheng.error}（点击配置）`
+                  : status?.shusheng?.connected
+                    ? `${status.shusheng.providerName || '书生·端砚'} (${status.shusheng.baseUrl}) · 模型 ${status.shusheng.defaultModel} · 可用 ${status.shusheng.availableModels.length} 个模型${status.shusheng.latencyMs ? ` · ${status.shusheng.latencyMs}ms` : ''} · Gemini 503/429 自动容灾切换（点击配置）`
+                    : 'OpenAI 兼容备用容灾引擎（点击配置 Base URL / 模型名 / API Key）'
+            }
+            className="inline-flex items-center gap-1.5 rounded-full border border-[#30363D] bg-[#161B22] px-2.5 py-1 hover:border-[#A371F7]/70 transition-colors cursor-pointer"
+          >
+            <span
+              className={`h-2 w-2 rounded-full shrink-0 ${
+                loading && !status
+                  ? 'bg-[#8B949E]'
+                  : status?.shusheng?.enabled === false
+                    ? 'bg-[#6E7681]'
+                    : shushengOk
+                      ? 'bg-[#3FB950]'
+                      : shushengConfigured
+                        ? 'bg-[#D29922]'
+                        : 'bg-[#6E7681]'
+              }`}
+            />
+            <Cpu className="h-3 w-3 text-[#A371F7] shrink-0" />
+            <span className="font-semibold text-[#F0F6FC]">
+              {status?.shusheng?.providerName || '书生端砚'}
+            </span>
+            <span
+              className={`font-mono ${
+                status?.shusheng?.enabled === false
+                  ? 'text-[#8B949E]'
+                  : shushengOk
+                    ? 'text-[#3FB950]'
+                    : shushengConfigured
+                      ? 'text-[#D29922]'
+                      : 'text-[#8B949E]'
+              }`}
+            >
+              {loading && !status
+                ? '检测中'
+                : status?.shusheng?.enabled === false
+                  ? '已停用'
+                  : shushengOk
+                    ? status?.shusheng?.defaultModel || 'OK'
+                    : shushengConfigured
+                      ? '异常'
+                      : '未配置'}
+            </span>
+          </button>
 
           {/* Feishu Bot */}
           <span
@@ -524,6 +630,76 @@ export function EnvironmentView({
         refreshSignal={overviewRefreshSignal}
         onErrorToast={onErrorToast}
       />
+
+      {/* Production Signals & Auto-Fix Quick Summary Strip */}
+      <section
+        data-testid="env-signals-summary-strip"
+        aria-label="线上信号与自愈快览"
+        className="rounded-md border border-[#30363D] bg-[#161B22] px-4 py-3.5 flex flex-col md:flex-row md:items-center md:justify-between gap-3"
+      >
+        <div className="space-y-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-[13.5px] font-semibold text-[#F0F6FC]">
+              线上信号与自愈闭环
+            </h2>
+            <span className="font-mono text-[11px] text-[#3FB950]">
+              {signalsState?.config.ingestTokenConfigured
+                ? '已直连 atd-v1 线上应用 · 双向零丢失同步'
+                : '等待 GitHub 凭证就绪'}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[12px] text-[#C9D1D9] tabular-nums">
+            <span className="inline-flex items-center gap-1.5">
+              <Inbox className="h-3.5 w-3.5 text-[#58A6FF]" />
+              <span>待巡检反馈</span>
+              <strong className="font-mono text-[#F0F6FC]">
+                {signalsState?.summary.pendingFeedbackCount ?? 0}
+              </strong>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <Bug className="h-3.5 w-3.5 text-[#D29922]" />
+              <span>活跃报错指纹</span>
+              <strong className="font-mono text-[#F0F6FC]">
+                {signalsState?.summary.activeErrorGroupsCount ?? 0}
+              </strong>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <Wrench className="h-3.5 w-3.5 text-[#3FB950]" />
+              <span>排队或修复中</span>
+              <strong className="font-mono text-[#F0F6FC]">
+                {(signalsState?.summary.queuedErrorGroupsCount ?? 0) +
+                  (signalsState?.summary.fixingErrorGroupsCount ?? 0)}
+              </strong>
+              {signalsState?.summary.activeAutofixPrNumber ? (
+                <span className="font-mono text-[11px] text-[#58A6FF]">
+                  (合批 PR #{signalsState.summary.activeAutofixPrNumber})
+                </span>
+              ) : null}
+            </span>
+          </div>
+        </div>
+
+        {onOpenSignalsTab && (
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => onOpenSignalsTab('feedback')}
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-2.5 py-1.5 text-[12px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] transition-colors cursor-pointer"
+            >
+              <span>用户反馈池</span>
+              <ArrowRight className="h-3 w-3" />
+            </button>
+            <button
+              type="button"
+              onClick={() => onOpenSignalsTab('errors')}
+              className="inline-flex items-center gap-1.5 rounded-md border border-[#30363D] bg-[#21262D] px-2.5 py-1.5 text-[12px] font-medium text-[#C9D1D9] hover:bg-[#30363D] hover:text-[#F0F6FC] transition-colors cursor-pointer"
+            >
+              <span>线上报错自愈</span>
+              <ArrowRight className="h-3 w-3" />
+            </button>
+          </div>
+        )}
+      </section>
 
       {/* Dedicated Danger Zone: State Persistence, GitHub API Quota, Clean-Slate Reset & Wipe Repo Code */}
       <section
@@ -802,6 +978,15 @@ export function EnvironmentView({
           )}
         </div>
       </section>
+
+      <AiModelConfigModal
+        open={showAiConfigModal}
+        onClose={() => setShowAiConfigModal(false)}
+        shushengStatus={status?.shusheng}
+        onSaved={onRefresh}
+        onErrorToast={onErrorToast}
+        onSuccessToast={onSuccessToast}
+      />
     </div>
   );
 }

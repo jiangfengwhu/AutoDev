@@ -37,7 +37,9 @@ import type { SevenDayOverviewMetrics } from './lib/overviewMetrics';
 import {
   DEMO_PIPELINE_PHASES,
   deriveRealFactorySnapshot,
+  detectNewlyLaunchedRunId,
   getDemoFactorySnapshot,
+  isRunDelivered,
   type FactoryMode,
   type FactoryStationId,
 } from './lib/factoryPipelineState';
@@ -136,7 +138,8 @@ export default function App() {
   const [refreshNonce, setRefreshNonce] = useState(0);
   const prevTaskStatusRef = useRef<Map<string, BackgroundTask['status']>>(new Map());
   const prevCodingRunningRef = useRef(false);
-  const knownDeliveredIdsRef = useRef<Set<string> | null>(null);
+  const knownDeliveredIdsRef = useRef<Set<string>>(new Set());
+  const knownInFlightIdsRef = useRef<Set<string>>(new Set());
 
   const [prdDraft, setPrdDraft] = useState<PrdDraftState>(() => {
     const saved = loadPrdDraft();
@@ -475,6 +478,10 @@ export default function App() {
     setAnalysisJob(null);
     setAnalysisJobs([]);
     setRsiReports([]);
+    setCelebratingDeliveredRunId(null);
+    setApprovedStampRunId(null);
+    knownDeliveredIdsRef.current = new Set();
+    knownInFlightIdsRef.current = new Set();
     lastJobStatusRef.current = null;
     clearPrdDraft();
     hasRestoredLocalDraftRef.current = false;
@@ -577,7 +584,15 @@ export default function App() {
     ]
   );
 
-  const handleBackgroundTaskStarted = useCallback((task: BackgroundTask) => {
+  const handleBackgroundTaskStarted = useCallback((rawTask: BackgroundTask) => {
+    const maybeWrapped = rawTask as unknown as { task?: BackgroundTask };
+    const task =
+      rawTask && typeof rawTask.id === 'string'
+        ? rawTask
+        : maybeWrapped?.task && typeof maybeWrapped.task.id === 'string'
+          ? maybeWrapped.task
+          : null;
+    if (!task) return;
     prevTaskStatusRef.current.set(task.id, task.status);
     setBackgroundTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)]);
   }, []);
@@ -630,9 +645,11 @@ export default function App() {
   const handleRunUpdated = useCallback((updated: PipelineRun) => {
     setRuns((prev) => {
       const existing = prev.find((r) => r.id === updated.id);
-      const wasDelivered = Boolean(existing && (existing.mergedRelease || existing.status === 'approved'));
-      const isNowDelivered = Boolean(updated.mergedRelease || updated.status === 'approved');
-      if (isNowDelivered && !wasDelivered) {
+      const wasDelivered = Boolean(existing && isRunDelivered(existing));
+      const isNowDelivered = isRunDelivered(updated);
+      if (existing && isNowDelivered && !wasDelivered) {
+        knownDeliveredIdsRef.current.add(updated.id);
+        knownInFlightIdsRef.current.delete(updated.id);
         setCelebratingDeliveredRunId(updated.id);
       }
       return prev.map((r) => (r.id === updated.id ? updated : r));
@@ -654,21 +671,28 @@ export default function App() {
     }
   }, []);
 
-  // Detect live transitions into delivered/approved across polls (NEVER fire on initial cold load!)
+  // Detect live transitions from in-flight -> delivered/launched across polls
+  // (NEVER fire on cold-start hydration, feedback triage -> 转大型PRD, or old historical runs!)
   useEffect(() => {
     if (!runsHydrated) return;
-    const currentDelivered = runs
-      .filter((r) => Boolean(r.mergedRelease) || r.status === 'approved')
-      .map((r) => r.id);
-    if (knownDeliveredIdsRef.current === null) {
-      knownDeliveredIdsRef.current = new Set(currentDelivered);
-      return;
-    }
-    for (const id of currentDelivered) {
-      if (!knownDeliveredIdsRef.current.has(id)) {
-        knownDeliveredIdsRef.current.add(id);
-        setCelebratingDeliveredRunId(id);
+
+    const newlyLaunchedId = detectNewlyLaunchedRunId({
+      runs,
+      knownDeliveredIds: knownDeliveredIdsRef.current,
+      knownInFlightIds: knownInFlightIdsRef.current,
+    });
+
+    for (const r of runs) {
+      if (isRunDelivered(r)) {
+        knownDeliveredIdsRef.current.add(r.id);
+        knownInFlightIdsRef.current.delete(r.id);
+      } else {
+        knownInFlightIdsRef.current.add(r.id);
       }
+    }
+
+    if (newlyLaunchedId) {
+      setCelebratingDeliveredRunId(newlyLaunchedId);
     }
   }, [runs, runsHydrated]);
 
@@ -824,10 +848,11 @@ export default function App() {
     : 0;
 
   useEffect(() => {
+    setActiveCodingActionRunning(false);
+    setLatestCodingActionConclusion(null);
+    prevCodingRunningRef.current = false;
+
     if (!inFlightPrBranch || !selectedRepo.fullName) {
-      setActiveCodingActionRunning(false);
-      setLatestCodingActionConclusion(null);
-      prevCodingRunningRef.current = false;
       return;
     }
     let cancelled = false;
@@ -848,14 +873,14 @@ export default function App() {
         };
         const list = Array.isArray(data.runs) ? data.runs : [];
         // Match coding runs: workflow_dispatch runs execute on ref `main` with name "AutoDev AGY Coding Runner",
-        // so match by coding workflow name created AFTER this PR's creation (with 60s slack) OR direct headBranch match.
+        // so match by coding workflow name created AFTER this PR's creation (tight 5s slack) OR direct headBranch match.
         const codingRuns = list.filter((r) => {
           const isCodingName = /coding\s*runner|autodev-agy\.yml/i.test(r.name || '');
           const branchMatches = r.headBranch === inFlightPrBranch;
           if (!isCodingName && !branchMatches) return false;
           if (branchMatches) return true;
           const runMs = r.createdAt ? Date.parse(r.createdAt) : 0;
-          return !inFlightPrCreatedAtMs || !runMs || runMs >= inFlightPrCreatedAtMs - 60_000;
+          return !inFlightPrCreatedAtMs || !runMs || runMs >= inFlightPrCreatedAtMs - 5_000;
         });
 
         const isRunning = codingRuns.some(
@@ -941,10 +966,17 @@ export default function App() {
   );
 
   const handleNavigateFromTasksDrawer = useCallback(
-    (section: NavSectionId) => {
+    (section: NavSectionId, task?: BackgroundTask) => {
       if (section === 'studio') {
         setDrawerStationId(null);
       } else {
+        if (section === 'quality' && task) {
+          if (task.kind === 'signals_triage') {
+            setFocusedQualityTarget({ topSection: 'feedback', nonce: Date.now() });
+          } else if (task.kind === 'signals_autofix') {
+            setFocusedQualityTarget({ topSection: 'errors', nonce: Date.now() });
+          }
+        }
         openStationDrawer(ROOM_TO_STATION[section]);
       }
     },
@@ -1111,6 +1143,13 @@ export default function App() {
             onSelectRepo={handleSelectRepo}
             onEnvironmentReset={handleEnvironmentReset}
             onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            onOpenSignalsTab={(tab) => {
+              setFocusedQualityTarget({
+                topSection: tab,
+                nonce: Date.now(),
+              });
+              openStationDrawer('ST-03');
+            }}
             refreshNonce={refreshNonce}
             onErrorToast={pushErrorToast}
             onSuccessToast={pushSuccessToast}
@@ -1130,6 +1169,7 @@ export default function App() {
             onJobStarted={handleJobStarted}
             onRunUpdated={handleRunUpdated}
             onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            onClosePavilion={() => setDrawerStationId(null)}
             onGoToEnvironment={() => openStationDrawer('ST-00')}
             onGoToPipeline={() => openStationDrawer('ST-02')}
             onGoToApproval={(runId) => {
@@ -1165,7 +1205,9 @@ export default function App() {
             repoFullName={selectedRepo.fullName}
             focusedTarget={focusedQualityTarget}
             onClearFocusedTarget={handleClearFocusedQualityTarget}
+            activeTasks={backgroundTasks}
             onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            onClosePavilion={() => setDrawerStationId(null)}
             refreshNonce={refreshNonce}
             onErrorToast={pushErrorToast}
             onSuccessToast={pushSuccessToast}
@@ -1179,6 +1221,7 @@ export default function App() {
             onSelectRun={setActiveRunId}
             onRunUpdated={handleRunUpdated}
             onBackgroundTaskStarted={handleBackgroundTaskStarted}
+            onClosePavilion={() => setDrawerStationId(null)}
             isRequirementInProgress={isRequirementInProgress}
             onGoToNewPrd={() => openStationDrawer('ST-01')}
             onGoToQuality={(target) => {

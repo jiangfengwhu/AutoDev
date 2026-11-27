@@ -20,8 +20,8 @@ import type {
 import {
   AGY_AGENT_MODES,
   AGY_AVAILABLE_MODELS,
+  DEFAULT_AGY_CODING_MODEL,
   DEFAULT_AGY_MODE,
-  DEFAULT_AGY_MODEL,
   FIXED_TARGET_REPO,
 } from '../lib/workflowBuilder';
 import { filterActionRunsForPipelineRun } from '../lib/iterationContext';
@@ -105,7 +105,7 @@ export function PipelineBoardView({
   );
 
   const [selectedBranch, setSelectedBranch] = useState<string>('');
-  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_AGY_MODEL);
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_AGY_CODING_MODEL);
   const [selectedMode, setSelectedMode] = useState<string>(DEFAULT_AGY_MODE);
   const [dispatching, setDispatching] = useState(false);
   const [dispatchFeedback, setDispatchFeedback] = useState<{

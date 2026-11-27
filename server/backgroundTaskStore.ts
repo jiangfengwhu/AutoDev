@@ -4,6 +4,10 @@ import type {
   BackgroundTaskKind,
   NavSectionId,
 } from '../src/types/autodev.ts';
+import {
+  formatFriendlyGeminiError,
+  isTransientGeminiError,
+} from '../src/lib/geminiResilience.ts';
 
 const MAX_RETAINED_TASKS = 40;
 
@@ -101,7 +105,16 @@ export function enqueueBackgroundTask<TResult = Record<string, unknown>>(
       task.completedAt = doneAt;
     } catch (err) {
       const failAt = new Date().toISOString();
-      const message = err instanceof Error ? err.message : String(err);
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      const looksLikeGeminiApiError =
+        rawMessage.trim().startsWith('{') ||
+        /gemini|generativelanguage|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand/i.test(rawMessage);
+      const message =
+        looksLikeGeminiApiError && isTransientGeminiError(err)
+          ? formatFriendlyGeminiError(err, '后台任务执行失败')
+          : rawMessage.trim().startsWith('{')
+            ? formatFriendlyGeminiError(err, '后台任务执行失败')
+            : rawMessage;
       task.status = 'failed';
       task.error = message;
       task.progressMessage = message;

@@ -4,9 +4,7 @@ import type { IncomingHttpHeaders } from 'http';
 import type { FeishuIntegrationStatus } from '../src/types/autodev.ts';
 import {
   buildFeishuStageCard,
-  decryptFeishuPayload,
   timingSafeStringEqual,
-  verifyFeishuSignature,
   type FeishuStageNotificationPayload,
 } from '../src/lib/feishuProtocol.ts';
 import { scheduleGitHubStateSync } from './githubStateStore.ts';
@@ -48,26 +46,12 @@ function getFeishuConfig() {
   const appId = readEnv('FEISHU_APP_ID');
   const appSecret = readEnv('FEISHU_APP_SECRET');
   const verificationToken = readEnv('FEISHU_VERIFICATION_TOKEN');
-  const encryptKey = readEnv('FEISHU_ENCRYPT_KEY');
-  const defaultChatId = readEnv('FEISHU_DEFAULT_CHAT_ID');
-  const allowedChatIds = readEnv('FEISHU_ALLOWED_CHAT_IDS')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const appBaseUrl =
-    readEnv('PUBLIC_APP_URL') ||
-    readEnv('APP_BASE_URL') ||
-    readEnv('SHARED_APP_URL') ||
-    readEnv('APP_URL') ||
-    '';
+  const appBaseUrl = readEnv('APP_URL');
 
   return {
     appId,
     appSecret,
     verificationToken,
-    encryptKey,
-    defaultChatId,
-    allowedChatIds,
     appBaseUrl,
   };
 }
@@ -120,8 +104,6 @@ export function rememberFeishuActiveChat(chatId: string): void {
 export function getFeishuTargetChatId(preferredChatId?: string): string {
   const preferred = (preferredChatId || '').trim();
   if (preferred) return preferred;
-  const cfg = getFeishuConfig();
-  if (cfg.defaultChatId) return cfg.defaultChatId;
   return loadFeishuState().lastActiveChatId || '';
 }
 
@@ -129,11 +111,8 @@ export function getFeishuAppBaseUrl(): string {
   return getFeishuConfig().appBaseUrl;
 }
 
-export function isFeishuChatAllowed(chatId?: string): boolean {
-  const cfg = getFeishuConfig();
-  if (cfg.allowedChatIds.length === 0) return true;
-  if (!chatId) return false;
-  return cfg.allowedChatIds.includes(chatId.trim());
+export function isFeishuChatAllowed(_chatId?: string): boolean {
+  return true;
 }
 
 export function isDuplicateFeishuEvent(eventId?: string): boolean {
@@ -153,15 +132,15 @@ export function isDuplicateFeishuEvent(eventId?: string): boolean {
 export function getFeishuIntegrationStatus(): FeishuIntegrationStatus {
   const cfg = getFeishuConfig();
   const hasAppCredentials = Boolean(cfg.appId && cfg.appSecret);
-  const hasWebhookAuth = Boolean(cfg.verificationToken || cfg.encryptKey);
+  const hasVerificationToken = Boolean(cfg.verificationToken);
   const activeChat = getFeishuTargetChatId();
 
   return {
-    configured: hasAppCredentials && hasWebhookAuth,
+    configured: hasAppCredentials && hasVerificationToken,
     hasAppCredentials,
-    hasVerificationToken: Boolean(cfg.verificationToken),
-    hasEncryptKey: Boolean(cfg.encryptKey),
-    hasDefaultChatId: Boolean(cfg.defaultChatId),
+    hasVerificationToken,
+    hasEncryptKey: false,
+    hasDefaultChatId: false,
     hasActiveChat: Boolean(activeChat),
     eventsCallbackPath: FEISHU_EVENTS_CALLBACK_PATH,
     cardCallbackPath: FEISHU_CARD_CALLBACK_PATH,
@@ -198,12 +177,12 @@ export function verifyAndDecodeFeishuWebhook(params: {
       error: '服务端尚未配置 FEISHU_APP_ID / FEISHU_APP_SECRET 环境变量',
     };
   }
-  if (!cfg.verificationToken && !cfg.encryptKey) {
+  if (!cfg.verificationToken) {
     return {
       ok: false,
       statusCode: 503,
       code: 'FEISHU_AUTH_NOT_CONFIGURED',
-      error: '服务端必须配置 FEISHU_VERIFICATION_TOKEN 或 FEISHU_ENCRYPT_KEY 才能启用飞书回调',
+      error: '服务端必须配置 FEISHU_VERIFICATION_TOKEN 才能启用飞书回调',
     };
   }
 
@@ -220,82 +199,22 @@ export function verifyAndDecodeFeishuWebhook(params: {
     };
   }
 
-  let decodedPayload: Record<string, unknown> = rawObj;
+  const decodedPayload: Record<string, unknown> = rawObj;
+  const header =
+    decodedPayload.header && typeof decodedPayload.header === 'object'
+      ? (decodedPayload.header as Record<string, unknown>)
+      : null;
+  const incomingToken =
+    (typeof header?.token === 'string' ? header.token : '') ||
+    (typeof decodedPayload.token === 'string' ? decodedPayload.token : '');
 
-  if (cfg.encryptKey) {
-    // Enforce signature verification when Encrypt Key is configured
-    const timestamp = getHeaderValue(params.headers, 'x-lark-request-timestamp');
-    const nonce = getHeaderValue(params.headers, 'x-lark-request-nonce');
-    const signature = getHeaderValue(params.headers, 'x-lark-signature');
-
-    if (typeof rawObj.encrypt !== 'string' || !rawObj.encrypt.trim()) {
-      return {
-        ok: false,
-        statusCode: 403,
-        code: 'FEISHU_ENCRYPT_REQUIRED',
-        error: '已启用 FEISHU_ENCRYPT_KEY，拒绝未加密的飞书回调请求',
-      };
-    }
-
-    if (signature || timestamp || nonce) {
-      const sigCheck = verifyFeishuSignature({
-        timestamp,
-        nonce,
-        signature,
-        encryptKey: cfg.encryptKey,
-        rawBody: params.rawBody,
-      });
-      if (!sigCheck.ok) {
-        return {
-          ok: false,
-          statusCode: 403,
-          code: 'FEISHU_BAD_SIGNATURE',
-          error: sigCheck.reason || '飞书回调签名校验失败',
-        };
-      }
-    }
-
-    try {
-      const plain = decryptFeishuPayload(rawObj.encrypt, cfg.encryptKey);
-      const parsed = JSON.parse(plain);
-      if (!parsed || typeof parsed !== 'object') {
-        throw new Error('Decrypted JSON is not an object');
-      }
-      decodedPayload = parsed as Record<string, unknown>;
-    } catch {
-      return {
-        ok: false,
-        statusCode: 403,
-        code: 'FEISHU_DECRYPT_FAILED',
-        error: '飞书回调内容解密失败，请核对 FEISHU_ENCRYPT_KEY 配置',
-      };
-    }
-  } else if (typeof rawObj.encrypt === 'string' && rawObj.encrypt.trim()) {
+  if (!incomingToken || !timingSafeStringEqual(incomingToken, cfg.verificationToken)) {
     return {
       ok: false,
-      statusCode: 503,
-      code: 'FEISHU_ENCRYPT_KEY_MISSING',
-      error: '收到加密飞书回调但服务端未配置 FEISHU_ENCRYPT_KEY',
+      statusCode: 403,
+      code: 'FEISHU_BAD_TOKEN',
+      error: '飞书 Verification Token 校验失败',
     };
-  }
-
-  if (cfg.verificationToken) {
-    const header =
-      decodedPayload.header && typeof decodedPayload.header === 'object'
-        ? (decodedPayload.header as Record<string, unknown>)
-        : null;
-    const incomingToken =
-      (typeof header?.token === 'string' ? header.token : '') ||
-      (typeof decodedPayload.token === 'string' ? decodedPayload.token : '');
-
-    if (!incomingToken || !timingSafeStringEqual(incomingToken, cfg.verificationToken)) {
-      return {
-        ok: false,
-        statusCode: 403,
-        code: 'FEISHU_BAD_TOKEN',
-        error: '飞书 Verification Token 校验失败',
-      };
-    }
   }
 
   return { ok: true, payload: decodedPayload };
@@ -481,8 +400,7 @@ export async function notifyFeishuStageEvent(
     targetChatId = await discoverBotChatIdFallback();
   }
   if (!targetChatId) {
-    const reason =
-      '未找到目标飞书群 chat_id：请配置 FEISHU_DEFAULT_CHAT_ID，或在飞书群内 @机器人 一次绑定活跃群';
+    const reason = '未找到目标飞书群 chat_id：请在飞书群内 @机器人 一次绑定活跃群';
     lastPushStatus = {
       ok: false,
       kind: payload.kind,

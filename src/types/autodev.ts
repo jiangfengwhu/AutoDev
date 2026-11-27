@@ -78,6 +78,22 @@ export interface CloudflareIntegrationStatus {
 export interface GeminiIntegrationStatus {
   configured: boolean;
   model: string;
+  fallbackModel?: string;
+  decisionModel?: string;
+  checkedAt: string;
+}
+
+export interface ShushengIntegrationStatus {
+  configured: boolean;
+  connected: boolean;
+  enabled?: boolean;
+  providerName?: string;
+  baseUrl: string;
+  defaultModel: string;
+  availableModels: string[];
+  apiKeySource?: 'custom' | 'env' | 'none';
+  latencyMs?: number;
+  error?: string;
   checkedAt: string;
 }
 
@@ -100,6 +116,7 @@ export interface IntegrationsStatusResponse {
   github: GitHubIntegrationStatus;
   cloudflare: CloudflareIntegrationStatus;
   gemini: GeminiIntegrationStatus;
+  shusheng?: ShushengIntegrationStatus;
   feishu?: FeishuIntegrationStatus;
 }
 
@@ -340,6 +357,12 @@ export interface CodingAgentOutputSnapshot {
   tokenUsage?: TokenUsageSummary;
 }
 
+export type PipelineRunOrigin =
+  | 'manual_prd'
+  | 'feishu_prd'
+  | 'user_feedback_batch'
+  | 'prod_error_autofix';
+
 export interface PipelineRun {
   id: string;
   createdAt: string;
@@ -347,6 +370,9 @@ export interface PipelineRun {
   defaultBranch: string;
   prdTitle: string;
   prdContent: string;
+  origin?: PipelineRunOrigin;
+  linkedIssueNumbers?: number[];
+  linkedIssueUrls?: string[];
   techStackHint?: string;
   repoContext?: RepoContextSnapshot;
   architect: ArchitectOutput;
@@ -456,6 +482,8 @@ export type BackgroundTaskKind =
   | 'rsi_analyze'
   | 'rsi_consolidate'
   | 'rsi_report_incident'
+  | 'signals_triage'
+  | 'signals_autofix'
   | 'state_sync'
   | 'admin_reset';
 

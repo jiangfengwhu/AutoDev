@@ -7,7 +7,16 @@ import { githubRequest } from './githubService.ts';
 
 export const AUTODEV_STATE_BRANCH = 'autodev-state';
 
-export type PersistedStateKey = 'runs' | 'jobs' | 'auditLogs' | 'rsi' | 'auth' | 'feishu';
+export type PersistedStateKey =
+  | 'runs'
+  | 'jobs'
+  | 'auditLogs'
+  | 'rsi'
+  | 'auth'
+  | 'feishu'
+  | 'feedback'
+  | 'prodErrors'
+  | 'aiConfig';
 
 const STATE_FILE_MAP: Record<
   PersistedStateKey,
@@ -36,6 +45,18 @@ const STATE_FILE_MAP: Record<
   feishu: {
     localFile: 'feishu-state-v1.json',
     remotePath: '.autodev-state/feishu-state-v1.json',
+  },
+  feedback: {
+    localFile: 'feedback-v1.json',
+    remotePath: '.autodev-state/feedback-v1.json',
+  },
+  prodErrors: {
+    localFile: 'prod-errors-v1.json',
+    remotePath: '.autodev-state/prod-errors-v1.json',
+  },
+  aiConfig: {
+    localFile: 'ai-model-config-v1.json',
+    remotePath: '.autodev-state/ai-model-config-v1.json',
   },
 };
 

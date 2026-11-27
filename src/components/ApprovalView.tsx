@@ -26,6 +26,7 @@ interface ApprovalViewProps {
   onSelectRun: (runId: string) => void;
   onRunUpdated: (run: PipelineRun) => void;
   onBackgroundTaskStarted?: (task: BackgroundTask) => void;
+  onClosePavilion?: () => void;
   onGoToNewPrd: () => void;
   onGoToQuality?: (target?: { reportId?: string; actionsRunId?: number }) => void;
   isRequirementInProgress?: boolean;
@@ -39,6 +40,7 @@ export function ApprovalView({
   onSelectRun,
   onRunUpdated,
   onBackgroundTaskStarted,
+  onClosePavilion,
   onGoToNewPrd,
   onGoToQuality,
   isRequirementInProgress = false,
@@ -174,6 +176,7 @@ export function ApprovalView({
             : '退回修订与 AGY 自动返工派发已转入服务端后台执行，离开页面不会中断。';
         setFeedback({ type: 'success', text: msg });
         onSuccessToast(msg, decision === 'approved' ? '后台上线已启动' : '后台返工已启动');
+        onClosePavilion?.();
         return;
       }
       if (!res.ok) {

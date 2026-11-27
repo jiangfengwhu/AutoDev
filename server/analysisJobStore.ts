@@ -29,7 +29,7 @@ import {
 import { parseRepoFullName } from '../src/lib/taskGraph.ts';
 import {
   DEFAULT_AGY_MODE,
-  DEFAULT_AGY_MODEL,
+  DEFAULT_AGY_PLAN_MODEL,
   resolveEffectiveTechStack,
 } from '../src/lib/workflowBuilder.ts';
 import {
@@ -52,7 +52,6 @@ const DATA_DIR = path.join(process.cwd(), '.autodev-data');
 const JOBS_FILE = path.join(DATA_DIR, 'jobs-v1.json');
 const LEGACY_TMP_JOBS_FILE = path.join(os.tmpdir(), 'autodev-studio-jobs-v1.json');
 
-const DEFAULT_AGY_PLAN_MODEL = DEFAULT_AGY_MODEL;
 const DEFAULT_AGY_PLAN_MODE = DEFAULT_AGY_MODE;
 const PLAN_POLL_INTERVAL_MS = 8000;
 const PLAN_HARD_TIMEOUT_MS = 95 * 60 * 1000;

@@ -47,7 +47,7 @@ import {
   AGY_AGENT_MODES,
   AGY_AVAILABLE_MODELS,
   DEFAULT_AGY_MODE,
-  DEFAULT_AGY_MODEL,
+  DEFAULT_AGY_PLAN_MODEL,
 } from '../lib/workflowBuilder';
 import { TestDiffViewer } from './TestDiffViewer';
 
@@ -63,6 +63,7 @@ interface PrdWorkspaceViewProps {
   onJobStarted: (job: AnalysisJob) => void;
   onRunUpdated: (run: PipelineRun) => void;
   onBackgroundTaskStarted?: (task: BackgroundTask) => void;
+  onClosePavilion?: () => void;
   onGoToEnvironment: () => void;
   onGoToPipeline: () => void;
   onGoToApproval?: (runId: string) => void;
@@ -119,6 +120,7 @@ export function PrdWorkspaceView({
   onJobStarted,
   onRunUpdated,
   onBackgroundTaskStarted,
+  onClosePavilion,
   onGoToEnvironment,
   onGoToPipeline,
   onGoToApproval,
@@ -143,7 +145,7 @@ export function PrdWorkspaceView({
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; label: string }>>(
     () => AGY_AVAILABLE_MODELS.map((m) => ({ id: m.id, label: m.label }))
   );
-  const [agyModel, setAgyModel] = useState<string>(DEFAULT_AGY_MODEL);
+  const [agyModel, setAgyModel] = useState<string>(DEFAULT_AGY_PLAN_MODEL);
   const [agyMode, setAgyMode] = useState<string>(DEFAULT_AGY_MODE);
   const [cancellingJob, setCancellingJob] = useState(false);
 
@@ -539,6 +541,7 @@ export function PrdWorkspaceView({
           'Draft PR 创建与分支推送已转入服务端后台执行，切换房间或离开页面不会中断',
           '后台建 PR 已启动'
         );
+        onClosePavilion?.();
         return;
       }
       if (!response.ok) {
@@ -555,9 +558,7 @@ export function PrdWorkspaceView({
         `Draft PR #${data.draftPr?.prNumber ?? ''} 已推送至 ${selectedRepo?.fullName}`,
         'Draft PR 创建成功'
       );
-      setTimeout(() => {
-        prFeedbackRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      }, 60);
+      onClosePavilion?.();
     } catch (err) {
       const msg = err instanceof Error ? err.message : '创建 Draft PR 失败';
       setPrError(msg);

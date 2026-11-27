@@ -19,7 +19,15 @@ export type AuditActionType =
   | 'revision_requested'
   | 'rsi_sync_triggered'
   | 'rsi_incident_reported'
-  | 'rsi_rule_mutated';
+  | 'rsi_rule_mutated'
+  | 'user_feedback_ingested'
+  | 'daily_feedback_batch_dispatched'
+  | 'feedback_direct_dispatched'
+  | 'prod_error_new_fingerprint'
+  | 'prod_error_occurrence_recorded'
+  | 'prod_error_merged_into_active_pr'
+  | 'prod_error_autofix_dispatched'
+  | 'ai_model_config_updated';
 
 export interface AuditLogEntry {
   id: string;
@@ -156,6 +164,14 @@ export const AUDIT_ACTION_LABELS: Record<AuditActionType, string> = {
   rsi_sync_triggered: '同步测试报告与归因',
   rsi_incident_reported: '手动上报异常事件',
   rsi_rule_mutated: '维护 RSI 规则库',
+  user_feedback_ingested: '采集线上用户反馈',
+  daily_feedback_batch_dispatched: '每日反馈合批直通编码',
+  feedback_direct_dispatched: '用户反馈一键直派编码',
+  prod_error_new_fingerprint: '捕获新线上报错指纹',
+  prod_error_occurrence_recorded: '线上报错复发计数',
+  prod_error_merged_into_active_pr: '合并线上报错至进行中 PR',
+  prod_error_autofix_dispatched: '派发线上报错自愈修复',
+  ai_model_config_updated: '更新 AI 模型与容灾配置',
 };
 
 export const REQUIREMENT_STATUS_META: Record<

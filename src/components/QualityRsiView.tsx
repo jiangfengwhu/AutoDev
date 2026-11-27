@@ -52,10 +52,14 @@ import {
 } from '../lib/rsiEngine';
 
 import type { BackgroundTask } from '../types/autodev';
+import { SignalsHubPanel, type SignalsPanelMode } from './SignalsHubPanel';
+
+export type QualityTopSection = 'rsi' | SignalsPanelMode;
 
 export interface QualityFocusTarget {
   reportId?: string;
   actionsRunId?: number;
+  topSection?: QualityTopSection;
   nonce: number;
 }
 
@@ -63,7 +67,9 @@ interface QualityRsiViewProps {
   repoFullName: string;
   focusedTarget?: QualityFocusTarget | null;
   onClearFocusedTarget?: () => void;
+  activeTasks?: BackgroundTask[];
   onBackgroundTaskStarted?: (task: BackgroundTask) => void;
+  onClosePavilion?: () => void;
   refreshNonce?: number;
   onErrorToast: (message: string, title?: string) => void;
   onSuccessToast: (message: string, title?: string) => void;
@@ -260,7 +266,9 @@ export function QualityRsiView({
   repoFullName,
   focusedTarget,
   onClearFocusedTarget,
+  activeTasks = [],
   onBackgroundTaskStarted,
+  onClosePavilion,
   refreshNonce = 0,
   onErrorToast,
   onSuccessToast,
@@ -270,11 +278,22 @@ export function QualityRsiView({
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [topSection, setTopSection] = useState<QualityTopSection>(
+    focusedTarget?.topSection ?? 'rsi'
+  );
   const [activeTab, setActiveTab] = useState<WorkbenchTab>('reports');
   const [trendFilter, setTrendFilter] = useState<TrendKindFilter>('all');
   const [expandedReportId, setExpandedReportId] = useState<string | null>(null);
   const [highlightedReportId, setHighlightedReportId] = useState<string | null>(null);
   const [analyzingIncidentId, setAnalyzingIncidentId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (focusedTarget?.topSection) {
+      setTopSection(focusedTarget.topSection);
+    } else if (focusedTarget?.reportId || focusedTarget?.actionsRunId) {
+      setTopSection('rsi');
+    }
+  }, [focusedTarget]);
 
   // Manual Incident Report Drawer/Form
   const [showIncidentForm, setShowIncidentForm] = useState(false);
@@ -684,6 +703,51 @@ export function QualityRsiView({
 
   return (
     <div className="space-y-6">
+      {/* Top-level QA·RSI & Production Signals Segmented Switcher */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div
+          role="tablist"
+          aria-label="质检进化与线上信号台切换"
+          className="inline-flex flex-wrap items-center gap-1 p-1 rounded-lg border border-slate-200 bg-slate-100"
+        >
+          {(
+            [
+              ['rsi', '质量与自进化 (RSI)'],
+              ['feedback', '线上用户反馈'],
+              ['errors', '线上报错自愈'],
+            ] as const
+          ).map(([sectionKey, label]) => (
+            <button
+              key={sectionKey}
+              type="button"
+              role="tab"
+              aria-selected={topSection === sectionKey}
+              onClick={() => setTopSection(sectionKey)}
+              className={`px-3.5 py-1.5 text-[13px] font-medium rounded-md transition-colors whitespace-nowrap ${
+                topSection === sectionKey
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {topSection !== 'rsi' ? (
+        <SignalsHubPanel
+          mode={topSection}
+          repoFullName={repoFullName}
+          refreshNonce={refreshNonce}
+          activeTasks={activeTasks}
+          onBackgroundTaskStarted={onBackgroundTaskStarted}
+          onClosePavilion={onClosePavilion}
+          onErrorToast={onErrorToast}
+          onSuccessToast={onSuccessToast}
+        />
+      ) : (
+        <>
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-[#30363D]">
         <div>
@@ -2170,6 +2234,8 @@ export function QualityRsiView({
           </div>
         )}
       </section>
+        </>
+      )}
     </div>
   );
 }

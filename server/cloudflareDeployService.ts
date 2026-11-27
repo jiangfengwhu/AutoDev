@@ -472,3 +472,45 @@ export async function deployBranchPreviewToCloudflare(params: {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 }
+
+/**
+ * Uploads or updates a Cloudflare Worker secret binding via the Cloudflare Workers REST API.
+ */
+export async function putCloudflareWorkerSecret(params: {
+  workerName: string;
+  secretName: string;
+  secretValue: string;
+}): Promise<{ ok: true; workerName: string; secretName: string }> {
+  const cfToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  const cfAccountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  if (!cfToken || !cfAccountId) {
+    throw new Error('服务端未配置 CLOUDFLARE_API_TOKEN 或 CLOUDFLARE_ACCOUNT_ID，无法写入 Worker Secret。');
+  }
+  await cfApi(
+    cfToken,
+    `/accounts/${encodeURIComponent(cfAccountId)}/workers/scripts/${encodeURIComponent(params.workerName)}/secrets`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({
+        name: params.secretName,
+        text: params.secretValue,
+        type: 'secret_text',
+      }),
+    }
+  );
+  return { ok: true, workerName: params.workerName, secretName: params.secretName };
+}
+
+let cachedWorkerSubdomain: string | null = null;
+
+export async function resolveCloudflareWorkerUrl(workerName: string): Promise<string | null> {
+  const cfToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  const cfAccountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  if (!cfToken || !cfAccountId) return null;
+  if (!cachedWorkerSubdomain) {
+    cachedWorkerSubdomain = await getWorkersSubdomain(cfToken, cfAccountId);
+  }
+  if (!cachedWorkerSubdomain) return null;
+  return `https://${workerName}.${cachedWorkerSubdomain}.workers.dev`;
+}
+

@@ -45,6 +45,19 @@ import {
   runQaSpecAgent,
 } from './server/agentOrchestrator.ts';
 import {
+  checkShushengIntegrationStatus,
+  invalidateShushengStatusCache,
+  pingShushengChat,
+} from './server/shushengService.ts';
+import {
+  getAiModelConfig,
+  getPublicAiModelConfig,
+  reloadAiModelConfigFromDisk,
+  updateAiModelConfig,
+} from './server/aiModelConfigStore.ts';
+import { isValidShushengModelId } from './src/lib/shushengProtocol.ts';
+import { validateBackupBaseUrl } from './src/lib/aiModelConfig.ts';
+import {
   attachDraftPrToRun,
   attachPreviewDeploymentToRun,
   clearAllRuns,
@@ -164,6 +177,42 @@ import {
   parseFeishuCardCallbackBody,
   parseFeishuEventBody,
 } from './src/lib/feishuProtocol.ts';
+import {
+  DEFAULT_ERROR_BURST_DEBOUNCE_MS,
+  MAX_SIGNAL_PAYLOAD_BYTES,
+  validateFeedbackPayload,
+  validateProdErrorPayload,
+  type FeedbackStatus,
+  type ProdErrorStatus,
+} from './src/lib/signalsEngine.ts';
+import {
+  getFeedbackRecordById,
+  getProdErrorGroupById,
+  listProdErrorGroups,
+  markProdErrorsResolvedForRun,
+  recordFeedbackItem,
+  reloadSignalsFromDisk,
+  updateFeedbackRecord,
+  updateProdErrorGroup,
+  upsertProdErrorOccurrence,
+} from './server/signalsStore.ts';
+import {
+  buildSignalsDashboardPayload,
+  checkIngestRateLimit,
+  dispatchSingleFeedbackDirect,
+  drainQueuedSignalsIfIdle,
+  flushProdErrorAutofixQueue,
+  isCronSecretConfigured,
+  isIngestTokenConfigured,
+  maybeAutoRegisterPublicStudioUrl,
+  pullUnsyncedSignalsFromAtdV1,
+  runDailyFeedbackTriage,
+  scheduleProdErrorBurstFlush,
+  syncAtdV1SignalsInfra,
+  verifyCronSecret,
+  verifyIngestToken,
+} from './server/signalsService.ts';
+import { formatFriendlyGeminiError } from './src/lib/geminiResilience.ts';
 import type {
   AnalysisSseEvent,
   IntegrationsStatusResponse,
@@ -260,7 +309,10 @@ async function startServer() {
       req.path === '/auth/unlock' ||
       req.path === '/auth/lock' ||
       req.path === '/feishu/events' ||
-      req.path === '/feishu/card-action'
+      req.path === '/feishu/card-action' ||
+      req.path === '/ingest/feedback' ||
+      req.path === '/ingest/errors' ||
+      req.path === '/triage/feedback/daily'
     ) {
       next();
       return;
@@ -295,24 +347,147 @@ async function startServer() {
   });
 
   // Module 1: Environment connectivity status
-  app.get('/api/integrations/status', async (_req, res) => {
-    const [github, cloudflare] = await Promise.all([
+  app.get('/api/integrations/status', async (req, res) => {
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const [github, cloudflare, shusheng] = await Promise.all([
       checkGitHubIntegration(),
       checkCloudflareIntegration(),
+      checkShushengIntegrationStatus(forceRefresh),
     ]);
+    const aiCfg = getAiModelConfig();
 
     const payload: IntegrationsStatusResponse = {
       github,
       cloudflare,
       gemini: {
         configured: Boolean(process.env.GEMINI_API_KEY?.trim()),
-        model: GEMINI_AGENT_MODEL,
+        model: aiCfg.geminiPrimaryModel || GEMINI_AGENT_MODEL,
+        fallbackModel: aiCfg.geminiFallbackModel,
+        decisionModel: aiCfg.geminiDecisionModel,
         checkedAt: new Date().toISOString(),
       },
+      shusheng,
       feishu: getFeishuIntegrationStatus(),
     };
 
     res.json(payload);
+  });
+
+  // Configurable Gemini & OpenAI-compatible backup model settings (read returns sanitized metadata only; never exposes secrets)
+  app.get('/api/ai-config', (_req, res) => {
+    res.json({ config: getPublicAiModelConfig() });
+  });
+
+  // Protected update for AI model names and OpenAI-compatible backup provider (edit-auth enforced)
+  app.put('/api/ai-config', async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const updated = updateAiModelConfig({
+      geminiPrimaryModel:
+        typeof body.geminiPrimaryModel === 'string' ? body.geminiPrimaryModel : undefined,
+      geminiFallbackModel:
+        typeof body.geminiFallbackModel === 'string' ? body.geminiFallbackModel : undefined,
+      geminiDecisionModel:
+        typeof body.geminiDecisionModel === 'string' ? body.geminiDecisionModel : undefined,
+      backupEnabled: typeof body.backupEnabled === 'boolean' ? body.backupEnabled : undefined,
+      backupProviderName:
+        typeof body.backupProviderName === 'string' ? body.backupProviderName : undefined,
+      backupBaseUrl: typeof body.backupBaseUrl === 'string' ? body.backupBaseUrl : undefined,
+      backupModel: typeof body.backupModel === 'string' ? body.backupModel : undefined,
+      backupApiKey: typeof body.backupApiKey === 'string' ? body.backupApiKey : undefined,
+      clearBackupApiKey: body.clearBackupApiKey === true,
+    });
+    if (!updated.ok) {
+      res.status(400).json({ error: updated.error });
+      return;
+    }
+
+    invalidateShushengStatusCache();
+    const shusheng = await checkShushengIntegrationStatus(true);
+    appendAuditLog({
+      category: 'execution',
+      action: 'ai_model_config_updated',
+      repoFullName: FIXED_TARGET_REPO.fullName,
+      detail: `更新 AI 模型配置：Gemini(${updated.config.geminiPrimaryModel} / ${updated.config.geminiFallbackModel} / ${updated.config.geminiDecisionModel}) · 备用(${updated.config.backupProviderName} · ${updated.config.backupModel})`,
+    });
+    res.json({ config: updated.config, shusheng });
+  });
+
+  // Protected live model discovery probe for candidate or saved OpenAI-compatible backup provider
+  app.post('/api/ai-config/probe', async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const rawBaseUrl = typeof body.backupBaseUrl === 'string' ? body.backupBaseUrl.trim() : '';
+    const rawModel = typeof body.backupModel === 'string' ? body.backupModel.trim() : '';
+    const rawApiKey = typeof body.backupApiKey === 'string' ? body.backupApiKey.trim() : '';
+    const rawProviderName =
+      typeof body.backupProviderName === 'string' ? body.backupProviderName.trim() : '';
+
+    if (rawBaseUrl) {
+      const check = validateBackupBaseUrl(rawBaseUrl);
+      if (!check.ok) {
+        res.status(400).json({ error: check.error });
+        return;
+      }
+    }
+    if (rawModel && !isValidShushengModelId(rawModel)) {
+      res.status(400).json({ error: '无效的模型名称格式' });
+      return;
+    }
+
+    const shusheng = await checkShushengIntegrationStatus(true, {
+      baseUrl: rawBaseUrl || undefined,
+      model: rawModel || undefined,
+      apiKey: rawApiKey || undefined,
+      providerName: rawProviderName || undefined,
+    });
+    res.status(shusheng.connected ? 200 : 502).json({ shusheng });
+  });
+
+  // Protected live chat completion probe for candidate or saved OpenAI-compatible backup provider
+  app.post('/api/ai-config/test', async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const rawBaseUrl = typeof body.backupBaseUrl === 'string' ? body.backupBaseUrl.trim() : '';
+    const rawModel = typeof body.backupModel === 'string' ? body.backupModel.trim() : '';
+    const rawApiKey = typeof body.backupApiKey === 'string' ? body.backupApiKey.trim() : '';
+    const rawProviderName =
+      typeof body.backupProviderName === 'string' ? body.backupProviderName.trim() : '';
+
+    if (rawBaseUrl) {
+      const check = validateBackupBaseUrl(rawBaseUrl);
+      if (!check.ok) {
+        res.status(400).json({ error: check.error });
+        return;
+      }
+    }
+    if (rawModel && !isValidShushengModelId(rawModel)) {
+      res.status(400).json({ error: '无效的模型名称格式' });
+      return;
+    }
+
+    const result = await pingShushengChat({
+      baseUrl: rawBaseUrl || undefined,
+      model: rawModel || undefined,
+      apiKey: rawApiKey || undefined,
+      providerName: rawProviderName || undefined,
+    });
+    res.status(result.ok ? 200 : 502).json(result);
+  });
+
+  // 书生·端砚 / 备用引擎 connectivity & available models status (cached to protect RPM limit)
+  app.get('/api/shusheng/status', async (req, res) => {
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const shusheng = await checkShushengIntegrationStatus(forceRefresh);
+    res.json({ shusheng });
+  });
+
+  // Protected live chat completion probe against backup provider (edit-auth middleware enforced)
+  app.post('/api/shusheng/test', async (req, res) => {
+    const rawModel = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
+    if (rawModel && !isValidShushengModelId(rawModel)) {
+      res.status(400).json({ error: '无效的模型名称格式' });
+      return;
+    }
+    const result = await pingShushengChat({ model: rawModel || undefined });
+    res.status(result.ok ? 200 : 502).json(result);
   });
 
   // Feishu Bot integration status & callback paths (no secrets exposed)
@@ -1517,6 +1692,9 @@ async function startServer() {
             reloadRsiStateFromDisk();
             reloadEditAuthFromDisk();
             reloadFeishuStateFromDisk();
+            reloadSignalsFromDisk();
+            reloadAiModelConfigFromDisk();
+            invalidateShushengStatusCache();
           },
         });
         return {
@@ -2374,6 +2552,15 @@ async function startServer() {
               branchDeleted: resMerge.release.branchDeleted,
             };
 
+            markProdErrorsResolvedForRun(runId);
+            void drainQueuedSignalsIfIdle({
+              onAgyDispatched: (dispatchParams) => {
+                void watchAgyCodingRunAndNotifyFeishu(dispatchParams);
+              },
+            }).catch((drainErr) => {
+              console.warn('[AutoDev Signals] Post-merge queue drain skipped:', drainErr);
+            });
+
             // Automatically deploy merged main branch to production Cloudflare Workers!
             try {
               const targetProdBranch = resMerge.release.baseBranch || updated?.defaultBranch || 'main';
@@ -2772,7 +2959,6 @@ async function startServer() {
     dispatchedAtMs: number;
     chatId?: string;
   }): Promise<void> {
-    if (!getFeishuIntegrationStatus().configured) return;
     const key = `${params.owner}/${params.repo}:${params.prBranch}`;
     if (activeAgyCodingWatchers.has(key)) return;
     activeAgyCodingWatchers.add(key);
@@ -2819,26 +3005,46 @@ async function startServer() {
             const latestRep = reports[0];
             const succeeded = candidate.conclusion === 'success';
 
-            await notifyFeishuStageEvent({
-              kind: succeeded ? 'coding_completed' : 'coding_failed',
-              prdTitle: params.prdTitle,
-              repoFullName: params.repoFullName,
-              runId: params.runId,
-              branchName: params.prBranch,
-              prNumber: params.prNumber,
-              prUrl: params.prUrl,
-              actionsUrl: candidate.htmlUrl,
-              passedTests: latestRep?.passed,
-              failedTests: latestRep?.failed,
-              summary:
-                latestRep?.summary ||
-                (succeeded
-                  ? 'VPS AGY 已完成代码实现并推送到 PR 分支。'
-                  : `GitHub Actions 结束状态：${candidate.conclusion || 'failure'}`),
-              error: succeeded
-                ? undefined
-                : `Actions #${candidate.id} 结束状态：${candidate.conclusion || 'failure'}`,
-              chatId: params.chatId,
+            // Update any production errors linked to this autofix run to pr_ready on success
+            if (params.runId && succeeded) {
+              for (const g of listProdErrorGroups(250)) {
+                if (g.linkedRunId === params.runId && g.status === 'fixing') {
+                  updateProdErrorGroup(g.id, { status: 'pr_ready' });
+                }
+              }
+            }
+
+            if (getFeishuIntegrationStatus().configured) {
+              await notifyFeishuStageEvent({
+                kind: succeeded ? 'coding_completed' : 'coding_failed',
+                prdTitle: params.prdTitle,
+                repoFullName: params.repoFullName,
+                runId: params.runId,
+                branchName: params.prBranch,
+                prNumber: params.prNumber,
+                prUrl: params.prUrl,
+                actionsUrl: candidate.htmlUrl,
+                passedTests: latestRep?.passed,
+                failedTests: latestRep?.failed,
+                summary:
+                  latestRep?.summary ||
+                  (succeeded
+                    ? 'VPS AGY 已完成代码实现并推送到 PR 分支。'
+                    : `GitHub Actions 结束状态：${candidate.conclusion || 'failure'}`),
+                error: succeeded
+                  ? undefined
+                  : `Actions #${candidate.id} 结束状态：${candidate.conclusion || 'failure'}`,
+                chatId: params.chatId,
+              });
+            }
+
+            // Drain any pending follow-up autofix pass or queued signals once AGY finishes
+            void drainQueuedSignalsIfIdle({
+              onAgyDispatched: (dispatchParams) => {
+                void watchAgyCodingRunAndNotifyFeishu(dispatchParams);
+              },
+            }).catch((drainErr) => {
+              console.warn('[AutoDev Signals] Post-AGY queue drain skipped:', drainErr);
             });
             return;
           }
@@ -3628,6 +3834,350 @@ async function startServer() {
     res.json({ toast: { type: 'info', content: '未识别的卡片操作类型' } });
   });
 
+  // =========================================================================
+  // Production User Feedback & Error Signals Ingest + Daily Triage + Autofix
+  // =========================================================================
+  const resolveClientIpKey = (req: express.Request): string =>
+    (typeof req.headers['x-forwarded-for'] === 'string'
+      ? req.headers['x-forwarded-for'].split(',')[0]?.trim()
+      : undefined) ||
+    req.ip ||
+    'unknown';
+
+  const hasValidEditSession = (req: express.Request): boolean =>
+    verifyEditSessionToken(extractBearerToken(req.headers.authorization)).valid;
+
+  const signalDispatchCallbacks = {
+    onAgyDispatched: (dispatchParams: {
+      owner: string;
+      repo: string;
+      repoFullName: string;
+      prBranch: string;
+      prNumber?: number;
+      prUrl?: string;
+      runId?: string;
+      prdTitle: string;
+      dispatchedAtMs: number;
+    }) => {
+      void watchAgyCodingRunAndNotifyFeishu(dispatchParams);
+    },
+  };
+
+  app.use((req, _res, next) => {
+    maybeAutoRegisterPublicStudioUrl(req);
+    next();
+  });
+
+  app.post('/api/ingest/feedback', (req, res) => {
+    if (!verifyIngestToken(req)) {
+      res.status(isIngestTokenConfigured() ? 401 : 503).json({
+        error: isIngestTokenConfigured()
+          ? '上报鉴权失败：请提供有效的 X-AutoDev-Ingest-Token'
+          : '服务端尚未配置 GITHUB_TOKEN，无法生成上报鉴权密钥',
+      });
+      return;
+    }
+
+    const rawBytes = Buffer.byteLength((req as RequestWithRawBody).rawBody || JSON.stringify(req.body ?? {}), 'utf-8');
+    if (rawBytes > MAX_SIGNAL_PAYLOAD_BYTES) {
+      res.status(413).json({ error: '反馈请求体超过 32KB 上限' });
+      return;
+    }
+
+    const rate = checkIngestRateLimit(`fb:${resolveClientIpKey(req)}`);
+    if (!rate.allowed) {
+      res.status(429).json({
+        error: `反馈上报过于频繁，请 ${rate.retryAfterSec} 秒后重试`,
+        retryAfterSec: rate.retryAfterSec,
+      });
+      return;
+    }
+
+    const validated = validateFeedbackPayload(req.body);
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error });
+      return;
+    }
+
+    const record = recordFeedbackItem(FIXED_TARGET_REPO.fullName, validated.data);
+    appendAuditLog({
+      category: 'planning',
+      action: 'user_feedback_ingested',
+      actor: 'atd-v1 线上应用',
+      repoFullName: FIXED_TARGET_REPO.fullName,
+      detail: `收到用户反馈 ${record.id}（路由 ${record.pageRoute || '/'}）：${record.content.slice(0, 60)}`,
+    });
+
+    res.status(201).json({
+      accepted: true,
+      record,
+      message: '反馈已保存至 GitHub autodev-state，将在每日巡检中自动过滤并合批派发',
+    });
+  });
+
+  app.post('/api/ingest/errors', (req, res) => {
+    if (!verifyIngestToken(req)) {
+      res.status(isIngestTokenConfigured() ? 401 : 503).json({
+        error: isIngestTokenConfigured()
+          ? '上报鉴权失败：请提供有效的 X-AutoDev-Ingest-Token'
+          : '服务端尚未配置 GITHUB_TOKEN，无法生成上报鉴权密钥',
+      });
+      return;
+    }
+
+    const rawBytes = Buffer.byteLength((req as RequestWithRawBody).rawBody || JSON.stringify(req.body ?? {}), 'utf-8');
+    if (rawBytes > MAX_SIGNAL_PAYLOAD_BYTES) {
+      res.status(413).json({ error: '报错请求体超过 32KB 上限' });
+      return;
+    }
+
+    const rate = checkIngestRateLimit(`err:${resolveClientIpKey(req)}`);
+    if (!rate.allowed) {
+      res.status(429).json({
+        error: `报错上报触发限流保护，请 ${rate.retryAfterSec} 秒后重试`,
+        retryAfterSec: rate.retryAfterSec,
+      });
+      return;
+    }
+
+    const validated = validateProdErrorPayload(req.body);
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error });
+      return;
+    }
+
+    const { group, isNew, reopened } = upsertProdErrorOccurrence(
+      FIXED_TARGET_REPO.fullName,
+      validated.data
+    );
+
+    const shouldScheduleBurstAutofix =
+      isNew || reopened || group.status === 'new';
+
+    if (shouldScheduleBurstAutofix) {
+      scheduleProdErrorBurstFlush(signalDispatchCallbacks, DEFAULT_ERROR_BURST_DEBOUNCE_MS);
+    }
+
+    appendAuditLog({
+      category: 'execution',
+      action: isNew ? 'prod_error_new_fingerprint' : 'prod_error_occurrence_recorded',
+      actor: 'atd-v1 线上应用',
+      repoFullName: FIXED_TARGET_REPO.fullName,
+      detail: `${isNew ? '新报错指纹' : '重复报错累计'} ${group.fingerprint} (${group.source} ${group.route}) · ${group.errorName} · 共 ${group.occurrenceCount} 次`,
+    });
+
+    res.status(201).json({
+      accepted: true,
+      deduplicated: !isNew,
+      reopened,
+      scheduledAutofix: shouldScheduleBurstAutofix,
+      burstWindowSec: Math.round(DEFAULT_ERROR_BURST_DEBOUNCE_MS / 1000),
+      group,
+      message: shouldScheduleBurstAutofix
+        ? `已记录并加入 ${Math.round(DEFAULT_ERROR_BURST_DEBOUNCE_MS / 1000)} 秒合批窗口，同一波报错将自动合并为 1 个修复 PR`
+        : `已按指纹 ${group.fingerprint} 去重合并（累计 ${group.occurrenceCount} 次）`,
+    });
+  });
+
+  app.post('/api/triage/feedback/daily', async (req, res) => {
+    const isCronAuthed = verifyCronSecret(req);
+    const isAdminAuthed = hasValidEditSession(req);
+    if (!isCronAuthed && !isAdminAuthed) {
+      res.status(isCronSecretConfigured() ? 401 : 403).json({
+        error: isCronSecretConfigured()
+          ? '鉴权失败：请提供有效的 X-AutoDev-Cron-Secret 或先解锁编辑权限'
+          : '当前处于只读锁定状态，且服务端尚未初始化巡检密钥',
+      });
+      return;
+    }
+
+    const trigger: 'cron' | 'manual' = isCronAuthed || req.body?.trigger === 'cron' ? 'cron' : 'manual';
+    const runAsync = req.body?.async === true && trigger === 'manual';
+
+    if (runAsync) {
+      const { task, deduplicated } = enqueueBackgroundTask({
+        kind: 'signals_triage',
+        title: '每日用户反馈 AI 筛选与直通编码派发',
+        roomId: 'quality',
+        repoFullName: FIXED_TARGET_REPO.fullName,
+        dedupeKey: `signals_daily_triage:${FIXED_TARGET_REPO.fullName}`,
+        initialMessage: '正在同步线上反馈并调用 AI 进行安全分诊与轻量任务派发…',
+        executor: async ({ setProgress }) => {
+          const outcome = await runDailyFeedbackTriage({
+            trigger: 'manual',
+            repoFullName: FIXED_TARGET_REPO.fullName,
+            callbacks: signalDispatchCallbacks,
+            onProgress: setProgress,
+          });
+          return {
+            summary: outcome.message,
+            result: {
+              batchId: outcome.batch.id,
+              runId: outcome.batch.linkedRunId,
+              prUrl: outcome.batch.linkedPrUrl,
+            },
+          };
+        },
+      });
+      res.status(202).json({ accepted: true, task, deduplicated });
+      return;
+    }
+
+    try {
+      const outcome = await runDailyFeedbackTriage({
+        trigger,
+        repoFullName: FIXED_TARGET_REPO.fullName,
+        callbacks: signalDispatchCallbacks,
+      });
+      res.json(outcome);
+    } catch (err) {
+      res.status(502).json({
+        error: formatFriendlyGeminiError(err, '每日用户反馈巡检执行失败'),
+      });
+    }
+  });
+
+  app.post('/api/signals/feedback/:id/dispatch', async (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const existing = getFeedbackRecordById(id);
+    if (!existing) {
+      res.status(404).json({ error: '未找到指定反馈记录' });
+      return;
+    }
+    if (existing.status === 'dispatched' && existing.linkedPrNumber) {
+      res.status(409).json({
+        error: `该反馈已派发至 PR #${existing.linkedPrNumber}，无需重复派发`,
+      });
+      return;
+    }
+
+    const shortLabel = existing.content.trim().slice(0, 22);
+    const { task, deduplicated } = enqueueBackgroundTask({
+      kind: 'signals_triage',
+      title: `一键直派用户反馈：${shortLabel}${existing.content.trim().length > 22 ? '…' : ''}`,
+      roomId: 'quality',
+      repoFullName: FIXED_TARGET_REPO.fullName,
+      dedupeKey: `signals_direct_feedback:${id}`,
+      initialMessage: '正在生成轻量任务书、创建 Draft PR 并直发 AGY 编码…',
+      executor: async ({ setProgress }) => {
+        const outcome = await dispatchSingleFeedbackDirect({
+          feedbackId: id,
+          repoFullName: FIXED_TARGET_REPO.fullName,
+          callbacks: signalDispatchCallbacks,
+          onProgress: setProgress,
+        });
+        return {
+          summary: outcome.message,
+          result: {
+            status: outcome.status,
+            batchId: outcome.batch.id,
+            runId: outcome.batch.linkedRunId,
+            prUrl: outcome.batch.linkedPrUrl,
+          },
+        };
+      },
+    });
+
+    res.status(202).json({ accepted: true, task, deduplicated });
+  });
+
+  app.get('/api/signals/state', async (req, res) => {
+    const forcePull = req.query.refresh === '1';
+    await pullUnsyncedSignalsFromAtdV1({
+      force: forcePull,
+      callbacks: signalDispatchCallbacks,
+    }).catch(() => {});
+    res.json(buildSignalsDashboardPayload());
+  });
+
+  app.post('/api/signals/errors/flush', async (req, res) => {
+    const forceGroupIds = Array.isArray(req.body?.groupIds)
+      ? req.body.groupIds.map((x: unknown) => String(x)).filter(Boolean)
+      : undefined;
+
+    const { task, deduplicated } = enqueueBackgroundTask({
+      kind: 'signals_autofix',
+      title: '合并派发线上报错自愈修复 PR',
+      roomId: 'quality',
+      repoFullName: FIXED_TARGET_REPO.fullName,
+      dedupeKey: `signals_error_flush:${FIXED_TARGET_REPO.fullName}`,
+      initialMessage: '正在评估线上报错指纹并合并为单一修复 PR 派发至 AGY…',
+      executor: async ({ setProgress }) => {
+        const outcome = await flushProdErrorAutofixQueue({
+          trigger: 'manual',
+          repoFullName: FIXED_TARGET_REPO.fullName,
+          forceGroupIds,
+          callbacks: signalDispatchCallbacks,
+          onProgress: setProgress,
+        });
+        return {
+          summary: outcome.message,
+          result: {
+            action: outcome.action,
+            runId: outcome.batch?.linkedRunId,
+            prUrl: outcome.batch?.linkedPrUrl,
+          },
+        };
+      },
+    });
+
+    res.status(202).json({ accepted: true, task, deduplicated });
+  });
+
+  app.post('/api/signals/feedback/:id/status', (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const status = String(req.body?.status || '').trim() as FeedbackStatus;
+    const allowed: FeedbackStatus[] = ['pending', 'accepted_queued', 'ignored', 'needs_manual_prd'];
+    if (!allowed.includes(status)) {
+      res.status(400).json({ error: '不支持的目标状态' });
+      return;
+    }
+    const existing = getFeedbackRecordById(id);
+    if (!existing) {
+      res.status(404).json({ error: '未找到指定反馈记录' });
+      return;
+    }
+    const updated = updateFeedbackRecord(id, {
+      status,
+      triageReason:
+        typeof req.body?.reason === 'string' && req.body.reason.trim()
+          ? req.body.reason.trim()
+          : existing.triageReason,
+    });
+    res.json({ record: updated });
+  });
+
+  app.post('/api/signals/errors/:id/status', (req, res) => {
+    const id = String(req.params.id || '').trim();
+    const status = String(req.body?.status || '').trim() as ProdErrorStatus;
+    const allowed: ProdErrorStatus[] = ['new', 'queued_for_agy', 'ignored', 'resolved'];
+    if (!allowed.includes(status)) {
+      res.status(400).json({ error: '不支持的目标报错状态' });
+      return;
+    }
+    const existing = getProdErrorGroupById(id);
+    if (!existing) {
+      res.status(404).json({ error: '未找到指定报错指纹' });
+      return;
+    }
+    const updated = updateProdErrorGroup(id, {
+      status,
+      ...(status === 'resolved' ? { resolvedAt: new Date().toISOString() } : {}),
+    });
+    res.json({ group: updated });
+  });
+
+  app.post('/api/signals/queue/drain', async (_req, res) => {
+    try {
+      const result = await drainQueuedSignalsIfIdle(signalDispatchCallbacks);
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : '调度待修队列失败',
+      });
+    }
+  });
+
   // Vite middleware in dev (lazy-loaded so production startup never imports Vite), static build in production
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -3660,6 +4210,9 @@ async function startServer() {
               reloadRsiStateFromDisk();
               reloadEditAuthFromDisk();
               reloadFeishuStateFromDisk();
+              reloadSignalsFromDisk();
+              reloadAiModelConfigFromDisk();
+              invalidateShushengStatusCache();
             },
           }).then((res) => {
             if (res.hydrated) {
@@ -3693,6 +4246,23 @@ async function startServer() {
           })
           .catch((err) => {
             console.warn('[AutoDev] Background workflow auto-sync skipped:', err?.message || err);
+          })
+          .finally(() => {
+            syncAtdV1SignalsInfra()
+              .then((res) => {
+                const ghSecretsSummary =
+                  res.githubSecretsUpdated.length > 0
+                    ? res.githubSecretsUpdated.join(',')
+                    : res.githubSecretsSkippedReason
+                      ? `skipped(${res.githubSecretsSkippedReason})`
+                      : 'none';
+                console.log(
+                  `[AutoDev Signals] Synced atd-v1 infra (workflow=${res.workflowSynced}, ghSecrets=${ghSecretsSummary}, cfSecrets=${res.cloudflareSecretsUpdated.join(',') || 'none'}${res.errors.length ? `, errors=${res.errors.join(' | ')}` : ''})`
+                );
+              })
+              .catch((err) => {
+                console.warn('[AutoDev Signals] Background atd-v1 infra sync skipped:', err?.message || err);
+              });
           });
       }
     });

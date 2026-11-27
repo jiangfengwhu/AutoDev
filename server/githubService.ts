@@ -13,17 +13,20 @@ import type { PrArtifacts } from '../src/lib/specBuilder.ts';
 import { buildBootstrapReadmeContent, isEmptyGitHubRepoError } from '../src/lib/specBuilder.ts';
 import { generateBranchName } from '../src/lib/taskGraph.ts';
 import {
+  AUTODEV_DAILY_FEEDBACK_WORKFLOW_PATH,
   AUTODEV_DEPLOY_WORKFLOW_PATH,
   AUTODEV_LIVE_LOG_ISSUE_TITLE,
   AUTODEV_PLAN_CHANNEL_BRANCH,
   AUTODEV_PLAN_WORKFLOW_PATH,
   AUTODEV_VPS_CAPS_PATH,
   AUTODEV_WORKFLOW_PATH,
+  DEFAULT_AGY_CODING_MODEL,
   DEFAULT_AGY_MODE,
-  DEFAULT_AGY_MODEL,
+  DEFAULT_AGY_PLAN_MODEL,
   buildAgyPlanWorkflowYaml,
   buildAgyRunnerWorkflowYaml,
   buildCloudflareDeployWorkflowYaml,
+  buildDailyFeedbackCronWorkflowYaml,
 } from '../src/lib/workflowBuilder.ts';
 import { extractCleanAssistantChatFromComment } from '../src/lib/codingChatOutput.ts';
 
@@ -1428,7 +1431,7 @@ export async function dispatchAgyPlanWorkflow(params: {
   const { owner, repo, jobId } = params;
   const baseBranch = params.baseBranch?.trim() || 'main';
   const channelBranch = params.channelBranch?.trim() || AUTODEV_PLAN_CHANNEL_BRANCH;
-  const agyModel = params.agyModel?.trim() || DEFAULT_AGY_MODEL;
+  const agyModel = params.agyModel?.trim() || DEFAULT_AGY_PLAN_MODEL;
   const agyMode = params.agyMode?.trim() || DEFAULT_AGY_MODE;
   const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 
@@ -1558,7 +1561,7 @@ export async function dispatchAgyWorkflow(params: {
     sessionMode,
     resumeSessionId,
   } = params;
-  const agyModel = params.agyModel?.trim() || DEFAULT_AGY_MODEL;
+  const agyModel = params.agyModel?.trim() || DEFAULT_AGY_CODING_MODEL;
   const agyMode = params.agyMode?.trim() || DEFAULT_AGY_MODE;
   const baseBranch = params.baseBranch?.trim() || 'main';
   const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
@@ -2801,4 +2804,332 @@ export async function extractCodingOutputFromLiveLogFallback(
     return undefined;
   }
 }
+
+export async function createGitHubIssue(params: {
+  owner: string;
+  repo: string;
+  title: string;
+  body: string;
+  labels?: string[];
+}): Promise<{ issueNumber: number; issueUrl: string }> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('服务端未配置 GITHUB_TOKEN，无法创建 GitHub Issue。');
+  }
+  const repoPath = `/repos/${encodeURIComponent(params.owner)}/${encodeURIComponent(params.repo)}`;
+  try {
+    const created = await githubRequest<{ number: number; html_url: string }>(
+      token,
+      `${repoPath}/issues`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          title: params.title.slice(0, 240),
+          body: params.body,
+          labels: params.labels && params.labels.length > 0 ? params.labels : undefined,
+        }),
+      }
+    );
+    return { issueNumber: created.number, issueUrl: created.html_url };
+  } catch (err) {
+    // Fallback without labels if token lacks label creation permission
+    if (params.labels && params.labels.length > 0) {
+      const created = await githubRequest<{ number: number; html_url: string }>(
+        token,
+        `${repoPath}/issues`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            title: params.title.slice(0, 240),
+            body: params.body,
+          }),
+        }
+      );
+      return { issueNumber: created.number, issueUrl: created.html_url };
+    }
+    throw err;
+  }
+}
+
+export async function commentGitHubIssue(params: {
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  body: string;
+}): Promise<{ commentUrl: string }> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('服务端未配置 GITHUB_TOKEN，无法向 Issue 写入评论。');
+  }
+  const repoPath = `/repos/${encodeURIComponent(params.owner)}/${encodeURIComponent(params.repo)}`;
+  const created = await githubRequest<{ html_url: string }>(
+    token,
+    `${repoPath}/issues/${params.issueNumber}/comments`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ body: params.body }),
+    }
+  );
+  return { commentUrl: created.html_url };
+}
+
+/**
+ * Atomically updates docs/prd.md, docs/spec.json (and archived copies) on an EXISTING open PR branch
+ * so newly coalesced production errors can be merged into the single active autofix PR without opening a 2nd PR.
+ */
+export async function updateDraftPrDocsOnBranch(params: {
+  owner: string;
+  repo: string;
+  branchName: string;
+  prNumber?: number;
+  newPrTitle?: string;
+  newPrBody?: string;
+  artifacts: PrArtifacts;
+  commitMessage: string;
+}): Promise<{ commitSha: string }> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('服务端未配置 GITHUB_TOKEN，无法更新已有 Draft PR 分支文档。');
+  }
+  const repoPath = `/repos/${encodeURIComponent(params.owner)}/${encodeURIComponent(params.repo)}`;
+  const refData = await githubRequest<{ object: { sha: string } }>(
+    token,
+    `${repoPath}/git/ref/heads/${encodeURIComponent(params.branchName)}`,
+    { cache: 'no-store' }
+  );
+  const headCommitSha = refData.object.sha;
+  const headCommit = await githubRequest<{ tree: { sha: string } }>(
+    token,
+    `${repoPath}/git/commits/${headCommitSha}`
+  );
+
+  const filesToCommit = [
+    { path: params.artifacts.specJsonPath, content: params.artifacts.specJsonContent },
+    { path: params.artifacts.archivedSpecPath, content: params.artifacts.specJsonContent },
+    { path: params.artifacts.prdMdPath, content: params.artifacts.prdMdContent },
+    { path: params.artifacts.archivedPrdPath, content: params.artifacts.prdMdContent },
+  ];
+
+  const blobEntries = await Promise.all(
+    filesToCommit.map(async (file) => {
+      const blob = await githubRequest<{ sha: string }>(token, `${repoPath}/git/blobs`, {
+        method: 'POST',
+        body: JSON.stringify({ content: file.content, encoding: 'utf-8' }),
+      });
+      return {
+        path: file.path,
+        mode: '100644' as const,
+        type: 'blob' as const,
+        sha: blob.sha,
+      };
+    })
+  );
+
+  const newTree = await githubRequest<{ sha: string }>(token, `${repoPath}/git/trees`, {
+    method: 'POST',
+    body: JSON.stringify({
+      base_tree: headCommit.tree.sha,
+      tree: blobEntries,
+    }),
+  });
+
+  const newCommit = await githubRequest<{ sha: string }>(token, `${repoPath}/git/commits`, {
+    method: 'POST',
+    body: JSON.stringify({
+      message: params.commitMessage,
+      tree: newTree.sha,
+      parents: [headCommitSha],
+    }),
+  });
+
+  await githubRequest<{ ref: string }>(
+    token,
+    `${repoPath}/git/refs/heads/${encodeURIComponent(params.branchName)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ sha: newCommit.sha, force: false }),
+    }
+  );
+
+  if (params.prNumber && (params.newPrTitle || params.newPrBody)) {
+    try {
+      await githubRequest(token, `${repoPath}/pulls/${params.prNumber}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...(params.newPrTitle ? { title: params.newPrTitle.slice(0, 240) } : {}),
+          ...(params.newPrBody ? { body: params.newPrBody } : {}),
+        }),
+      });
+    } catch {
+      // Non-fatal if PR metadata update fails; commit + comment still carry full details
+    }
+  }
+
+  invalidateGitHubReadCache(repoPath);
+  return { commitSha: newCommit.sha };
+}
+
+export async function syncDailyFeedbackWorkflowFile(params: {
+  owner: string;
+  repo: string;
+  baseBranch?: string;
+}): Promise<{
+  path: string;
+  commitSha: string;
+  htmlUrl: string;
+  updated: boolean;
+  skipped?: boolean;
+}> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('服务端未配置 GITHUB_TOKEN，无法写入每日反馈定时巡检 Workflow。');
+  }
+  const { owner, repo } = params;
+  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const repoMeta = await githubRequest<{ default_branch: string }>(token, repoPath);
+  const baseBranch = params.baseBranch?.trim() || repoMeta.default_branch || 'main';
+
+  return upsertRepoFile({
+    token,
+    repoPath,
+    owner,
+    repo,
+    baseBranch,
+    filePath: AUTODEV_DAILY_FEEDBACK_WORKFLOW_PATH,
+    content: buildDailyFeedbackCronWorkflowYaml(owner),
+    createMessage: 'chore(autodev): add daily user feedback triage cron workflow',
+    updateMessage: 'chore(autodev): update daily user feedback triage cron workflow',
+  });
+}
+
+/**
+ * Encrypts and upserts a GitHub Actions repository secret via the repo's LibSodium public key.
+ */
+export async function putGitHubRepoSecret(params: {
+  owner: string;
+  repo: string;
+  secretName: string;
+  secretValue: string;
+}): Promise<{ ok: true; secretName: string }> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('服务端未配置 GITHUB_TOKEN，无法写入 GitHub Actions Secret。');
+  }
+  const { owner, repo, secretName, secretValue } = params;
+  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const pubKey = await githubRequest<{ key_id: string; key: string }>(
+    token,
+    `${repoPath}/actions/secrets/public-key`,
+    { cache: 'no-store' }
+  );
+
+  const tweetsodiumMod = await import('tweetsodium');
+  const sodium = (tweetsodiumMod.default || tweetsodiumMod) as {
+    seal: (message: Uint8Array, publicKey: Uint8Array) => Uint8Array;
+  };
+  const messageBytes = Buffer.from(secretValue, 'utf-8');
+  const keyBytes = Buffer.from(pubKey.key, 'base64');
+  const encryptedBytes = sodium.seal(messageBytes, keyBytes);
+  const encryptedValue = Buffer.from(encryptedBytes).toString('base64');
+
+  await githubRequest<void>(
+    token,
+    `${repoPath}/actions/secrets/${encodeURIComponent(secretName)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({
+        encrypted_value: encryptedValue,
+        key_id: pubKey.key_id,
+      }),
+    }
+  );
+  return { ok: true, secretName };
+}
+
+/**
+ * Atomically commits multiple text files onto a target branch using Git Data API.
+ */
+export async function commitFilesToBranchAtomic(params: {
+  owner: string;
+  repo: string;
+  branch: string;
+  commitMessage: string;
+  files: Array<{ path: string; content: string }>;
+}): Promise<{ commitSha: string; commitUrl: string; filesCommitted: string[] }> {
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (!token) {
+    throw new Error('服务端未配置 GITHUB_TOKEN，无法提交文件到目标仓库。');
+  }
+  const { owner, repo, branch, commitMessage, files } = params;
+  const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const ref = await githubRequest<{ object: { sha: string } }>(
+    token,
+    `${repoPath}/git/ref/heads/${encodeURIComponent(branch)}`,
+    { cache: 'no-store' }
+  );
+  const baseCommitSha = ref.object.sha;
+  const baseCommit = await githubRequest<{ tree: { sha: string } }>(
+    token,
+    `${repoPath}/git/commits/${baseCommitSha}`
+  );
+
+  const treeEntries = await Promise.all(
+    files.map(async (f) => {
+      const blob = await githubRequest<{ sha: string }>(token, `${repoPath}/git/blobs`, {
+        method: 'POST',
+        body: JSON.stringify({
+          content: f.content,
+          encoding: 'utf-8',
+        }),
+      });
+      return {
+        path: f.path,
+        mode: '100644' as const,
+        type: 'blob' as const,
+        sha: blob.sha,
+      };
+    })
+  );
+
+  const newTree = await githubRequest<{ sha: string }>(token, `${repoPath}/git/trees`, {
+    method: 'POST',
+    body: JSON.stringify({
+      base_tree: baseCommit.tree.sha,
+      tree: treeEntries,
+    }),
+  });
+
+  const newCommit = await githubRequest<{ sha: string; html_url?: string }>(
+    token,
+    `${repoPath}/git/commits`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        message: commitMessage,
+        tree: newTree.sha,
+        parents: [baseCommitSha],
+      }),
+    }
+  );
+
+  await githubRequest(
+    token,
+    `${repoPath}/git/refs/heads/${encodeURIComponent(branch)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({
+        sha: newCommit.sha,
+        force: false,
+      }),
+    }
+  );
+
+  return {
+    commitSha: newCommit.sha,
+    commitUrl: `https://github.com/${owner}/${repo}/commit/${newCommit.sha}`,
+    filesCommitted: files.map((f) => f.path),
+  };
+}
+
+
 

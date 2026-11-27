@@ -47,7 +47,9 @@ export const AGY_AVAILABLE_MODELS = [
   { id: 'gpt-oss-120b-medium', label: 'GPT-OSS 120B (Medium)' },
 ] as const;
 
-export const DEFAULT_AGY_MODEL = AGY_AVAILABLE_MODELS[0].id;
+export const DEFAULT_AGY_PLAN_MODEL = 'gemini-4-neon-high';
+export const DEFAULT_AGY_CODING_MODEL = 'gemini-4-hydrogen-high';
+export const DEFAULT_AGY_MODEL = DEFAULT_AGY_PLAN_MODEL;
 
 export const AGY_AGENT_MODES = [
   {
@@ -72,6 +74,7 @@ export const DEFAULT_AGY_MODE = AGY_AGENT_MODES[0].id;
 export const AUTODEV_WORKFLOW_PATH = '.github/workflows/autodev-agy.yml';
 export const AUTODEV_DEPLOY_WORKFLOW_PATH = '.github/workflows/autodev-deploy-cf.yml';
 export const AUTODEV_PLAN_WORKFLOW_PATH = '.github/workflows/autodev-plan.yml';
+export const AUTODEV_DAILY_FEEDBACK_WORKFLOW_PATH = '.github/workflows/autodev-daily-feedback.yml';
 export const AUTODEV_PLAN_CHANNEL_BRANCH = 'autodev-plan-channel';
 export const AUTODEV_E2E_VAULT_PREFIX = '.autodev-e2e-vault';
 export const AUTODEV_VPS_CAPS_PATH = '.autodev-vps-capabilities.json';
@@ -108,9 +111,9 @@ on:
         default: ''
         type: string
       agy_model:
-        description: 'AGY model ID configured on the VPS (supports Gemini 4 & live synced models)'
+        description: 'AGY model ID configured on the VPS (default: gemini-4-hydrogen-high)'
         required: false
-        default: '${DEFAULT_AGY_MODEL}'
+        default: '${DEFAULT_AGY_CODING_MODEL}'
         type: string
       agy_mode:
         description: 'AGY execution mode (--mode: auto, accept-edits, plan)'
@@ -161,7 +164,7 @@ jobs:
         shell: bash
         run: |
           BRANCH="\${{ inputs.pr_branch || github.head_ref }}"
-          MODEL="\${{ inputs.agy_model || '${DEFAULT_AGY_MODEL}' }}"
+          MODEL="\${{ inputs.agy_model || '${DEFAULT_AGY_CODING_MODEL}' }}"
           MODE="\${{ inputs.agy_mode || '${DEFAULT_AGY_MODE}' }}"
           PR_NUM="\${{ inputs.pr_number || github.event.pull_request.number || '' }}"
           E2E_PATH="\${{ inputs.e2e_test_path || '' }}"
@@ -242,7 +245,7 @@ jobs:
           const repo = process.env.LIVE_REPO || '';
           const actionsRunId = Number(process.env.LIVE_RUN_ID || 0);
           const branch = process.env.LIVE_BRANCH || 'main';
-          const requestedModel = (process.env.LIVE_MODEL || '${DEFAULT_AGY_MODEL}').trim();
+          const requestedModel = (process.env.LIVE_MODEL || '${DEFAULT_AGY_CODING_MODEL}').trim();
           const requestedMode = (process.env.LIVE_MODE || '${DEFAULT_AGY_MODE}').trim();
           const prNumber = process.env.LIVE_PR_NUM ? Number(process.env.LIVE_PR_NUM) : undefined;
           const pipelineRunId = (process.env.LIVE_PIPELINE_ID || '').trim() || undefined;
@@ -1413,9 +1416,9 @@ on:
         default: 'autodev-plan-channel'
         type: string
       agy_model:
-        description: 'AGY model ID configured on the VPS (supports Gemini 4 & live synced models)'
+        description: 'AGY model ID configured on the VPS (default: gemini-4-neon-high)'
         required: false
-        default: '${DEFAULT_AGY_MODEL}'
+        default: '${DEFAULT_AGY_PLAN_MODEL}'
         type: string
       agy_mode:
         description: 'AGY execution mode (--mode: auto, accept-edits, plan)'
@@ -1453,7 +1456,7 @@ jobs:
           PLAN_JOB_ID: \${{ inputs.job_id }}
           PLAN_BASE_BRANCH: \${{ inputs.base_branch || 'main' }}
           PLAN_CHANNEL_BRANCH: \${{ inputs.channel_branch || 'autodev-plan-channel' }}
-          PLAN_MODEL: \${{ inputs.agy_model || '${DEFAULT_AGY_MODEL}' }}
+          PLAN_MODEL: \${{ inputs.agy_model || '${DEFAULT_AGY_PLAN_MODEL}' }}
           PLAN_MODE: \${{ inputs.agy_mode || '${DEFAULT_AGY_MODE}' }}
         shell: bash
         run: |
@@ -1474,7 +1477,7 @@ jobs:
           const safeJobId = String(jobId || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_');
           const baseBranch = process.env.PLAN_BASE_BRANCH || 'main';
           const channelBranch = process.env.PLAN_CHANNEL_BRANCH || 'autodev-plan-channel';
-          const requestedModel = (process.env.PLAN_MODEL || '${DEFAULT_AGY_MODEL}').trim();
+          const requestedModel = (process.env.PLAN_MODEL || '${DEFAULT_AGY_PLAN_MODEL}').trim();
           const requestedMode = (process.env.PLAN_MODE || '${DEFAULT_AGY_MODE}').trim();
           const actionsUrl = 'https://github.com/' + repo + '/actions/runs/' + actionsRunId;
 
@@ -2203,3 +2206,58 @@ jobs:
           exit \$EXIT_CODE
 `;
 }
+
+export function buildDailyFeedbackCronWorkflowYaml(allowedActor: string = 'jiangfengwhu'): string {
+  return `name: AutoDev Daily Feedback Triage
+
+on:
+  schedule:
+    # Runs daily at 01:00 UTC (09:00 Asia/Shanghai)
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: autodev-daily-feedback-triage
+  cancel-in-progress: false
+
+jobs:
+  trigger-daily-triage:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.actor == '${allowedActor}'
+    steps:
+      - name: Trigger AutoDev Studio Daily Feedback Triage
+        env:
+          STUDIO_URL: \${{ secrets.AUTODEV_STUDIO_URL }}
+          CRON_SECRET: \${{ secrets.AUTODEV_CRON_SECRET }}
+        run: |
+          if [ -z "\$STUDIO_URL" ]; then
+            echo "::error::Missing repository secret AUTODEV_STUDIO_URL (your deployed AutoDev Studio base URL)"
+            exit 1
+          fi
+          if [ -z "\$CRON_SECRET" ]; then
+            echo "::error::Missing repository secret AUTODEV_CRON_SECRET (must match Cloud Run AUTODEV_CRON_SECRET)"
+            exit 1
+          fi
+
+          BASE_URL="\${STUDIO_URL%/}"
+          ENDPOINT="\${BASE_URL}/api/triage/feedback/daily"
+          echo "Calling daily feedback triage endpoint: \$ENDPOINT"
+
+          HTTP_CODE=\$(curl -sS -o /tmp/triage_response.json -w "%{http_code}" \\
+            --max-time 180 \\
+            -X POST "\$ENDPOINT" \\
+            -H "Content-Type: application/json" \\
+            -H "X-AutoDev-Cron-Secret: \$CRON_SECRET" \\
+            -d '{"trigger":"cron"}')
+
+          echo "HTTP status: \$HTTP_CODE"
+          cat /tmp/triage_response.json || true
+          echo ""
+
+          if [ "\$HTTP_CODE" -lt 200 ] || [ "\$HTTP_CODE" -ge 300 ]; then
+            echo "::error::AutoDev daily feedback triage failed with HTTP \$HTTP_CODE"
+            exit 1
+          fi
+`;
+}
+
